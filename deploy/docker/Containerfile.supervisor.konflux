@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supervisor image for RHEL/Konflux.
+#
+# The supervisor binary is extracted and injected into arbitrary user
+# containers (Alpine, Debian, distroless, UBI) so it MUST be a fully-static
+# musl binary. musl libc is built from source since UBI9 does not ship it.
+#
+# Uses rustup (not RPM rust) because the musl target requires
+# rust-std-*-unknown-linux-musl which the RPM toolchain does not ship.
+#
+#   podman build -f deploy/docker/Containerfile.supervisor.konflux \
+#       -t openshell-supervisor-konflux .
+
+ARG RUST_VERSION=1.92.0
+ARG MUSL_VERSION=1.2.5
+
+# ---------------------------------------------------------------------------
+# Stage 1: build musl libc from source
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6 AS musl-toolchain
+
+ARG MUSL_VERSION
+
+RUN dnf install -y --nodocs gcc make tar gzip \
+    && dnf clean all
+
+WORKDIR /tmp/musl-build
+
+RUN curl -fsSL "https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz" \
+        | tar xz --strip-components=1 \
+    && ./configure --prefix=/usr/local/musl --disable-shared \
+    && make -j"$(nproc)" \
+    && make install
+
+# ---------------------------------------------------------------------------
+# Stage 2: compile supervisor (static musl binary)
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6 AS builder
+
+ARG RUST_VERSION
+
+RUN dnf install -y --nodocs \
+        gcc gcc-c++ make cmake \
+        openssl-devel git-core \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" \
+    && /root/.cargo/bin/rustup target add x86_64-unknown-linux-musl
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY --from=musl-toolchain /usr/local/musl /usr/local/musl
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+ENV PATH="/usr/local/musl/bin:${PATH}"
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN if [ -f /cachi2/cachi2.env ]; then . /cachi2/cachi2.env; fi && \
+    cargo build --release \
+        --target x86_64-unknown-linux-musl \
+        --package openshell-sandbox
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6
+
+RUN microdnf install -y --nodocs \
+        nftables \
+        iptables-nft \
+        iproute \
+        util-linux-core \
+    && microdnf clean all
+
+COPY --from=builder --chmod=0555 \
+    /build/target/x86_64-unknown-linux-musl/release/openshell-sandbox \
+    /openshell-sandbox
+
+LABEL name="openshell-supervisor" \
+      summary="OpenShell supervisor sandbox runtime" \
+      io.k8s.display-name="OpenShell Supervisor"
+
+ENTRYPOINT ["/openshell-sandbox"]

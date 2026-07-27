@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway image for RHEL/Konflux.
+#
+# Multi-stage build that compiles openshell-gateway from source on UBI9.
+# Works locally (podman build) and hermetically in Konflux (cachi2 prefetch).
+#
+#   podman build -f deploy/docker/Containerfile.gateway.konflux \
+#       -t openshell-gateway-konflux .
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6 AS builder
+
+RUN dnf install -y --nodocs \
+        rust cargo \
+        gcc gcc-c++ make cmake \
+        openssl-devel git-core clang-devel \
+        gcc-toolset-14 gcc-toolset-14-gcc-c++ \
+    && dnf clean all
+
+# gcc-toolset-14 provides C++20 <format> header required by bundled Z3.
+# Same pattern as ~/git/builder (AIPCC-10154).
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
+
+RUN if [ -f /cachi2/cachi2.env ]; then . /cachi2/cachi2.env; fi && \
+    cargo build --release \
+        --package openshell-server \
+        --features bundled-z3
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6
+
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all
+
+COPY --from=builder --chmod=0555 \
+    /build/target/release/openshell-gateway \
+    /usr/local/bin/openshell-gateway
+
+LABEL name="openshell-gateway" \
+      summary="OpenShell gateway control-plane server" \
+      io.k8s.display-name="OpenShell Gateway"
+
+USER 1000:1000
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
