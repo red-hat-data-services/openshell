@@ -36,7 +36,17 @@ COPY crates/ crates/
 COPY proto/ proto/
 COPY providers/ providers/
 
-RUN if [ -f /cachi2/cachi2.env ]; then . /cachi2/cachi2.env; fi && \
+# z3-sys bundled build downloads Z3 source from GitHub at build time.
+# For hermetic builds, prefetch the tarball via generic fetcher and point
+# Z3_SYS_BUNDLED_DIR_OVERRIDE at the extracted source.
+ARG Z3_VERSION=4.16.0
+RUN if [ -d /cachi2/deps/generic/z3-z3-${Z3_VERSION} ]; then \
+        export Z3_SYS_BUNDLED_DIR_OVERRIDE=/cachi2/deps/generic/z3-z3-${Z3_VERSION}; \
+    elif [ -f /cachi2/deps/generic/z3-${Z3_VERSION}.tar.gz ]; then \
+        mkdir -p /tmp/z3-src && \
+        tar xzf /cachi2/deps/generic/z3-${Z3_VERSION}.tar.gz -C /tmp/z3-src --strip-components=1 && \
+        export Z3_SYS_BUNDLED_DIR_OVERRIDE=/tmp/z3-src; \
+    fi && \
     cargo build --release \
         --package openshell-server \
         --features bundled-z3
