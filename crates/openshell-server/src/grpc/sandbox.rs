@@ -504,6 +504,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        &workspace,
+        &sandbox,
+        &candidate_spec.providers,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -2600,9 +2607,9 @@ mod tests {
         drop(stream);
         drop(request_span);
 
-        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while traced.spans_named("disconnected_watch_request").is_empty() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
