@@ -7,6 +7,7 @@ mod auth_rpc;
 pub mod policy;
 pub mod provider;
 mod sandbox;
+pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
 pub mod workspace;
@@ -91,6 +92,18 @@ pub fn persistence_error_to_status(
             current_resource_version,
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
+/// Apply the public missing-target contract after authorization and parent checks.
+fn deletion_outcome(deleted: bool, allow_missing: bool, resource: &str) -> Result<i32, Status> {
+    use openshell_core::proto::DeletionOutcome;
+    if deleted {
+        Ok(DeletionOutcome::Completed.into())
+    } else if allow_missing {
+        Ok(DeletionOutcome::AlreadyAbsent.into())
+    } else {
+        Err(Status::not_found(format!("{resource} not found")))
     }
 }
 
@@ -894,7 +907,7 @@ pub mod test_support {
         );
         crate::ensure_default_workspace(&store).await.unwrap();
         let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
-        let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
+        let compute = new_test_runtime_with_driver(store.clone(), "test", driver);
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")
@@ -913,6 +926,9 @@ pub mod test_support {
 // ---------------------------------------------------------------------------
 // Tests for mod-level utilities
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mutation_tests;
 
 #[cfg(test)]
 mod tests {
