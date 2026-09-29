@@ -17,9 +17,9 @@
 # /etc/yum.repos.d from inside the base image.
 contentOrigin:
   repos:
-    - repoid: ubi-9-baseos-rpms
+    - repoid: ubi-9-for-$basearch-baseos-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os/
-    - repoid: ubi-9-appstream-rpms
+    - repoid: ubi-9-for-$basearch-appstream-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
 packages:
   # Build stage: Rust toolchain is prefetched from static.rust-lang.org (see
