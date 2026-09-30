@@ -48,6 +48,11 @@ path = "tests/policy_activation.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "provider_files"
+path = "tests/provider_files.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
@@ -100,11 +105,6 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "podman_host_gateway"
 path = "tests/podman_host_gateway.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
-name = "podman_preflight"
-path = "tests/podman_preflight.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
