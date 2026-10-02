@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Build Konflux images locally using Hermeto prefetched dependencies.
 # Replicates the Konflux hermetic build pipeline (--network none).
 #
 # Prerequisites:
-#   - hermeto (pip install git+https://github.com/hermetoproject/hermeto.git)
+#   - hermeto and rpm (the RPM backend requires a Linux environment)
 #   - podman
 #
 # Usage:
 #   ./deploy/konflux/build-local.sh gateway
 #   ./deploy/konflux/build-local.sh supervisor
 #   ./deploy/konflux/build-local.sh sandbox
+#   ./deploy/konflux/build-local.sh openclaw
+#   ./deploy/konflux/build-local.sh e2e-odh
 #   ./deploy/konflux/build-local.sh all
+#
+# The openclaw smoke test additionally requires host openssl.
 #
 # Override architecture (default: host arch via uname -m):
 #   PLATFORM=linux/arm64 ./deploy/konflux/build-local.sh supervisor
@@ -29,18 +36,37 @@ esac
 PLATFORM="${PLATFORM:-${DEFAULT_PLATFORM}}"
 
 CLEANUP_PATHS=()
+RESTORE_FILES=()
+CONFIG_BACKUP_DIR="$(mktemp -d)"
+cp -p "${REPO_ROOT}/.cargo/config.toml" "${CONFIG_BACKUP_DIR}/root-config.toml"
+if [[ -f "${REPO_ROOT}/e2e/rust/.cargo/config.toml" ]]; then
+    cp -p "${REPO_ROOT}/e2e/rust/.cargo/config.toml" "${CONFIG_BACKUP_DIR}/e2e-config.toml"
+fi
 cleanup() {
+    local i
+    for ((i = 0; i < ${#RESTORE_FILES[@]}; i += 2)); do
+        cp -p "${RESTORE_FILES[i]}" "${RESTORE_FILES[i+1]}"
+    done
+    cp -p "${CONFIG_BACKUP_DIR}/root-config.toml" "${REPO_ROOT}/.cargo/config.toml"
+    if [[ -f "${CONFIG_BACKUP_DIR}/e2e-config.toml" ]]; then
+        cp -p "${CONFIG_BACKUP_DIR}/e2e-config.toml" "${REPO_ROOT}/e2e/rust/.cargo/config.toml"
+    else
+        rm -f "${REPO_ROOT}/e2e/rust/.cargo/config.toml"
+        rmdir "${REPO_ROOT}/e2e/rust/.cargo" 2>/dev/null || true
+    fi
     for p in "${CLEANUP_PATHS[@]}"; do
         rm -rf "$p"
     done
-    git -C "${REPO_ROOT}" checkout .cargo/config.toml 2>/dev/null || true
+    rm -rf "${CONFIG_BACKUP_DIR}"
 }
 trap cleanup EXIT
 
 build_image() {
     local component="$1"
-    local dockerfile konfig_dir output_dir repos_dir
+    local dockerfile konfig_dir output_dir repos_dir prefetch_input image_name
+    image_name="openshell-${component}-konflux"
 
+    prefetch_input=""
     case "$component" in
         gateway)
             dockerfile="deploy/docker/Dockerfile.konflux.gateway"
@@ -58,26 +84,59 @@ build_image() {
             dockerfile="deploy/docker/Dockerfile.konflux.cli"
             konfig_dir="deploy/konflux/cli"
             ;;
+        openclaw)
+            dockerfile="deploy/docker/Dockerfile.konflux.openclaw"
+            konfig_dir="deploy/konflux/openclaw"
+            prefetch_input="[
+            {\"path\": \"${konfig_dir}\", \"type\": \"npm\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"}
+        ]"
+            ;;
+        e2e-odh)
+            image_name="odh-openshell-e2e"
+            dockerfile="deploy/docker/Dockerfile.konflux.e2e-odh"
+            konfig_dir="deploy/konflux/e2e-odh"
+            prefetch_input="[
+            {\"path\": \".\", \"type\": \"cargo\"},
+            {\"path\": \"e2e/rust\", \"type\": \"cargo\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"generic\", \"lockfile\": \"generic-fetcher.yaml\"}
+        ]"
+            ;;
         *)
             echo "Unknown component: $component" >&2
             exit 1
             ;;
     esac
 
+    if [[ -z "${prefetch_input}" ]]; then
+        prefetch_input="[
+            {\"path\": \".\", \"type\": \"cargo\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"generic\", \"lockfile\": \"generic-fetcher.yaml\"}
+        ]"
+    fi
+
     output_dir="${OUTPUT_DIR}/${component}"
     repos_dir=$(mktemp -d)
     CLEANUP_PATHS+=("${repos_dir}")
+
+    if [[ -f "${REPO_ROOT}/${konfig_dir}/package-lock.json" ]]; then
+        local npm_backup
+        npm_backup=$(mktemp -d)
+        CLEANUP_PATHS+=("${npm_backup}")
+        cp -p "${REPO_ROOT}/${konfig_dir}/package.json" "${npm_backup}/package.json"
+        cp -p "${REPO_ROOT}/${konfig_dir}/package-lock.json" "${npm_backup}/package-lock.json"
+        RESTORE_FILES+=("${npm_backup}/package.json" "${REPO_ROOT}/${konfig_dir}/package.json")
+        RESTORE_FILES+=("${npm_backup}/package-lock.json" "${REPO_ROOT}/${konfig_dir}/package-lock.json")
+    fi
 
     echo "=== Prefetching ${component} dependencies ==="
     rm -rf "${output_dir}"
     hermeto fetch-deps \
         --source "${REPO_ROOT}" \
         --output "${output_dir}" \
-        "[
-            {\"path\": \".\", \"type\": \"cargo\"},
-            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"},
-            {\"path\": \"${konfig_dir}\", \"type\": \"generic\", \"lockfile\": \"generic-fetcher.yaml\"}
-        ]"
+        "${prefetch_input}"
 
     echo "=== Injecting files ==="
     hermeto inject-files "${output_dir}" --for-output-dir /cachi2/output
@@ -101,7 +160,8 @@ build_image() {
     hermetic_dockerfile=$(mktemp)
     CLEANUP_PATHS+=("${hermetic_dockerfile}")
     cp "${REPO_ROOT}/${dockerfile}" "${hermetic_dockerfile}"
-    sed -i 's|^\s*RUN |RUN . /cachi2/cachi2.env \&\& \\\n    |i' "${hermetic_dockerfile}"
+    awk '/^[[:space:]]*RUN / { match($0, /RUN /); $0 = substr($0, 1, RSTART - 1) "RUN . /cachi2/cachi2.env && " sprintf("%c", 92) "\n    " substr($0, RSTART + RLENGTH) } { print }' "${hermetic_dockerfile}" > "${hermetic_dockerfile}.injected"
+    mv "${hermetic_dockerfile}.injected" "${hermetic_dockerfile}"
 
     # Disable subscription-manager so it doesn't inject RHEL repos that fail
     # DNS under --network=none. Same as Konflux Tekton script (unlink rhel secrets).
@@ -127,20 +187,32 @@ build_image() {
         --volume "${sm_conf}:/etc/dnf/plugins/subscription-manager.conf:Z" \
         --volume "${empty_secrets}:/run/secrets:Z" \
         --network none \
-        -t "openshell-${component}-konflux" \
+        -t "${image_name}" \
         "${REPO_ROOT}"
 
     echo "=== ${component} built successfully ==="
     # The sandbox runtime image is ubi-micro without crypto-policies.
-    if [[ "${component}" != "sandbox" ]]; then
-        test "$(podman run --rm --user=0 --entrypoint /usr/bin/update-crypto-policies "openshell-${component}-konflux" --show)" = "DEFAULT:PQ"
+    # openclaw stays on UBI 9 with DEFAULT:PQ; smoke-test.sh asserts it.
+    if [[ "${component}" != "sandbox" && "${component}" != "openclaw" ]]; then
+        test "$(podman run --rm --platform "${PLATFORM}" --user=0 --entrypoint /usr/bin/update-crypto-policies "${image_name}" --show)" = "DEFAULT:PQ"
     fi
-    podman run --rm --platform "${PLATFORM}" "openshell-${component}-konflux" --help 2>&1 | head -3
+    if [[ "${component}" == "openclaw" ]]; then
+        PLATFORM="${PLATFORM}" bash "${REPO_ROOT}/deploy/konflux/openclaw/smoke-test.sh" "openshell-${component}-konflux"
+    elif [[ "${component}" == "e2e-odh" ]]; then
+        podman run --rm --platform "${PLATFORM}" --entrypoint openshell "${image_name}" --version
+        podman run --rm --platform "${PLATFORM}" --entrypoint cargo-nextest "${image_name}" \
+            nextest list --archive-file /opt/openshell/e2e-odh.tar.zst \
+            --workspace-remap /home/odh/openshell-e2e-odh/e2e/rust \
+            --config-file /home/odh/openshell-e2e-odh/.config/nextest.toml \
+            --profile e2e-odh --message-format json > /dev/null
+    else
+        podman run --rm --platform "${PLATFORM}" "openshell-${component}-konflux" --help 2>&1 | head -3
+    fi
     echo ""
 }
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 {gateway|supervisor|sandbox|cli|all}" >&2
+    echo "Usage: $0 {gateway|supervisor|sandbox|cli|openclaw|e2e-odh|all}" >&2
     exit 1
 fi
 
@@ -150,6 +222,7 @@ if [[ "$target" == "all" ]]; then
     build_image supervisor
     build_image sandbox
     build_image cli
+    build_image openclaw
 else
     build_image "$target"
 fi

@@ -411,9 +411,13 @@ within it.
 ### Execute a non-interactive command
 
 ```bash
-openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
+openshell sandbox exec my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
+
+The sandbox is a positional name or `--name`, not both; omit it to use the
+last-used sandbox. `--` is required and everything after it is the remote
+command, so put options such as `--tty` before it.
 
 `sandbox exec` starts an independent sibling process and streams output. After
 stdout and stderr drain, it returns the remote command's exit code if delivery
@@ -882,11 +886,13 @@ openshell sandbox create \
   --name my-app \
   --from my-app:latest \
   --expose 8080 \
+  --expose-authorization-mode bearer-passthrough \
   --detach \
   -- ./start-server.sh
 
 # Expose and manage an HTTP service through the gateway.
-openshell service expose my-app 8080 web
+openshell service expose my-app 8080 web \
+  --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
@@ -900,6 +906,19 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+
+Exposed services strip `Authorization` by default. Select
+`bearer-passthrough` only when the application inside the sandbox authenticates
+its own clients. This mode accepts either no `Authorization` header or exactly
+one non-empty Bearer credential and forwards that value unchanged. It rejects
+duplicate, malformed, or non-Bearer authorization before contacting the
+application. The application remains responsible for validating the token, and
+the raw token reaches the sandbox process, so never log it. Service routes
+bypass control-plane RPC authorization, but they still use the gateway's
+existing listener, domain routing, and TLS configuration, including any client
+certificate requirement. See the published
+[sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for the complete security contract.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 
