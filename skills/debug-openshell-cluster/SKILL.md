@@ -249,7 +249,13 @@ errors as connectivity, authorization, or lifecycle failures.
 
 The sandbox container's log holds the sandbox runtime's warnings and the
 main process's stdout and stderr when it runs without a TTY. The supervisor
-container's log holds supervisor diagnostics.
+container's log holds supervisor diagnostics and OCSF shorthand. With
+`ocsf_json_enabled=true`, it also contains compact `OCSF-JSON` records for
+log collectors. Read these through `docker logs <supervisor-container>`;
+`docker cp` does not expose the live `/var/log` tmpfs, and workload exec
+accesses a separate filesystem. See the published
+[OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export)
+for the marker format and delivery limits.
 
 ```bash
 docker info
@@ -293,7 +299,8 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
-- Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Docker and Podman also reject an image `VOLUME` or driver mount that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Custom Docker and Podman workspace changes live in the workload container's writable layer, not a managed named volume. Stop/start of the same container retains them; removing or replacing that container does not. Export files you need before deleting the sandbox.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Local Docker gateway setup cannot copy `openshell-sandbox` after exporting a supervisor image: the sandbox runtime and supervisor are separate artifacts. The runtime image must provide `/openshell-sandbox`; the supervisor image provides `/openshell-supervisor`.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
@@ -309,6 +316,7 @@ Common findings:
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
+- Docker or Podman rejects an explicit `cdi_devices` selector: use a CDI qualified name (`<vendor>/<class>=<name>`), not a host-device path. Syntax validation accepts other vendors; it does not establish that the runtime has the device or that its GPU workload is supported. Consult the published GPU selection documentation for request requirements.
 
 #### Corporate upstream proxy
 
@@ -435,6 +443,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When checking a Helm values migration, compare the rendered `gateway.toml`
+with the intended `gatewayConfig` tables. Explicit resource-admission settings
+and the Kubernetes Secrets credential namespace take precedence over deprecated
+aliases. Confirm the credential driver's namespace matches its Role and
+RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
+the global Helm pull policy applies to runtime and supervisor images.
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
@@ -458,8 +473,9 @@ retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
 stores encrypted credential envelopes in the OpenShell database. For
 `workload.kind=deployment` or multi-replica gateways, confirm
 `server.externalDbSecret` points at a shared database. A render/install error
-mentioning `server.credentialDrivers` means the values selected multiple
-external credential backends.
+mentioning multiple credential drivers means the
+`gatewayConfig.openshell.gateway.credential_drivers` list selected more than
+one external credential backend.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
@@ -634,8 +650,9 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
-If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
-render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
+If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
+mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
 and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
@@ -646,7 +663,7 @@ Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
 driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
+helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
 kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
