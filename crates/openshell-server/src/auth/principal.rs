@@ -32,6 +32,10 @@ pub enum Principal {
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
     /// Gateway replica authenticated for internal peer RPCs.
     Peer(PeerPrincipal),
+    /// The gateway's shared supervisor, authenticated by a gateway-minted
+    /// supervisor token. It may call only the supervisor assignment stream
+    /// and never acts for a user or a sandbox.
+    Supervisor(SupervisorPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -81,6 +85,13 @@ pub struct SandboxPrincipal {
     pub trust_domain: Option<String>,
 }
 
+/// Shared supervisor caller.
+#[derive(Debug, Clone)]
+pub struct SupervisorPrincipal {
+    /// Claims of the verified supervisor token.
+    pub identity: openshell_supervisor_control::HostIdentity,
+}
+
 /// Gateway peer caller.
 #[derive(Debug, Clone)]
 pub struct PeerPrincipal {
@@ -108,4 +119,75 @@ pub enum SandboxIdentitySource {
         driver_name: String,
         runtime_identity: String,
     },
+}
+
+impl Principal {
+    /// One-line caller label for audit records.
+    #[must_use]
+    pub fn audit_actor(&self) -> String {
+        match self {
+            Self::User(user) => format!("user:{}", user.identity.subject),
+            Self::Operator(operator) => format!("operator:{}", operator.identity.subject),
+            Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
+            Self::Peer(peer) => format!("peer:{}", peer.replica_id),
+            Self::Supervisor(supervisor) => format!("supervisor:{}", supervisor.identity.subject),
+            Self::Anonymous => "anonymous".to_string(),
+        }
+    }
+}
+
+/// Principals for tests.
+#[cfg(test)]
+pub mod test_support {
+    use super::{Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use crate::auth::identity::{Identity, IdentityProvider};
+
+    /// An OIDC user with no roles or scopes.
+    pub fn user(subject: &str) -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    /// A sandbox holding a gateway JWT.
+    pub fn sandbox(sandbox_id: &str) -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::identity::IdentityProvider;
+
+    #[test]
+    fn audit_actor_distinguishes_operator_from_user_with_same_subject() {
+        let identity = Identity {
+            subject: "reviewer".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Mtls,
+        };
+        let operator = Principal::Operator(OperatorPrincipal {
+            identity: identity.clone(),
+            certificate_sha256: "certificate-fingerprint".to_string(),
+        });
+        let user = Principal::User(UserPrincipal { identity });
+
+        assert_eq!(operator.audit_actor(), "operator:reviewer");
+        assert_eq!(user.audit_actor(), "user:reviewer");
+    }
 }

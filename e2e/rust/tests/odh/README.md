@@ -28,7 +28,8 @@ e2e/rust/tests/odh/
 │   ├── mod.rs
 │   └── selinux.rs              # combined/sidecar process-supervisor SELinux label
 ├── tier2/                     # Tier 2: medium/low priority positive tests
-│   └── mod.rs                    # empty — no scenarios yet
+│   ├── mod.rs
+│   └── managed_identity.rs    # managed namespace UID/GID and process MCS isolation
 ├── tier3/                      # Tier 3: negative and destructive tests
 │   └── mod.rs                    # empty — no scenarios yet
 ├── tiers.toml                  # data-only gateway modes and ordered tier phases
@@ -59,8 +60,10 @@ plain module is enough — no new crate and no workspace change.
   harness does. `oc_json()` runs a query and parses `-o json` output, panicking
   with a descriptive message on any failure.
 - `odh_harness::selinux::SelinuxAudit` — an opt-in scenario guard that detects
-  OpenShift, requires every Ready worker to report `Enforcing`, records
-  node-local audit cutoffs, and rejects OpenShell AVCs on completion.
+  OpenShift, checks every Ready worker's enforcement mode, records node-local
+  audit cutoffs, and rejects OpenShell AVCs on completion. `begin()` requires
+  enforcement; `begin_if_enforcing()` skips known non-enforcing modes. Both
+  discover workers and check enforcement once, and fail on discovery/access errors.
 
 Put ODH-specific shared helpers here (the `oc` builder and node-level SELinux
 checks), and reuse them rather than
@@ -103,10 +106,20 @@ upstream_tests = ["workspace_namespace_managed"]
 
 Smoke covers gateway reachability, sandbox lifecycle, and image provenance.
 Tier 1 checks the process-supervisor SELinux label and its mapped upstream
-tests. Tier 2 runs `workspace_lifecycle`, ODH Tier 2, and image provenance in
+tests. It excludes four sandbox lifecycle tests after intermittent OpenShift
+failures: `canonical_main_disconnect_reconnect_replays_history_for_same_process`,
+`canonical_main_exit_255_is_not_retried_as_transport_failure`,
+`on_failure_policy_replaces_runtime_and_preserves_workspace`, and
+`canonical_main_and_exec_receive_declared_environment`. Full still includes all four.
+Tier 2 runs `workspace_lifecycle`, ODH Tier 2, and image provenance in
 shared mode, then runs `workspace_namespace_managed` against a separate
 managed-mode deployment. The `odh` and `full` tiers use the same shared then
-managed split. Image provenance runs once in each tier's shared phase. Smoke
+managed split. Each managed phase also selects `tier2::managed_identity::`.
+The shared phases exclude that prefix through `excluded_odh_filters`, so the
+managed-only scenarios do not appear as passes without running isolation checks.
+These validated prefix exclusions apply after all test selections are combined,
+including Full's `all_binaries` selection.
+Image provenance runs once in each tier's shared phase. Smoke
 and Tier 1/3 use only shared mode. Add Rust scenarios by creating a `.rs` file
 under the tier's directory and declaring it with a `mod` line in that tier's
 `mod.rs`; add its selector to the corresponding tier table or mode extension.
@@ -225,6 +238,38 @@ starting and ending with a letter or digit.
 Set `OPENSHELL_E2E_DEPLOY_GATEWAY=0` only to attach to a compatible existing
 gateway; this option works only for single-phase tiers.
 
+### Managed-workspace SCC identity qualification
+
+The managed phase of Tier 2, ODH, and Full qualifies namespace identity
+isolation on OpenShift. The Kubernetes driver creates managed namespaces
+without copying gateway SCC annotations and waits for OpenShift to allocate
+each namespace's own `openshift.io/sa.scc.uid-range`,
+`openshift.io/sa.scc.supplemental-groups`, and `openshift.io/sa.scc.mcs`.
+It resolves the sandbox UID and primary GID from that target namespace.
+The qualification deployment must leave explicit sandbox UID/GID overrides unset.
+
+The expected invariant is non-overlapping UID and group allocations between
+two managed workspace namespaces. Sandbox container identities and running
+workload identities must fall within their own namespace's allocations.
+On enforcing OpenShift, actual workload and supervisor process MCS categories
+must match their namespace allocation and differ between workspaces. Category
+sets are compared dynamically; individual categories may overlap.
+
+These tests create and clean up temporary workspaces, sandboxes, and their
+managed namespaces. Cleanup waits for namespace deletion; access errors or a
+two-minute timeout fail the test and leave fallback cleanup enabled.
+They do not change SCCs, grants, or namespace allocations.
+They require cluster-wide Sandbox reads for namespace discovery and reuse the
+existing `oc` namespace-cleanup and node-debug permissions. Both tests skip outside
+OpenShift or a managed phase; only the MCS test skips when SELinux is not
+enforcing. Discovery, RBAC, malformed allocations, and missing process labels
+are failures on an eligible environment.
+The scenarios share the lifecycle serialization group and have a 15-minute
+nextest timeout to allow cold starts and cleanup.
+The phase runner exports `OPENSHELL_E2E_GATEWAY_MODE` from the resolved plan.
+For a direct single-test invocation against an existing managed gateway, set
+`OPENSHELL_E2E_GATEWAY_MODE=managed` explicitly.
+
 ### SELinux-enforcing OCP validation
 
 Tier 1 includes the SELinux checks when it runs against an OpenShift cluster.
@@ -252,8 +297,8 @@ image, deploying and running one phase at a time. `e2e:odh` runs all ODH
 scenarios; `e2e:odh:full` runs all feature-enabled binaries except the
 managed-only binary in its shared phase, followed by that binary in managed
 mode. Phase JUnit files are named `e2e-odh-<tier>-<phase>.xml`; the entrypoint
-merges them into `e2e-odh-<tier>.xml` and the matching HTML report in
-`results/`.
+merges them into `e2e-odh-<tier>-xunit.xml` for Jenkins discovery and
+`e2e-odh-<tier>.html` in `results/`.
 
 ### Every `e2e:odh*` task runs the image provenance check
 
@@ -393,7 +438,7 @@ use distinct values across parallel invocations. The entrypoint exports
 `OPENSHELL_E2E_RUN_ID` and the derived names so future Python test modes can
 reuse the same invocation identity. The image writes
 phase reports named `e2e-odh-<tier>-<phase>.xml`, then merges them into
-`e2e-odh-<tier>.xml` and `e2e-odh-<tier>.html` in `results/`.
+`e2e-odh-<tier>-xunit.xml` and `e2e-odh-<tier>.html` in `results/`.
 Missing phase reports are skipped, so reports from completed phases remain
 available after a later deployment or preflight failure; the task still exits
 with the failure status.
