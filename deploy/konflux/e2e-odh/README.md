@@ -15,8 +15,8 @@ tasks use the same plan, entrypoint, and deployment path. Tier 2, `odh`, and
 `full` run shared mode followed by managed-workspace mode; each logical tier
 runs image provenance once in the shared phase. The entrypoint preserves
 cleanup on failures and signals, continues after a test-phase failure, and
-merges the ordered JUnit files into one `e2e-odh-<tier>.xml` plus its HTML
-companion. Phase reports remain available as
+merges the ordered JUnit files into one `e2e-odh-<tier>-xunit.xml` for Jenkins
+discovery plus `e2e-odh-<tier>.html`. Phase reports remain available as
 `e2e-odh-<tier>-<phase>.xml`. The no-deploy option is supported only for
 single-phase tiers. Extracted client mTLS material is stored in a mode `0700`
 directory with mode `0600` files. The runtime image owns its home and workspace
@@ -63,3 +63,14 @@ The image name is `odh-openshell-e2e`; Konflux automation generates the
 Tekton YAML files.
 Before merging, validate the local hermetic build on both `linux/amd64` and
 `linux/arm64` using `PLATFORM` with `deploy/konflux/build-local.sh e2e-odh`.
+
+`sync-generic-fetcher.py` keeps the Dockerfile tool versions and the Hermeto
+generic artifacts consistent. `--check` (offline) verifies that the URLs and
+filenames derive from the Dockerfile versions and that checksums are
+well-formed. `--update <tool>` recomputes checksums by downloading both
+architectures concurrently, retrying transient failures and comparing each
+hash with the publisher-provided checksum sidecar. This catches corruption or
+inconsistent responses, but the sidecar is not an independent trust root
+because it comes from the same origin as the artifact. Run it after a Renovate
+bump, as the PR note instructs. Nothing is written unless every download
+succeeds and matches its sidecar.
