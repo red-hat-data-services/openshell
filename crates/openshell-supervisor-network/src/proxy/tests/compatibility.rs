@@ -116,6 +116,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
         let (mut app, mut proxy) = tcp_pair().await;
         deny_forward_destination(
             &mut proxy,
+            &tracing::Span::none(),
             &denial,
             peer,
             "POST",
@@ -543,7 +544,6 @@ network_policies:
                             Arc::new(None),
                             Arc::new(None),
                             Arc::new(None),
-                            None,
                             None,
                             None,
                             None,
