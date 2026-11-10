@@ -101,24 +101,22 @@ RUN . /tmp/build-env && \
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7fbeae18dc9476399f565e68255f602a3374ea8614ba3d14843565131a13ff93
+# UBI 10 — RHEL 10 has PQC crypto by default (no ubi-minimal-pqc / crypto-policies step).
+FROM registry.access.redhat.com/ubi10/ubi-minimal@sha256:f0c7b9ae9914fcf183e7c36fc46864903c2d2caf3af327421913ae54b3d29e94 AS runtime
 
-RUN microdnf install -y --nodocs ca-certificates crypto-policies-scripts git-core \
+RUN microdnf install -y --nodocs ca-certificates git-core \
     && microdnf clean all
-
-# Enable post-quantum cryptography support in the RHEL system policy.
-RUN update-crypto-policies --set DEFAULT:PQ
 
 COPY --from=builder --chmod=0555 /build/output/openshell /usr/local/bin/openshell
 
 LABEL com.redhat.component="odh-openshell-cli-container" \
       description="CLI for OpenShell sandboxed AI agent runtimes" \
       summary="CLI for OpenShell sandboxed AI agent runtimes" \
-      name="rhoai/odh-openshell-cli-rhel9" \
+      name="rhoai/odh-openshell-cli-rhel10" \
       maintainer="['managed-open-data-hub@redhat.com']" \
       io.openshift.expose-services="" \
       io.k8s.display-name="odh-openshell-cli" \
-      io.k8s.description="odh-openshell-cli" \
+      io.k8s.description="odh-openshell-cli-rhel10" \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
 
 USER 1000:1000
