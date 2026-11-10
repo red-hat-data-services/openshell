@@ -17,6 +17,8 @@
 # UBI content is public, so repos are inlined here rather than copied from the
 # image; rpm-lockfile-prototype resolves versions from the CDN and cannot read
 # /etc/yum.repos.d from inside the base image.
+# Build-stage RPMs are still resolved against UBI 9 because the Konflux
+# builder remains rust-rhel9. Runtime is ubi10/ubi-micro with no RPMs.
 # Conforma allows only arch-qualified repo IDs (known_rpm_repositories.yml).
 # Do not copy section names from the UBI image's ubi.repo: ubi-9-baseos-rpms
 # omits the architecture and fails rpm_repos.ids_known. $basearch is expanded
