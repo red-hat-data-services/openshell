@@ -93,6 +93,10 @@ pub struct CredentialProfile {
     pub env_vars: Vec<String>,
     #[serde(default)]
     pub required: bool,
+    /// Preserve an issued workload reference across external value updates.
+    /// Requires environment aliases and excludes gateway-owned credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stable_placeholder: bool,
     #[serde(default)]
     pub auth_style: String,
     #[serde(default)]
@@ -813,6 +817,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -991,6 +996,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -1143,8 +1149,8 @@ impl CredentialRefreshProfile {
 /// Whether the gateway can mint credentials for this refresh strategy (as
 /// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
 ///
-/// Single source of truth shared with `openshell-server`; keep in sync with the
-/// dispatch in `provider_refresh::mint_credential`.
+/// Profile capability predicate. Gateway parity tests keep this aligned with the
+/// embedded issuer's built-in minter registry without a catalog dependency.
 #[must_use]
 pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
     matches!(
@@ -2293,7 +2299,44 @@ pub fn validate_profile_set(
         ));
 
         let mut env_vars = HashSet::new();
+        let co_minted_credentials = profile.co_minted_credential_names();
         for credential in &profile.credentials {
+            // Each credential has one placeholder owner. Gateway-managed
+            // credentials derive their handle from a refresh authorization
+            // epoch, including outputs declared by a sibling credential.
+            if credential.stable_placeholder
+                && (credential
+                    .refresh
+                    .as_ref()
+                    .is_some_and(CredentialRefreshProfile::is_gateway_mintable)
+                    || co_minted_credentials.contains(credential.name.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with gateway-managed credential refresh",
+                ));
+            }
+            // Stored-name fallback credentials have no workload environment
+            // reference. Accepting this opt-in would silently leave them in
+            // revision mode because stable delivery selects environment aliases.
+            if credential.stable_placeholder && credential.env_vars.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder requires at least one environment variable",
+                ));
+            }
+            if credential.stable_placeholder && credential.token_grant.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with token_grant credentials",
+                ));
+            }
             for env_var in &credential.env_vars {
                 if env_var.trim().is_empty() {
                     diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2716,6 +2759,7 @@ pub fn validate_profile_set(
             }
 
             let l7_fields = L7EndpointFields {
+                websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
                 protocol: &endpoint.protocol,
                 access: &endpoint.access,
                 has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
@@ -4316,6 +4360,133 @@ credentials:
         assert_eq!(profile.id, "example");
         assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn stable_placeholder_defaults_false_and_round_trips() {
+        let default_profile = parse_profile_yaml(
+            r"
+id: default-placeholder
+display_name: Default Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+",
+        )
+        .expect("profile should parse");
+        assert!(!default_profile.credentials[0].stable_placeholder);
+
+        let stable_profile = parse_profile_yaml(
+            r"
+id: stable-placeholder
+display_name: Stable Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+",
+        )
+        .expect("profile should parse");
+        assert!(stable_profile.credentials[0].stable_placeholder);
+
+        let proto = stable_profile.to_proto();
+        assert!(proto.credentials[0].stable_placeholder);
+        let round_trip = ProviderTypeProfile::from_proto(&proto);
+        assert!(round_trip.credentials[0].stable_placeholder);
+
+        let exported = profile_to_yaml(&round_trip).expect("yaml");
+        assert!(exported.contains("stable_placeholder: true"));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_co_minted_refresh_outputs() {
+        for id in ["aws", "aws-s3"] {
+            for output in ["secret_access_key", "session_token"] {
+                let mut profile = crate::example_profiles::load(id);
+                let credential = profile
+                    .credentials
+                    .iter_mut()
+                    .find(|credential| credential.name == output)
+                    .expect("example profile refresh output");
+                assert!(credential.refresh.is_none());
+                credential.stable_placeholder = true;
+                let diagnostics = validate_profile_set(&[(format!("{id}.yaml"), profile)]);
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == "credentials.stable_placeholder"
+                        && diagnostic.message
+                            == "stable_placeholder is incompatible with gateway-managed credential refresh"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_credentials_without_environment_aliases() {
+        let profile = parse_profile_yaml(
+            r"
+id: stored-name-placeholder
+display_name: Stored Name Placeholder
+credentials:
+  - name: TOKEN
+    stable_placeholder: true
+",
+        )
+        .expect("stored-name profile should parse");
+        assert_eq!(profile.credentials[0].accepted_stored_keys(), vec!["TOKEN"]);
+        let diagnostics = validate_profile_set(&[("stored-name.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder requires at least one environment variable"
+        }));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_runtime_minted_credentials() {
+        let refresh_profile = parse_profile_yaml(
+            r"
+id: refresh-placeholder
+display_name: Refresh Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://auth.example.com/token
+",
+        )
+        .expect("refresh profile should parse");
+        let refresh_diagnostics =
+            validate_profile_set(&[("refresh.yaml".to_string(), refresh_profile)]);
+        assert!(refresh_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with gateway-managed credential refresh"
+        }));
+
+        let token_grant_profile = parse_profile_yaml(
+            r"
+id: token-grant-placeholder
+display_name: Token Grant Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .expect("token grant profile should parse");
+        let token_grant_diagnostics =
+            validate_profile_set(&[("token-grant.yaml".to_string(), token_grant_profile)]);
+        assert!(token_grant_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with token_grant credentials"
+        }));
     }
 
     #[test]
@@ -6158,6 +6329,42 @@ binaries: ["", /usr/bin/broken]
                 .any(|message| message.starts_with("invalid endpoint"))
         );
         assert!(messages.contains(&"binary path must not be empty"));
+    }
+
+    #[test]
+    fn validate_profile_rejects_rest_websocket_credential_rewrite() {
+        for protocol in ["rest", "REST", "Rest"] {
+            let profile = parse_profile_yaml(
+                r"
+id: rest-rewrite
+display_name: REST rewrite
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    websocket_credential_rewrite: true
+binaries:
+  - /usr/bin/curl
+"
+                .replace("protocol: rest", &format!("protocol: {protocol}"))
+                .as_str(),
+            )
+            .unwrap();
+            let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("use protocol: websocket"))
+            );
+        }
     }
 
     #[test]

@@ -978,9 +978,13 @@ async fn handle_shell_connect(
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -1001,16 +1005,7 @@ async fn handle_shell_connect(
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+        .args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1114,9 +1109,13 @@ async fn handle_exec_command(
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1139,16 +1138,7 @@ async fn handle_exec_command(
     // remote shell parses it correctly.
     let command_str = build_exec_command(command);
     let mut ssh = std::process::Command::new("ssh");
-    ssh.arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+    ssh.args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1209,7 +1199,7 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
     validate_ssh_session_response,
 };
 
@@ -1325,6 +1315,16 @@ fn render_policy_lines(
                 // L7 allow rules.
                 for l7 in &ep.rules {
                     if let Some(allow) = &l7.allow {
+                        if ep.protocol.eq_ignore_ascii_case("mcp") {
+                            render_mcp_rule(
+                                &mut lines,
+                                "Allow",
+                                &allow.method,
+                                allow.params.get("name"),
+                                t,
+                            );
+                            continue;
+                        }
                         let method = if allow.method.is_empty() {
                             "*"
                         } else {
@@ -1341,6 +1341,18 @@ fn render_policy_lines(
                             Span::styled("      Allow: ", t.muted),
                             Span::styled(format!("{method:<6} {target}"), t.text),
                         ]));
+                    }
+                }
+
+                if ep.protocol.eq_ignore_ascii_case("mcp") {
+                    for deny in &ep.deny_rules {
+                        render_mcp_rule(
+                            &mut lines,
+                            "Deny",
+                            &deny.method,
+                            deny.params.get("name"),
+                            t,
+                        );
                     }
                 }
 
@@ -1379,6 +1391,37 @@ fn render_policy_lines(
     }
 
     lines
+}
+
+fn render_mcp_rule(
+    lines: &mut Vec<ratatui::text::Line<'static>>,
+    action: &str,
+    method: &str,
+    tool: Option<&openshell_core::proto::L7QueryMatcher>,
+    theme: &theme::Theme,
+) {
+    use ratatui::text::{Line, Span};
+
+    let method = if method.is_empty() {
+        if tool.is_some() { "tools/call" } else { "*" }
+    } else {
+        method
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("      {action}: "), theme.muted),
+        Span::styled(method.to_string(), theme.text),
+    ]));
+    if let Some(tool) = tool {
+        for name in std::iter::once(&tool.glob)
+            .filter(|name| !name.is_empty())
+            .chain(&tool.any)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("        Tool: ", theme.muted),
+                Span::styled(name.clone(), theme.text),
+            ]));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,9 +1620,13 @@ async fn start_port_forwards(
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {
@@ -1606,16 +1653,7 @@ async fn start_port_forwards(
 
         let mut command = std::process::Command::new("ssh");
         command
-            .arg("-o")
-            .arg(format!("ProxyCommand={proxy_command}"))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("GlobalKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
+            .args(sandbox_ssh_args(&proxy_command, "ERROR"))
             .arg("-o")
             .arg("ConnectTimeout=15")
             .arg("-N")
@@ -2242,6 +2280,7 @@ async fn fetch_providers(
     let mut page_token = String::new();
     loop {
         let req = openshell_core::proto::ListProvidersRequest {
+            label_selector: String::new(),
             page_size: 100,
             page_token,
             workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
@@ -3108,6 +3147,8 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
         x if x == SandboxPhase::Completed as i32 => "Completed",
+        x if x == SandboxPhase::Suspending as i32 => "Suspending",
+        x if x == SandboxPhase::Suspended as i32 => "Suspended",
         _ => "Unknown",
     }
     .to_string()
@@ -3210,6 +3251,12 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
         assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
+    }
+
+    #[test]
+    fn phase_label_covers_suspend_and_resume_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Suspending as i32), "Suspending");
+        assert_eq!(phase_label(SandboxPhase::Suspended as i32), "Suspended");
     }
 }
 
@@ -3448,5 +3495,175 @@ mod sandbox_notes_tests {
         assert_eq!(sandbox_notes(&sandbox, "fwd:8080".into()), "fwd:8080");
         sandbox.status = None;
         assert_eq!(sandbox_notes(&sandbox, String::new()), "");
+    }
+}
+
+#[cfg(test)]
+mod policy_render_tests {
+    use super::*;
+
+    fn policy_lines(yaml: &str) -> Vec<ratatui::text::Line<'static>> {
+        let policy = openshell_policy::parse_sandbox_policy(yaml).expect("valid policy");
+        render_policy_lines(&policy, &theme::Theme::dark())
+    }
+
+    #[test]
+    fn mcp_tool_allowlist_is_visible_one_tool_per_line() {
+        let lines = policy_lines(
+            r"
+version: 1
+network_policies:
+  review:
+    endpoints:
+      - host: host.openshell.internal
+        port: 32443
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/call
+              tool:
+                any:
+                  - local_gh_issue_view
+                  - local_gh_pr_checks
+                  - local_gh_pr_details
+                  - local_gh_pr_diff
+                  - local_gh_pr_list
+                  - local_gh_pr_view
+                  - local_gh_repo_view
+                  - local_gh_run_failed_logs
+                  - local_gh_run_view
+                  - local_gh_source_blob
+                  - local_gh_source_tree
+                  - local_gh_version
+",
+        );
+        let tools: Vec<_> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter_map(|line| line.strip_prefix("        Tool: ").map(str::to_string))
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                "local_gh_issue_view",
+                "local_gh_pr_checks",
+                "local_gh_pr_details",
+                "local_gh_pr_diff",
+                "local_gh_pr_list",
+                "local_gh_pr_view",
+                "local_gh_repo_view",
+                "local_gh_run_failed_logs",
+                "local_gh_run_view",
+                "local_gh_source_blob",
+                "local_gh_source_tree",
+                "local_gh_version",
+            ]
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string() == "      Allow: tools/call")
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("tools/call *"))
+        );
+
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 60, 30));
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(lines),
+            buffer.area,
+            &mut buffer,
+        );
+        for tool in tools {
+            assert!(buffer.content.chunks(60).any(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains(&tool)
+            }));
+        }
+    }
+
+    #[test]
+    fn mcp_methods_and_allow_deny_selectors_preserve_their_scope() {
+        let lines = policy_lines(
+            r"
+version: 1
+network_policies:
+  review:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow:
+              method: tools/list
+          - allow:
+              tool: read_source
+          - allow:
+              method: tools/call
+              params:
+                name:
+                  any: [read_*, list_*]
+        deny_rules:
+          - tool: read_private
+          - method: tools/call
+            params:
+              name:
+                any: [read_secret_*, list_private]
+          - method: resources/read
+  profile:
+    endpoints:
+      - host: profile.example.com
+        port: 443
+        protocol: mcp
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow: {}
+        deny_rules:
+          - {}
+  rest:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        rules:
+          - allow: {method: GET, path: /repos/**}
+",
+        );
+        let text: Vec<_> = lines.iter().map(ToString::to_string).collect();
+        assert!(text.iter().any(|line| line == "      Allow: *"));
+        assert!(text.iter().any(|line| line == "      Deny: *"));
+        let mcp_start = text
+            .iter()
+            .position(|line| line == "      Allow: tools/list")
+            .unwrap();
+        assert_eq!(
+            &text[mcp_start..mcp_start + 12],
+            [
+                "      Allow: tools/list",
+                "      Allow: tools/call",
+                "        Tool: read_source",
+                "      Allow: tools/call",
+                "        Tool: read_*",
+                "        Tool: list_*",
+                "      Deny: tools/call",
+                "        Tool: read_private",
+                "      Deny: tools/call",
+                "        Tool: read_secret_*",
+                "        Tool: list_private",
+                "      Deny: resources/read",
+            ]
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "      Allow: GET    /repos/**")
+        );
     }
 }

@@ -82,15 +82,16 @@ RUN VER="${OPENSHELL_VERSION#v}" \
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7fbeae18dc9476399f565e68255f602a3374ea8614ba3d14843565131a13ff93
+# ubi-minimal-pqc already ships DEFAULT:PQ, so this stage does not install
+# crypto-policies-scripts (and the Python stack it pulls).
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.9@sha256:9aca95ae4e261eab848dc6abdfd08eb4c2453944232021245b2e3108eb25ae18
 
 RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
         ca-certificates \
-        crypto-policies-scripts \
     && microdnf clean all
 
-# Enable post-quantum cryptography support in the RHEL system policy.
-RUN update-crypto-policies --set DEFAULT:PQ
+# Fail the build if the PQC base stops shipping DEFAULT:PQ.
+RUN test "$(cat /etc/crypto-policies/config)" = "DEFAULT:PQ"
 
 COPY --from=builder --chmod=0555 \
     /build/target/release/openshell-gateway \

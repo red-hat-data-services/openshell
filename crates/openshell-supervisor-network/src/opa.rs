@@ -145,7 +145,7 @@ fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
         require_binary_identity,
         source, "Configured OPA runtime binary identity mode"
     );
-    openshell_ocsf::ocsf_emit!(
+    crate::telemetry::egress_emit!(
         openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::Informational)
             .status(openshell_ocsf::StatusId::Success)
@@ -1427,7 +1427,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 
 fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
     for w in warnings {
-        openshell_ocsf::ocsf_emit!(
+        crate::telemetry::egress_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)
@@ -2452,6 +2452,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         // from overlapping host and path selectors.
                         ep["token_grant_owner"] = e.token_grant_owner.clone().into();
                     }
+                    // Every inspected protocol must bind grant reporting to the
+                    // policy selected before credential acquisition.
+                    ep["policy_hash"] = policy_hash.clone().into();
                     if is_mcp_protocol(&e.protocol) {
                         // Derive endpoint identity from the policy endpoint while
                         // it is still available. Request handling carries this
@@ -2459,9 +2462,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         // recomputes identity from a concrete request host.
                         ep["endpoint_id"] =
                             openshell_core::endpoint_status::endpoint_id(e).into();
-                        // The selected endpoint must retain its policy identity
-                        // so it cannot bind to a replacement observation inventory.
-                        ep["policy_hash"] = policy_hash.clone().into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
@@ -3489,17 +3489,15 @@ mod tests {
         assert!(yaml_config.get("endpoint_id").is_none());
         assert!(yaml_config.get("policy_hash").is_none());
         let mut expected = yaml_config.clone();
+        // Grant reporting binds every protocol to the canonical policy. Derive
+        // this metadata independently and compare all remaining configuration.
+        expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
+        assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
         if is_mcp_protocol(&endpoint.protocol) {
-            // Gateway MCP observations carry canonical endpoint/policy identity.
-            // Derive only that metadata independently; compare every remaining
-            // configuration field without filtering actual runtime output.
             expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
-            expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
             assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
-            assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
         } else {
             assert!(proto_config.get("endpoint_id").is_none());
-            assert!(proto_config.get("policy_hash").is_none());
         }
         assert_eq!(
             &expected, proto_config,
@@ -3867,10 +3865,17 @@ network_policies:
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };
-            assert_eq!(
-                yaml_engine.query_endpoint_config(&input).unwrap(),
-                proto_engine.query_endpoint_config(&input).unwrap()
-            );
+            let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap();
+            let proto_config = proto_engine.query_endpoint_config(&input).unwrap();
+            match (&yaml_config, &proto_config) {
+                (Some(yaml_config), Some(proto_config)) => assert_endpoint_config_parity(
+                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
+                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &proto,
+                    &proto.network_policies["parity"].endpoints[0],
+                ),
+                _ => assert_eq!(yaml_config, proto_config),
+            }
             for engine in [&yaml_engine, &proto_engine] {
                 assert!(matches!(
                     engine.evaluate_network_action(&input).unwrap(),
@@ -4561,6 +4566,10 @@ process:
             let mut policy = valid.clone();
             policy["version"] = 1.into();
             policy["network_policies"]["admin"]["endpoints"][0][field] = control;
+            if field == "websocket_credential_rewrite" {
+                policy["network_policies"]["admin"]["endpoints"][0]["protocol"] =
+                    "websocket".into();
+            }
             openshell_policy::parse_sandbox_policy(&policy.to_string()).expect("typed valid twin");
             OpaEngine::from_strings(TEST_POLICY, &policy.to_string()).expect("raw valid twin");
             policy["network_policies"]["admin"]["endpoints"][0][field] = invalid;
@@ -8272,7 +8281,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "gateway.example.com".to_string(),
                     port: 443,
-                    protocol: "rest".to_string(),
+                    protocol: "websocket".to_string(),
                     enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     websocket_credential_rewrite: true,
@@ -11450,6 +11459,7 @@ network_policies:
                 sandbox_id: "sandbox".into(),
                 sandbox_name: "sandbox-name".into(),
                 workspace: "workspace".into(),
+                originating_process: None,
                 scheme: "wss".into(),
                 host: "api.openai.com".into(),
                 port: 443,
@@ -12399,6 +12409,18 @@ network_middlewares:
     middleware: openshell/regex
     endpoints:
       include: ["api[.example.com"]
+"#,
+                "invalid middleware configuration",
+            ),
+            (
+                "selector with a port",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+      exclude: ["api.example.com:22"]
 "#,
                 "invalid middleware configuration",
             ),
