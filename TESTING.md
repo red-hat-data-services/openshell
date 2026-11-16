@@ -124,8 +124,7 @@ plugin through its Windows `.cmd` launcher, and installs the matching locked
 ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
 resolution; it must not upgrade unrelated test dependencies.
 
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
+Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.
 
@@ -330,6 +329,21 @@ nix run .#openshell-test-runner -- run \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
   --family features --package keycloak-provider-refresh
 ```
+
+A suite that needs setup beyond a container engine runs in a feature
+environment, named `<base>-<feature>`, such as `ubuntu-docker-rootful-keycloak`
+or `ubuntu-docker-rootful-cdi`. `features` in `tests/tmachine/config.nix` lists
+each feature's setup playbooks, the inputs they read, and the bases it supports.
+To add one, add an entry there and use the generated environment name in the
+suite's row in `.github/workflows/e2e-suites.yml`. The CDI suite
+(`tests/suites/features/cdi`) runs in `ubuntu-docker-rootful-cdi`, which creates
+hardware-free CDI devices and the host files they reference. The environment
+tells the suite where its scenarios are with `OPENSHELL_TEST_CDI_SCENARIOS`, the
+path of a document that names the device kind, each scenario and the checks it
+expects. Any environment that creates matching devices and sets the variable
+can run the suite. The expectations characterize the sandbox's behavior today,
+not a specification, and the `echo-socket` check needs `perl` in the workload
+image, which the default image has.
 
 ### Python E2E (`e2e/python/`)
 
@@ -541,7 +555,7 @@ Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
@@ -566,14 +580,40 @@ matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
 driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
 Podman user-namespace mappings.
 Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
-the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
-`binaries` installer applies it:
+the gateway with one mode (`default`, `auto`, `keep-id` or `private`) and works
+with every installer; CI runs it with `rpm`:
 
 ```shell
 nix run .#openshell-test-runner -- run \
-  --environment fedora-podman-rootless-userns-keep-id --installer binaries \
-  --gateway tmachine --family drivers/podman
+  --environment fedora-podman-rootless-userns-keep-id --installer rpm \
+  --family drivers/podman
 ```
+
+#### Gateway overrides in an environment
+
+An environment overrides gateway settings by writing the tables to change to
+`/etc/openshell-test/gateway-overrides.toml` in a playbook that runs before the
+installer. The file holds whole tables, such as `[openshell.gateway]` or
+`[openshell.drivers.podman]`, and is not a complete configuration. Each
+installer applies it to the gateway's own file:
+
+- `binaries` applies it to the `/etc/openshell/gateway.toml` it generates.
+- `deb` and `rpm` apply it to the service user's
+  `~/.config/openshell/gateway.toml`, the file the packaged service reads. The
+  file starts as a copy of the rpm's
+  `/usr/share/openshell-gateway/gateway.toml.default`, where the service would
+  seed it on first start, or as a minimal `version = 2` file when the package
+  has no default. No environment replaces the packaged file, and an environment
+  with no overrides leaves it untouched.
+- `k3s` installers ignore the file.
+
+`tests/tmachine/ansible/roles/openshell_gateway/files/merge-gateway-toml.py`
+does the work. Each key in the overrides replaces the same key in the table, or
+is added to it, and a table the file lacks is appended. The rest of the file,
+comments included, stays. The script parses the result and fails the setup,
+leaving the file unchanged, when it isn't valid TOML. It can't remove a key.
+Settings that the packaged service reads from `gateway.env` instead of the
+TOML are not covered.
 
 The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
 image identity and working-directory behavior shared by the Docker and Podman
@@ -809,7 +849,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_corporate_proxy
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:
