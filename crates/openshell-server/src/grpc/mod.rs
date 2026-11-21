@@ -4,14 +4,19 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod mutation_audit;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+pub mod secret;
+pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
+pub mod service_advertisement;
+pub mod service_discovery;
 mod validation;
 pub mod workspace;
 
@@ -51,21 +56,28 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
     RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
     ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ResourceCapabilities, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    SupervisorMessage, SuspendSandboxRequest, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
+};
+use openshell_core::proto::{
+    CreateSecretRequest, DeleteSecretRequest, DeleteSecretResponse, GetSecretRequest,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse, ListSecretsRequest,
+    ListSecretsResponse, RevealSecretRequest, RevealSecretResponse, SecretResponse,
+    UpdateSecretRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -79,8 +91,11 @@ use crate::ServerState;
 /// Map a `PersistenceError` to an appropriate gRPC `Status`.
 ///
 /// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
-/// to signal that the client should retry with fresh data. Other persistence
-/// errors are mapped to `INTERNAL`.
+/// to signal that the client should retry with fresh data. Mutation lock
+/// timeouts are mapped to `UNAVAILABLE` with a retry delay: the mutation lock
+/// was not acquired, so this request's guarded writes did not run. So is a
+/// database without a free connection, which ran no statement. Other
+/// persistence errors are mapped to `INTERNAL`.
 pub fn persistence_error_to_status(
     err: crate::persistence::PersistenceError,
     operation: &str,
@@ -97,6 +112,16 @@ pub fn persistence_error_to_status(
                 current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
             ),
             current_resource_version,
+        ),
+        PersistenceError::LockTimeout(_) => openshell_core::rpc_error::unavailable(
+            "MUTATION_LOCK_TIMEOUT",
+            format!("{operation} timed out waiting for a concurrent mutation; retry the request"),
+            std::time::Duration::from_secs(1),
+        ),
+        PersistenceError::Unavailable(_) => openshell_core::rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            format!("{operation} failed: the database is unavailable; retry the request"),
+            std::time::Duration::from_secs(1),
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
@@ -158,7 +183,7 @@ const MAX_METADATA_ANNOTATIONS_ENTRIES: usize = 128;
 /// Maximum serialized size (bytes) for template Struct fields.
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 /// Maximum serialized size (bytes) for the policy field.
-const MAX_POLICY_SIZE: usize = 262_144;
+const MAX_POLICY_SIZE: usize = openshell_policy::MAX_AUTHORED_POLICY_SIZE;
 /// Maximum length for a provider type slug.
 const MAX_PROVIDER_TYPE_LEN: usize = 64;
 /// Maximum number of entries in the provider `credentials` map.
@@ -184,6 +209,10 @@ struct StoredSettings {
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
     resource_version: u64,
+    /// Database id of the loaded row. Not persisted; a save aborts when the
+    /// row was deleted and recreated under the same name since the load.
+    #[serde(skip)]
+    record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +257,23 @@ impl OpenShellService {
 // ---------------------------------------------------------------------------
 // Trait impl — thin delegation to submodules
 // ---------------------------------------------------------------------------
+
+#[tonic::async_trait]
+impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShellService {
+    async fn update_sandbox(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+}
 
 #[tonic::async_trait]
 impl OpenShell for OpenShellService {
@@ -306,14 +352,39 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn begin_rootfs_tar_staging(
         &self,
         request: Request<BeginRootfsTarStagingRequest>,
     ) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
-        sandbox::handle_begin_rootfs_tar_staging(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested(
+                    "rootfs_staging",
+                    request
+                        .file_name
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or_default(),
+                )],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_begin_rootfs_tar_staging(&self.state, request),
+        )
+        .await
     }
 
     type WatchSandboxStream = sandbox::WatchSandboxStream;
@@ -343,7 +414,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxTemplateRequest>,
     ) -> Result<Response<SandboxTemplateResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let name = request
+                .template
+                .as_ref()
+                .and_then(|template| template.metadata.as_ref())
+                .map_or("", |metadata| metadata.name.as_str());
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox_template", name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_sandbox_template(
@@ -364,7 +447,14 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxTemplateRequest>,
     ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox_template", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn list_sandbox_providers(
@@ -378,14 +468,34 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("provider", &request.provider),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn detach_sandbox_provider(
         &self,
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("provider", &request.provider),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_sandbox_provider_status(
@@ -406,21 +516,78 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_suspend_sandbox(&self.state, request),
+        )
+        .await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.name)],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_resume_sandbox(&self.state, request),
+        )
+        .await
     }
 
     // --- Exec ---
@@ -431,6 +598,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        mutation_audit::record_exec_targets(request.get_ref());
         mutation_replay::run(&self.state, request).await
     }
 
@@ -459,14 +627,35 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        sandbox::handle_create_ssh_session(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.sandbox)],
+            )
+        };
+        mutation_audit::audited(
+            targets,
+            sandbox::handle_create_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     async fn expose_service(
         &self,
         request: Request<ExposeServiceRequest>,
     ) -> Result<Response<ServiceEndpointResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("service", &request.name),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_service(
@@ -487,14 +676,28 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteServiceRequest>,
     ) -> Result<Response<DeleteServiceResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("service", &request.name),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn revoke_ssh_session(
         &self,
         request: Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        sandbox::handle_revoke_ssh_session(&self.state, request).await
+        mutation_audit::audited(
+            Vec::new(),
+            sandbox::handle_revoke_ssh_session(&self.state, request),
+        )
+        .await
     }
 
     // --- Providers ---
@@ -503,7 +706,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let name = request
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref())
+                .map_or("", |metadata| metadata.name.as_str());
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_provider_credentials(
@@ -545,14 +760,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ImportProviderProfilesRequest>,
     ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = mutation_audit::scoped(request.get_ref().workspace_scope.as_ref(), []);
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn update_provider_profiles(
         &self,
         request: Request<UpdateProviderProfilesRequest>,
     ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider_profile", &request.id)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn lint_provider_profiles(
@@ -566,7 +789,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let name = request
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.metadata.as_ref())
+                .map_or("", |metadata| metadata.name.as_str());
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_provider_refresh_status(
@@ -580,35 +815,168 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ConfigureProviderRefreshRequest>,
     ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn rotate_provider_credential(
         &self,
         request: Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn inline_provider_refresh_secrets(
+        &self,
+        request: Request<InlineProviderRefreshSecretsRequest>,
+    ) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider_refresh(
         &self,
         request: Request<DeleteProviderRefreshRequest>,
     ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("provider", &request.provider),
+                    mutation_audit::requested("provider_credential", &request.credential_key),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn delete_provider_profile(
         &self,
         request: Request<DeleteProviderProfileRequest>,
     ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("provider_profile", &request.id)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    // --- Workspace secrets ---
+
+    async fn create_secret(
+        &self,
+        request: Request<CreateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn get_secret(
+        &self,
+        request: Request<GetSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        secret::handle_get_secret(&self.state, request).await
+    }
+
+    async fn list_secrets(
+        &self,
+        request: Request<ListSecretsRequest>,
+    ) -> Result<Response<ListSecretsResponse>, Status> {
+        secret::handle_list_secrets(&self.state, request).await
+    }
+
+    async fn update_secret(
+        &self,
+        request: Request<UpdateSecretRequest>,
+    ) -> Result<Response<SecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn delete_secret(
+        &self,
+        request: Request<DeleteSecretRequest>,
+    ) -> Result<Response<DeleteSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
+    }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<Response<RevealSecretResponse>, Status> {
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("secret", &request.name)],
+            )
+        };
+        mutation_audit::audited(targets, secret::handle_reveal_secret(&self.state, request)).await
     }
 
     // --- Config / Policy ---
@@ -634,6 +1002,14 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn get_sandbox_provider_access_token(
+        &self,
+        request: Request<openshell_core::proto::GetSandboxProviderAccessTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderAccessTokenResponse>, Status>
+    {
+        provider::access_token::handle(&self.state, request).await
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -645,7 +1021,19 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = mutation_audit::update_config_targets(
+            request.get_ref(),
+            self.state.config.audit.capture_setting_values,
+        );
+        let deleting_only = mutation_audit::deletes_only_a_setting(request.get_ref());
+        mutation_audit::audited(
+            targets,
+            mutation_audit::record_absent_delete(
+                deleting_only,
+                mutation_replay::run(&self.state, request),
+            ),
+        )
+        .await
     }
 
     async fn get_sandbox_policy_status(
@@ -719,42 +1107,101 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn reject_draft_chunk(
         &self,
         request: Request<RejectDraftChunkRequest>,
     ) -> Result<Response<RejectDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn approve_all_draft_chunks(
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            let chunks = request
+                .approvals
+                .iter()
+                .map(|approval| mutation_audit::requested("draft_chunk", &approval.chunk_id));
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                std::iter::once(mutation_audit::requested("sandbox", &request.sandbox))
+                    .chain(chunks),
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn edit_draft_chunk(
         &self,
         request: Request<EditDraftChunkRequest>,
     ) -> Result<Response<EditDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn undo_draft_chunk(
         &self,
         request: Request<UndoDraftChunkRequest>,
     ) -> Result<Response<UndoDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [
+                    mutation_audit::requested("sandbox", &request.sandbox),
+                    mutation_audit::requested("draft_chunk", &request.chunk_id),
+                ],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn clear_draft_chunks(
         &self,
         request: Request<ClearDraftChunksRequest>,
     ) -> Result<Response<ClearDraftChunksResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested("sandbox", &request.sandbox)],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_draft_history(
@@ -789,7 +1236,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+        Box::pin(crate::supervisor_session::handle_connect_supervisor(
+            &self.state,
+            request,
+        ))
+        .await
     }
 
     async fn report_main_process_exit(
@@ -822,7 +1273,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateWorkspaceRequest>,
     ) -> Result<Response<CreateWorkspaceResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = vec![mutation_audit::requested(
+            "workspace",
+            &request.get_ref().name,
+        )];
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn get_workspace(
@@ -843,21 +1298,45 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = vec![mutation_audit::requested(
+            "workspace",
+            &request.get_ref().name,
+        )];
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn add_workspace_member(
         &self,
         request: Request<AddWorkspaceMemberRequest>,
     ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested(
+                    "workspace_member",
+                    &request.principal_subject,
+                )],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn remove_workspace_member(
         &self,
         request: Request<RemoveWorkspaceMemberRequest>,
     ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let targets = {
+            let request = request.get_ref();
+            mutation_audit::scoped(
+                request.workspace_scope.as_ref(),
+                [mutation_audit::requested(
+                    "workspace_member",
+                    &request.principal_subject,
+                )],
+            )
+        };
+        mutation_audit::audited(targets, mutation_replay::run(&self.state, request)).await
     }
 
     async fn list_workspace_members(
@@ -896,6 +1375,13 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxProviderStatusRequest>,
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
+    }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<PeerNotifyConfigUpdateResponse>, Status> {
+        crate::config_delivery::handle_peer_notify_config_update(&self.state, request)
     }
 }
 
@@ -949,7 +1435,9 @@ pub mod test_support {
 
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{Principal, UserPrincipal};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::compute::{
         NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
     };
@@ -959,7 +1447,129 @@ pub mod test_support {
     use crate::supervisor_session::SupervisorSessionRegistry;
     use crate::tracing_bus::TracingLogBus;
     use openshell_core::Config;
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use openshell_core::proto::open_shell_server::OpenShellServer;
+    use openshell_core::proto::{
+        GatewayMessage, SupervisorHello, SupervisorMessage, supervisor_message,
+    };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
     use tonic::Request;
+
+    /// A live `ConnectSupervisor` stream against an in-process gateway.
+    pub struct SupervisorStreamHarness {
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        /// Held so the supervisor side of the stream stays open.
+        pub outbound: mpsc::Sender<SupervisorMessage>,
+        pub inbound: tonic::Streaming<GatewayMessage>,
+    }
+
+    impl Drop for SupervisorStreamHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Switch a test state to push configuration delivery.
+    pub fn enable_push_delivery(state: &mut Arc<ServerState>) {
+        Arc::get_mut(state)
+            .expect("test state is not shared yet")
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+    }
+
+    /// Configuration stream features advertised by a test supervisor hello.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StreamFeatures {
+        /// Predates streamed configuration and keeps polling.
+        Legacy,
+        /// Applies and acknowledges streamed configuration.
+        Apply,
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream whose hello
+    /// advertises the given configuration stream features. Returns the gRPC
+    /// status when the gateway rejects the stream before accepting it.
+    pub async fn connect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 0).await
+    }
+
+    /// Model a stock supervisor reconnect, which advances its connection
+    /// epoch.
+    pub async fn reconnect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 1).await
+    }
+
+    async fn connect_supervisor_stream_with_epoch(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+        connection_epoch: u64,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    super::OpenShellService::new(Arc::clone(state)),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap()
+            .max_decoding_message_size(
+                openshell_core::grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES,
+            );
+        let (outbound, rx) = mpsc::channel(4);
+        outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    supports_service_advertisements: false,
+                    sandbox_id: sandbox_id.into(),
+                    instance_id: "instance".into(),
+                    supports_config_push: features == StreamFeatures::Apply,
+                    connection_epoch,
+                    supports_provider_readiness: false,
+                    redirected: false,
+                    supports_session_redirect: false,
+                })),
+            })
+            .await
+            .unwrap();
+        let inbound = match client.connect_supervisor(ReceiverStream::new(rx)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                server.abort();
+                return Err(status);
+            }
+        };
+        Ok(SupervisorStreamHarness {
+            server,
+            outbound,
+            inbound,
+        })
+    }
 
     /// Wrap a proto message in a `Request` with a dev principal injected.
     ///
@@ -1004,6 +1614,7 @@ pub mod test_support {
     fn test_provider_profile_sources() -> crate::provider_profile_sources::ProviderProfileSources {
         crate::provider_profile_sources::ProviderProfileSources::from_config(
             &[openshell_core::GatewayProviderProfileSourceConfig::User],
+            None,
             None,
         )
         .expect("user-only provider profile source configuration should be valid")
@@ -1127,6 +1738,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod mutation_tests;
+#[cfg(test)]
+mod secret_refresh_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1168,6 +1781,66 @@ mod tests {
     }
 
     #[test]
+    fn persistence_error_to_status_maps_mutation_lock_timeout_to_unavailable() {
+        let status = persistence_error_to_status(
+            crate::persistence::PersistenceError::LockTimeout(
+                "waiting for a PostgreSQL advisory lock".into(),
+            ),
+            "acquire provider mutation lock",
+        );
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "acquire provider mutation lock timed out waiting for a concurrent mutation; \
+             retry the request"
+        );
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "MUTATION_LOCK_TIMEOUT"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(std::time::Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn persistence_error_to_status_maps_database_unavailable_to_unavailable() {
+        let status = persistence_error_to_status(
+            crate::persistence::PersistenceError::Unavailable(
+                "pool timed out while waiting for an open connection".into(),
+            ),
+            "workspace lookup",
+        );
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "workspace lookup failed: the database is unavailable; retry the request"
+        );
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "DATABASE_UNAVAILABLE"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(
+            !openshell_core::replica_routing::retry_unrouted(
+                Some(&tonic::metadata::AsciiMetadataValue::from_static(
+                    "openshell-0"
+                )),
+                &status,
+            ),
+            "a gateway that answered must not look like an unrouted edge failure"
+        );
+    }
+
+    #[test]
     fn public_resource_capabilities_preserves_absence() {
         let absent: Option<DriverResourceCapabilities> = None;
         assert!(absent.map(public_resource_capabilities).is_none());
@@ -1193,5 +1866,24 @@ mod tests {
         assert_eq!(public.implementation_name, "openshell/vault");
         assert_eq!(public.protocol_major, 1);
         assert_eq!(public.protocol_minor, 2);
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::service_discovery_server::ServiceDiscovery for OpenShellService {
+    async fn get_service_route_snapshot(
+        &self,
+        request: Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        service_discovery::get_snapshot(&self.state, request).await
+    }
+
+    type WatchServiceRoutesStream = service_discovery::RouteWatchStream;
+
+    async fn watch_service_routes(
+        &self,
+        request: Request<openshell_core::proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        service_discovery::watch(&self.state, request).await
     }
 }

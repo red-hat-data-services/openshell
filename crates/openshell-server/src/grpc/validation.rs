@@ -459,6 +459,17 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
+/// Validate label keys and values using Kubernetes syntax.
+pub(super) fn validate_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<(), Status> {
+    for (key, value) in labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+    Ok(())
+}
+
 /// Validate object annotations.
 ///
 /// Annotation keys use the same qualified-key shape as labels. Annotation
@@ -477,6 +488,33 @@ pub(super) fn validate_annotations(
     )?;
     for key in annotations.keys() {
         validate_label_key(key)?;
+    }
+    Ok(())
+}
+
+/// Annotation key prefix owned by the gateway.
+const RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
+
+/// Validate annotations supplied by an API caller.
+///
+/// Same as [`validate_annotations`], but also rejects keys under the
+/// gateway-owned `internal.openshell.ai/` prefix. The gateway keeps session
+/// and runtime state there and trusts it on read.
+pub(super) fn validate_caller_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_annotations(annotations, field_name)?;
+    if let Some(key) = annotations
+        .keys()
+        .find(|key| key.starts_with(RESERVED_ANNOTATION_PREFIX))
+    {
+        return Err(invalid_argument(
+            field_name,
+            format!(
+                "{field_name} key '{key}' uses the reserved '{RESERVED_ANNOTATION_PREFIX}' prefix"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1014,20 +1052,12 @@ pub(super) fn validate_and_canonicalize_policy(
     })
 }
 
-/// Validate that user-authored policy does not use provider-derived rule keys.
+/// Validate that authored rules do not use provider-derived keys.
 pub(super) fn validate_no_reserved_provider_policy_keys(
     policy: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
-    if let Some(key) = policy
-        .network_policies
-        .keys()
-        .find(|key| openshell_policy::is_provider_rule_name(key))
-    {
-        return Err(Status::invalid_argument(format!(
-            "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
-        )));
-    }
-    Ok(())
+    openshell_policy::validate_authored_rule_names(policy)
+        .map_err(|violations| Status::invalid_argument(violations.join("; ")))
 }
 
 /// Validate that static policy fields (filesystem, landlock, process) haven't changed

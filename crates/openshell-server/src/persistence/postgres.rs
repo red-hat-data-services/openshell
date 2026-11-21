@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+use super::azure_workload_identity::{self, AzureWorkloadIdentity, CredentialPool};
+use super::mutation_lock::{
+    LOCK_CONNECTION_MIN_BUDGET, LockMode, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
+    MUTATION_LOCK_TIMEOUT, MUTATION_LOCK_TIMEOUT_SETTING, MutationLockSet,
 };
+use super::{
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
+};
+use crate::gateway_metrics::GaugeSlot;
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
@@ -16,7 +22,11 @@ use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{Connection, Postgres, QueryBuilder, Row};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
@@ -28,61 +38,520 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
         .map(|migration| migration.sql.as_ref())
 }
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::mutation_admission::{
+    self, ADMISSION_OBJECT_TYPE, AdmissionTx, COUNTER_OBJECT_TYPE, CompletedAdmission, Counter,
+    RECOUNT_STATUS, counter_id,
+};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
+};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
-    pool: PgPool,
+    pub(super) pool: CredentialPool,
+    /// Dedicated connections for session-level mutation advisory locks.
+    lock_pool: CredentialPool,
+    /// How acquisitions and guards use the lock pool's connections.
+    lock_usage: Arc<LockPoolUsage>,
+    /// Data connections that advisory-lock holders on the data pool may keep,
+    /// sized by [`data_lock_slot_count`].
+    data_lock_slots: Arc<Semaphore>,
 }
 
-// Stable cluster-wide key for serializing sandbox/provider cross-object
-// mutations. The bytes spell "OPENSHLL" and stay within PostgreSQL's signed
-// 64-bit advisory-lock key space.
-const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
+/// Lock-pool connections checked out by acquisitions and guards.
+#[derive(Debug)]
+struct LockPoolUsage {
+    /// Connections the lock pool may open.
+    max: u32,
+    /// Checked-out connections, each counted until its pool permit is
+    /// released.
+    in_use: AtomicU32,
+    /// How many times `in_use` reached `max`.
+    became_full: AtomicU64,
+}
 
-// Bounds the wait for the cross-object lock. The holder only validates and
-// writes, so a wait this long means a stuck replica; failing beats blocking
-// every sandbox and provider mutation in the fleet indefinitely.
-const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+/// What a wait for a lock connection saw of the pool when it started.
+#[derive(Clone, Copy)]
+struct LockPoolSnapshot {
+    full: bool,
+    became_full: u64,
+}
 
+impl LockPoolUsage {
+    fn new(max: u32) -> Self {
+        Self {
+            max,
+            in_use: AtomicU32::new(0),
+            became_full: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> LockPoolSnapshot {
+        // Read the counter first: if the pool fills between the two reads,
+        // either read shows it.
+        let became_full = self.became_full.load(Ordering::Acquire);
+        LockPoolSnapshot {
+            full: self.in_use.load(Ordering::Acquire) >= self.max,
+            became_full,
+        }
+    }
+
+    /// Whether every connection was checked out at some point since `start`.
+    /// A connection handed from one guard to the next leaves the count one
+    /// short only briefly, so a contended pool keeps filling up again.
+    fn was_full_since(&self, start: LockPoolSnapshot) -> bool {
+        start.full || self.became_full.load(Ordering::Acquire) != start.became_full
+    }
+}
+
+/// Detail of a lock-pool connection that `PostgreSQL` did not open by the
+/// deadline, though it had at least [`LOCK_CONNECTION_MIN_BUDGET`]. `SQLx`
+/// retries refused connections, `too_many_connections` (53300), and
+/// `cannot_connect_now` (57P03) silently until then.
+const LOCK_CONNECTION_NOT_OPENED: &str = "could not open a mutation lock connection: \
+     PostgreSQL refused the connection, had no free connection slot, was starting up, \
+     or did not answer before the deadline";
+
+/// How long the client waits past the caller's deadline for a lock statement.
+///
+/// Each statement sets `lock_timeout` to the remaining deadline, so
+/// `PostgreSQL` ends the wait on time; this timer only catches a stalled
+/// connection.
+const LOCK_STATEMENT_CLIENT_GRACE: Duration = Duration::from_millis(500);
+
+/// Bound the complete pool return, including the unlock hook and `SQLx`'s ping.
+/// A stalled connection must not retain a lock-pool permit indefinitely.
+pub(super) const LOCK_CONNECTION_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Holds the mutation advisory locks of one acquisition.
+///
+/// Returned to the lock pool on drop; `after_release` runs
+/// `pg_advisory_unlock_all()` before reuse. The entire return is bounded by
+/// [`LOCK_CONNECTION_RELEASE_TIMEOUT`]. An acquisition that `PostgreSQL`
+/// times out (`55P03`) is returned the same way. A cancelled or otherwise failed
+/// acquisition closes its session instead (see [`PendingLockConnection`]).
 pub(super) struct PostgresAdvisoryLockGuard {
-    // `close_on_drop` is set before this guard is constructed. Closing the
-    // dedicated session releases the session-level advisory lock even when a
-    // request is cancelled or returns early.
-    _connection: PoolConnection<Postgres>,
+    connection: PoolConnection<Postgres>,
+    checkout: LockConnectionCheckout,
+}
+
+/// Holds session-level advisory locks on a data-pool connection and one
+/// data-pool lock slot. Dropping a guard whose lock statements all completed
+/// unlocks every key, resets `lock_timeout`, and returns the connection to the
+/// pool; any other drop, or a failed or stalled scrub, closes the connection,
+/// which releases the locks. The slot frees only once the connection is
+/// returned or closed, so it still counts against the slots until then.
+pub(super) struct PostgresDataPoolLockGuard {
+    connection: Option<PoolConnection<Postgres>>,
+    slot: Option<OwnedSemaphorePermit>,
+    /// No lock statement is in flight, so the session can be scrubbed.
+    idle: bool,
+}
+
+impl PostgresDataPoolLockGuard {
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.connection
+            .as_mut()
+            .expect("data-pool lock connection is present until dropped")
+    }
+}
+
+impl Drop for PostgresDataPoolLockGuard {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let slot = self.slot.take();
+        let mut release = DataPoolLockRelease {
+            connection: Some(connection),
+            scrubbed: false,
+        };
+        let idle = self.idle;
+        tokio::spawn(async move {
+            let _slot = slot;
+            if idle {
+                let scrub = sqlx::raw_sql("SELECT pg_advisory_unlock_all(); RESET lock_timeout")
+                    .execute(&mut **release.connection());
+                release.scrubbed = matches!(
+                    tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, scrub).await,
+                    Ok(Ok(_))
+                );
+            }
+            release.finish().await;
+        });
+    }
+}
+
+/// A data-pool lock connection on its way back. It returns to the pool only
+/// once scrubbed; a release that is dropped before then, including when its
+/// task never runs, closes the session instead.
+struct DataPoolLockRelease {
+    connection: Option<PoolConnection<Postgres>>,
+    scrubbed: bool,
+}
+
+impl DataPoolLockRelease {
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.connection
+            .as_mut()
+            .expect("data-pool lock connection is present until released")
+    }
+
+    async fn finish(mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if self.scrubbed {
+            drop(connection);
+        } else {
+            // `close` keeps the pool permit until the session is closed.
+            let _ = tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, connection.close()).await;
+        }
+    }
+}
+
+impl Drop for DataPoolLockRelease {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.close_on_drop();
+        }
+    }
+}
+
+impl Drop for PostgresAdvisoryLockGuard {
+    fn drop(&mut self) {
+        return_lock_connection(&mut self.connection, std::mem::take(&mut self.checkout));
+    }
+}
+
+/// Counts one checked-out lock-pool connection in [`LockPoolUsage`] and in
+/// `openshell_server_mutation_lock_connections_in_use` until dropped. Its
+/// holder drops it only after the connection's pool permit is released.
+#[derive(Default)]
+struct LockConnectionCheckout(Option<(Arc<LockPoolUsage>, GaugeSlot)>);
+
+impl LockConnectionCheckout {
+    fn new(usage: &Arc<LockPoolUsage>) -> Self {
+        if usage.in_use.fetch_add(1, Ordering::AcqRel) + 1 >= usage.max {
+            usage.became_full.fetch_add(1, Ordering::AcqRel);
+        }
+        Self(Some((
+            Arc::clone(usage),
+            GaugeSlot::mutation_lock_connection(),
+        )))
+    }
+}
+
+impl Drop for LockConnectionCheckout {
+    fn drop(&mut self) {
+        // The gauge slot drops with the tuple, so both counts move together.
+        if let Some((usage, _slot)) = self.0.take() {
+            usage.in_use.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn return_lock_connection(
+    connection: &mut PoolConnection<Postgres>,
+    checkout: LockConnectionCheckout,
+) {
+    // SQLx transfers the connection and pool permit into this owned future
+    // immediately. Dropping it on timeout closes the socket and releases the
+    // permit, including when the unlock hook succeeded but the final ping stalls.
+    // This relies on sqlx-core 0.9's doc-hidden `PoolConnection::return_to_pool`;
+    // rerun the `postgres_mutation_lock_stalled_release_*` test on any sqlx bump.
+    let returning = connection.return_to_pool();
+    tokio::spawn(async move {
+        let _checkout = checkout;
+        if tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, returning)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "timed out returning PostgreSQL mutation lock connection; discarded connection"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+impl PostgresAdvisoryLockGuard {
+    /// Backend process id of the session that holds the locks.
+    pub(super) async fn backend_pid(&mut self) -> i32 {
+        let Self { connection, .. } = self;
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read the lock session's backend pid")
+    }
+}
+
+/// A lock-pool connection whose acquisition is still in progress.
+///
+/// Dropping it closes the session, which releases every advisory lock the
+/// backend holds once its current statement ends. A backend blocked on a lock
+/// does not notice the closed socket, so each lock statement carries its own
+/// `lock_timeout` to bound that wait by the caller's deadline.
+struct PendingLockConnection {
+    connection: Option<PoolConnection<Postgres>>,
+    checkout: LockConnectionCheckout,
+}
+
+impl PendingLockConnection {
+    fn new(connection: PoolConnection<Postgres>, usage: &Arc<LockPoolUsage>) -> Self {
+        Self {
+            connection: Some(connection),
+            checkout: LockConnectionCheckout::new(usage),
+        }
+    }
+
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.connection
+            .as_mut()
+            .expect("pending lock connection is present until disarmed")
+    }
+
+    /// Keep the session: every lock was acquired.
+    fn into_guard(mut self) -> PostgresAdvisoryLockGuard {
+        PostgresAdvisoryLockGuard {
+            connection: self
+                .connection
+                .take()
+                .expect("pending lock connection is present until disarmed"),
+            checkout: std::mem::take(&mut self.checkout),
+        }
+    }
+
+    /// Return the healthy session to the pool, whose `after_release` unlocks
+    /// any keys it already holds.
+    fn release(mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            return_lock_connection(&mut connection, std::mem::take(&mut self.checkout));
+        }
+    }
+}
+
+impl Drop for PendingLockConnection {
+    fn drop(&mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            // Still closes the session if the task below never runs.
+            connection.close_on_drop();
+            let checkout = std::mem::take(&mut self.checkout);
+            // `close` keeps the pool permit until the session is closed, and
+            // the connection counts as checked out until then.
+            tokio::spawn(async move {
+                let _checkout = checkout;
+                let _ =
+                    tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, connection.close()).await;
+            });
+        }
+    }
+}
+
+/// Pool ceiling used when the operator has not configured one.
+///
+/// A single shared pool serves every database-backed RPC, so this value is
+/// also the gateway's ceiling on concurrent database work. It is high enough
+/// for a single-replica gateway against a default-sized server; fleets that
+/// outgrow it raise it through `[openshell.gateway] database_max_connections`.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
+/// Smallest pool ceiling an operator may configure.
+///
+/// An SSH identity or provider-refresh lock holder keeps one data connection
+/// for its lock and queries the pool on another. [`data_lock_slot_count`]
+/// caps those holders at half the pool, which needs at least 2.
+pub const MIN_MAX_CONNECTIONS: u32 = 2;
+
+/// How long a data-pool caller waits for a connection, including opening one.
+pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a connect or migration failure means `PostgreSQL` is not serving
+/// yet, so startup retries it. A bad host, credentials, or certificate stays
+/// fatal.
+fn is_unavailable_at_startup(error: &sqlx::Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        ),
+        // read_only_sql_transaction, too_many_connections, admin_shutdown,
+        // crash_shutdown, cannot_connect_now.
+        sqlx::Error::Database(error) => matches!(
+            error.code().as_deref(),
+            Some("25006" | "53300" | "57P01" | "57P02" | "57P03")
+        ),
+        _ => false,
+    }
+}
+
+fn map_startup_error(error: &sqlx::Error) -> PersistenceError {
+    if is_unavailable_at_startup(error) {
+        PersistenceError::Unavailable(error.to_string())
+    } else {
+        map_db_error(error)
+    }
+}
+
+/// Data connections that advisory-lock holders on the data pool may keep at
+/// once: half of `max_connections`, rounded down and clamped to 1, so every
+/// holder can still get a second connection for its queries.
+/// [`PostgresStore::connect`] skips the [`MIN_MAX_CONNECTIONS`] check, so a
+/// pool of 1 still gets one slot.
+fn data_lock_slot_count(max_connections: u32) -> usize {
+    (max_connections / 2).max(1) as usize
 }
 
 impl PostgresStore {
-    pub async fn connect(url: &str) -> PersistenceResult<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(url)
-            .await
-            .map_err(|e| map_db_error(&e))?;
+    /// Connect and size the data and lock pools, falling back to
+    /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
+    pub async fn connect(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+    ) -> PersistenceResult<Self> {
+        Self::connect_with_lock_pool_size(
+            url,
+            max_connections,
+            lock_max_connections.unwrap_or(MUTATION_LOCK_POOL_MAX_CONNECTIONS),
+        )
+        .await
+    }
 
-        Ok(Self { pool })
+    pub(super) async fn connect_with_lock_pool_size(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_pool_size: u32,
+    ) -> PersistenceResult<Self> {
+        Self::connect_with_identity(url, max_connections, lock_pool_size, None).await
+    }
+
+    pub(super) async fn connect_with_identity(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_pool_size: u32,
+        identity: Option<Arc<AzureWorkloadIdentity>>,
+    ) -> PersistenceResult<Self> {
+        let max_connections = max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        tracing::info!(
+            max_connections,
+            lock_max_connections = lock_pool_size,
+            "sizing Postgres connection pools"
+        );
+        let data_options = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT);
+        let lock_options = PgPoolOptions::new()
+            .max_connections(lock_pool_size)
+            .min_connections(0)
+            // Backstop only; callers bound the acquire by their own deadline.
+            .acquire_timeout(MUTATION_LOCK_TIMEOUT)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    // Backstop only: every lock statement sets the remaining
+                    // deadline of its own acquisition.
+                    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                        .bind(MUTATION_LOCK_TIMEOUT_SETTING)
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    // Scrub every returned lock connection. On error sqlx closes
+                    // it, and the backend exit releases whatever it held.
+                    sqlx::query("SELECT pg_advisory_unlock_all()")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(true)
+                })
+            });
+        let (pool, lock_pool) = if let Some(identity) = identity {
+            let connect = azure_workload_identity::validate_url(url)
+                .map_err(|error| PersistenceError::Config(error.to_string()))?;
+            let replica =
+                std::env::var("OPENSHELL_REPLICA_ID").unwrap_or_else(|_| "gateway".into());
+            let pool = CredentialPool::azure(
+                data_options,
+                connect
+                    .clone()
+                    .application_name(&format!("openshell-data/{replica}")),
+                Arc::clone(&identity),
+            );
+            let lock_pool = CredentialPool::azure(
+                lock_options,
+                connect.application_name(&format!("openshell-lock/{replica}")),
+                identity,
+            );
+            drop(
+                pool.acquire()
+                    .await
+                    .map_err(|error| map_startup_error(&error))?,
+            );
+            (pool, lock_pool)
+        } else {
+            let pool = data_options
+                .connect(url)
+                .await
+                .map_err(|error| map_startup_error(&error))?;
+            let lock_pool = lock_options
+                .connect_lazy(url)
+                .map_err(|error| map_db_error(&error))?;
+            (pool.into(), lock_pool.into())
+        };
+
+        Ok(Self {
+            pool,
+            lock_pool,
+            lock_usage: Arc::new(LockPoolUsage::new(lock_pool_size)),
+            data_lock_slots: Arc::new(Semaphore::new(data_lock_slot_count(max_connections))),
+        })
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        self.pool.options().get_max_connections()
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))?;
+            .map_err(|e| match &e {
+                sqlx::migrate::MigrateError::Execute(error)
+                | sqlx::migrate::MigrateError::ExecuteMigration(error, _)
+                    if is_unavailable_at_startup(error) =>
+                {
+                    PersistenceError::Unavailable(e.to_string())
+                }
+                _ => map_migrate_error(&e),
+            })?;
         self.migrate_legacy_time_payloads().await
     }
 
     async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
-        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut transaction = self.pool.begin().await.map_err(|e| map_startup_error(&e))?;
         // Serialize this application-level data migration across gateway replicas.
         sqlx::query("SELECT pg_advisory_xact_lock(3052)")
             .execute(&mut *transaction)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| map_startup_error(&e))?;
         let rows =
             sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|e| map_db_error(&e))?;
+                .map_err(|e| map_startup_error(&e))?;
 
         for row in rows {
             let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
@@ -100,11 +569,14 @@ impl PostgresStore {
                     .bind(id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|e| map_db_error(&e))?;
+                    .map_err(|e| map_startup_error(&e))?;
             }
         }
 
-        transaction.commit().await.map_err(|e| map_db_error(&e))
+        transaction
+            .commit()
+            .await
+            .map_err(|e| map_startup_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -114,40 +586,241 @@ impl PostgresStore {
         conn.ping().await.map_err(|e| map_db_error(&e))
     }
 
-    pub(super) async fn acquire_cross_object_lock(
-        &self,
-    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
-        self.acquire_mutation_lock(CROSS_OBJECT_ADVISORY_LOCK_KEY)
-            .await
-    }
-
-    pub(super) async fn acquire_mutation_lock(
-        &self,
-        key: i64,
-    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
-        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
-        connection.close_on_drop();
-        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(key)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        Ok(PostgresAdvisoryLockGuard {
-            _connection: connection,
-        })
-    }
-
-    /// Test support only: close the underlying connection pool.
+    /// Acquire `locks` as session-level advisory locks, in ascending key
+    /// order, on one lock-pool connection.
     ///
-    /// Do not call from runtime code; this tears down the active pool.
+    /// Fails with [`PersistenceError::LockTimeout`] when the lock connections
+    /// stay checked out, too little time is left to open one, or a lock is
+    /// not granted by `deadline`, and with [`PersistenceError::Database`] when
+    /// `PostgreSQL` does not open a lock connection in at least
+    /// [`LOCK_CONNECTION_MIN_BUDGET`].
+    pub(super) async fn acquire_mutation_locks(
+        &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        let usage_at_start = self.lock_usage.snapshot();
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let connection = match tokio::time::timeout_at(deadline, self.lock_pool.acquire()).await {
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                return Err(self.lock_connection_timeout(usage_at_start, budget));
+            }
+            Ok(Err(error)) => {
+                return Err(PersistenceError::Database(format!(
+                    "could not open a mutation lock connection: {error}"
+                )));
+            }
+            Ok(Ok(connection)) => connection,
+        };
+        let mut pending = PendingLockConnection::new(connection, &self.lock_usage);
+        for (key, mode) in locks.iter() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < Duration::from_millis(1) {
+                // Nothing waits server-side; `after_release` unlocks the keys
+                // taken so far.
+                pending.release();
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a PostgreSQL advisory lock".into(),
+                ));
+            }
+            // `set_config` and the lock run in one statement. A CTE that calls
+            // a volatile function is never inlined, and the outer projection
+            // needs its row, so `lock_timeout` is set before the lock wait
+            // starts. PostgreSQL then abandons the wait at the caller's
+            // deadline even if this future is cancelled and the socket closed.
+            let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
+                LockMode::Exclusive => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock($2) FROM timeout"
+                }
+            };
+            let statement = sqlx::query(sql)
+                .bind(format!("{}ms", remaining.as_millis()))
+                .bind(key)
+                .execute(&mut **pending.connection());
+            match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
+                Err(_) => {
+                    return Err(PersistenceError::LockTimeout(
+                        "waiting for a PostgreSQL advisory lock".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    // 55P03 lock_not_available: the statement's own
+                    // `lock_timeout` ended the wait. The session is healthy:
+                    // return it; `after_release` unlocks the keys already held.
+                    if let Some(db) = error.as_database_error()
+                        && db.code().as_deref() == Some("55P03")
+                    {
+                        let detail = db.message().to_string();
+                        pending.release();
+                        return Err(PersistenceError::LockTimeout(detail));
+                    }
+                    return Err(map_db_error(&error));
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
+        Ok(pending.into_guard())
+    }
+
+    /// Acquire `locks` as session-level advisory locks, in slice order, on one
+    /// data-pool connection instead of the mutation lock pool, so these
+    /// holders never compete with mutation guards for lock connections.
+    /// The locks use the single-`bigint` advisory functions, so a shared lock
+    /// conflicts with an earlier release's `pg_advisory_lock` of the same key.
+    /// Dropping the guard unlocks them and returns the connection, or closes
+    /// it when the session may still be waiting (see
+    /// [`PostgresDataPoolLockGuard`]).
+    ///
+    /// Each holder first takes one of the store's data-pool lock slots
+    /// ([`data_lock_slot_count`]), so holders keep at most half the data
+    /// connections and leave the rest for queries. One deadline of
+    /// [`MUTATION_LOCK_TIMEOUT`] covers the slot, the connection, and every
+    /// lock: a slot, connection, or lock not obtained by then fails with
+    /// [`PersistenceError::LockTimeout`].
+    pub(super) async fn acquire_data_pool_locks(
+        &self,
+        locks: &[(i64, LockMode)],
+    ) -> PersistenceResult<PostgresDataPoolLockGuard> {
+        debug_assert!(!locks.is_empty(), "a data-pool lock guard holds a lock");
+        let deadline = tokio::time::Instant::now() + MUTATION_LOCK_TIMEOUT;
+        let Ok(slot) =
+            tokio::time::timeout_at(deadline, Arc::clone(&self.data_lock_slots).acquire_owned())
+                .await
+        else {
+            let max_connections = self.pool.options().get_max_connections();
+            tracing::warn!(
+                max_connections,
+                slots = data_lock_slot_count(max_connections),
+                "data-pool lock slots stayed busy; raise database_max_connections"
+            );
+            return Err(PersistenceError::LockTimeout(
+                "waiting for a data-pool lock slot".into(),
+            ));
+        };
+        let slot = slot.expect("the data-pool lock slots are never closed");
+        let connection = match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a data-pool lock connection".into(),
+                ));
+            }
+            Ok(Err(error)) => return Err(map_db_error(&error)),
+            Ok(Ok(connection)) => connection,
+        };
+        // From here on, every exit unlocks or closes the connection before the
+        // slot frees, which releases the keys already taken. A statement still
+        // in flight (cancelled, or timed out client-side) leaves the session
+        // waiting, so only a guard with none in flight is scrubbed for reuse.
+        let mut guard = PostgresDataPoolLockGuard {
+            connection: Some(connection),
+            slot: Some(slot),
+            idle: true,
+        };
+        for &(key, mode) in locks {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < Duration::from_millis(1) {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a PostgreSQL advisory lock".into(),
+                ));
+            }
+            // As in `acquire_mutation_locks`, one statement sets the remaining
+            // deadline as `lock_timeout` before the lock wait starts.
+            let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
+                LockMode::Exclusive => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock($2) FROM timeout"
+                }
+            };
+            let statement = sqlx::query(sql)
+                .bind(format!("{}ms", remaining.as_millis()))
+                .bind(key);
+            guard.idle = false;
+            let statement = statement.execute(&mut **guard.connection());
+            match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
+                Err(_) => {
+                    return Err(PersistenceError::LockTimeout(
+                        "waiting for a PostgreSQL advisory lock".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    // 55P03 lock_not_available: the statement's own
+                    // `lock_timeout` ended the wait, and the session is healthy.
+                    if let Some(db) = error.as_database_error()
+                        && db.code().as_deref() == Some("55P03")
+                    {
+                        guard.idle = true;
+                        return Err(PersistenceError::LockTimeout(db.message().to_string()));
+                    }
+                    return Err(map_db_error(&error));
+                }
+                Ok(Ok(_)) => guard.idle = true,
+            }
+        }
+        Ok(guard)
+    }
+
+    /// The error of a lock-pool acquire that ran out of time.
+    ///
+    /// If every lock connection was checked out at some point during the
+    /// wait, the acquire waited for one to come back, which is lock
+    /// contention. So is a wait that started with less than
+    /// [`LOCK_CONNECTION_MIN_BUDGET`] left: an earlier wait, such as for
+    /// local keys, used up the deadline. Otherwise the pool had room the whole
+    /// time and `PostgreSQL` did not open a new connection.
+    fn lock_connection_timeout(
+        &self,
+        start: LockPoolSnapshot,
+        budget: Duration,
+    ) -> PersistenceError {
+        if budget < LOCK_CONNECTION_MIN_BUDGET || self.lock_usage.was_full_since(start) {
+            PersistenceError::LockTimeout("waiting for a mutation lock connection".into())
+        } else {
+            PersistenceError::Database(LOCK_CONNECTION_NOT_OPENED.into())
+        }
+    }
+
+    /// Connections the lock pool may open, as configured.
+    pub(super) fn lock_connection_capacity(&self) -> u32 {
+        self.lock_usage.max
+    }
+
+    /// Connections the lock pool holds, idle or in use.
+    #[cfg(test)]
+    pub(super) fn lock_pool_size(&self) -> u32 {
+        self.lock_pool.size()
+    }
+
+    /// Lock-pool connections that are connected and ready for reuse.
+    #[cfg(test)]
+    pub(super) fn lock_pool_idle(&self) -> usize {
+        self.lock_pool.num_idle()
+    }
+
+    /// Backend process id and `lock_timeout` of a data-pool session.
+    #[cfg(test)]
+    pub(super) async fn data_session(&self) -> (i32, String) {
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('lock_timeout')")
+            .fetch_one(&self.pool)
+            .await
+            .expect("read a data-pool session")
+    }
+
+    /// Test support only: close the underlying connection pools.
+    ///
+    /// Do not call from runtime code; this tears down the active pools.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
         self.pool.close().await;
+        self.lock_pool.close().await;
     }
 
     pub async fn put(
@@ -329,6 +1002,107 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                 })
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let result_of = |row: &sqlx::postgres::PgRow| {
+            let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+            WriteResult {
+                resource_version: resource_version.max(1).cast_unsigned(),
+                created_at_ms: row.get("created_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+            }
+        };
+        let mut results = vec![None; writes.len()];
+        // One transaction on one data-pool connection; dropping it on an
+        // early return rolls every write back. Writes run in a fixed row
+        // order, so concurrent groups take row locks in one order.
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    let row = sqlx::query(
+                        r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r"
+UPDATE objects
+SET payload = $4, updated_at_ms = $5, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r"
+DELETE FROM objects
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
@@ -519,6 +1293,116 @@ RETURNING resource_version, created_at_ms, updated_at_ms
         }))
     }
 
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        mutation_admission::admit(PgAdmission(tx), id, name, bucket, payload, limit).await
+    }
+
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<CompletedAdmission>> {
+        // The object type is a literal so the planner can use the partial indexes
+        // from migration 010, whose predicate it must match exactly.
+        let rows: Vec<(String, Vec<u8>)> = match bucket {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= $1
+ORDER BY updated_at_ms LIMIT $2",
+                )
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(bucket) => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND workspace = $1
+  AND updated_at_ms <= $2
+ORDER BY updated_at_ms LIMIT $3",
+                )
+                .bind(bucket)
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, payload)| CompletedAdmission { id, payload })
+            .collect())
+    }
+
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut mark = QueryBuilder::<Postgres>::new("UPDATE objects SET status = ");
+            mark.push_bind(RECOUNT_STATUS)
+                .push(" WHERE object_type = ")
+                .push_bind(COUNTER_OBJECT_TYPE)
+                .push(" AND workspace IN (SELECT workspace FROM objects WHERE object_type = ")
+                .push_bind(ADMISSION_OBJECT_TYPE)
+                .push(" AND id IN (");
+            let mut separated = mark.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated("))");
+            mark.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+            let mut delete =
+                QueryBuilder::<Postgres>::new("DELETE FROM objects WHERE object_type = ");
+            delete.push_bind(ADMISSION_OBJECT_TYPE).push(" AND id IN (");
+            let mut separated = delete.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            deleted += delete
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = $1 WHERE id = $2")
+            .bind(updated_at_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -593,6 +1477,32 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        let mut existing = HashSet::with_capacity(ids.len());
+        for ids in ids.chunks(EXISTING_IDS_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Postgres>::new("SELECT id FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            existing.extend(rows.iter().map(|row| row.get::<String, _>("id")));
+        }
+        Ok(existing)
     }
 
     pub async fn count_in_workspace(
@@ -1048,6 +1958,50 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+
+        let sandbox_exists = sqlx::query(
+            "SELECT id FROM objects WHERE object_type = 'sandbox' AND id = $1 FOR UPDATE",
+        )
+        .bind(&record.sandbox_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        .is_some();
+
+        if sandbox_exists {
+            sqlx::query(
+                r"
+INSERT INTO objects (
+    object_type, id, scope, version, status, payload, created_at_ms, updated_at_ms, workspace
+)
+SELECT $1, $2, $3, 1, $4, $5, $6, $6, $7
+WHERE NOT EXISTS (SELECT 1 FROM objects WHERE object_type = $1 AND scope = $3)
+ON CONFLICT DO NOTHING
+",
+            )
+            .bind(POLICY_OBJECT_TYPE)
+            .bind(&record.id)
+            .bind(&record.sandbox_id)
+            .bind(&record.status)
+            .bind(wrapped_payload)
+            .bind(record.created_at_ms)
+            .bind(workspace)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        }
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
         Ok(())
     }
 
@@ -1655,6 +2609,87 @@ WHERE object_type = $1 AND scope = $2
     }
 }
 
+struct PgAdmission(sqlx::Transaction<'static, Postgres>);
+
+impl AdmissionTx for PgAdmission {
+    async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
+        // Row lock orders this count against concurrent recount marks.
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT hit_count, status, updated_at_ms FROM objects WHERE object_type = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .fetch_optional(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|(count, status, updated_at_ms)| Counter {
+            count,
+            recount: status.is_some(),
+            updated_at_ms,
+        }))
+    }
+
+    async fn count(&mut self, bucket: &str) -> PersistenceResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE object_type = $1 AND workspace = $2")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .fetch_one(&mut *self.0)
+            .await
+            .map_err(|e| map_db_error(&e))
+    }
+
+    async fn insert(
+        &mut self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)",
+        )
+        .bind(ADMISSION_OBJECT_TYPE)
+        .bind(id)
+        .bind(name)
+        .bind(bucket)
+        .bind(payload)
+        .bind(now_ms)
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn put_counter(
+        &mut self,
+        bucket: &str,
+        counter: &Counter,
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version, hit_count, status)
+VALUES ($1, $2, $3, ''::bytea, $4, $4, '{}'::jsonb, 1, $5, $6)
+ON CONFLICT (id) DO UPDATE SET hit_count = EXCLUDED.hit_count, status = EXCLUDED.status, updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .bind(bucket)
+        .bind(now_ms)
+        .bind(counter.count)
+        .bind(counter.recount.then_some(RECOUNT_STATUS))
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn commit(self) -> PersistenceResult<()> {
+        self.0.commit().await.map_err(|e| map_db_error(&e))
+    }
+}
+
 fn row_to_object_record(row: sqlx::postgres::PgRow) -> ObjectRecord {
     let labels_jsonb: Option<serde_json::Value> = row.get("labels");
     let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
@@ -1698,4 +2733,319 @@ fn row_to_draft_chunk_record(row: sqlx::postgres::PgRow) -> PersistenceResult<Dr
         created_at_ms,
         updated_at_ms,
     )
+}
+
+#[cfg(test)]
+impl PostgresStore {
+    /// Test support only: a store whose pools connect on first use, so it
+    /// can point at an address where `PostgreSQL` does not answer.
+    pub(crate) fn connect_lazy_for_tests(url: &str, lock_pool_size: u32) -> Self {
+        let max_connections = 10;
+        Self {
+            pool: PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect_lazy(url)
+                .expect("build the lazy data pool")
+                .into(),
+            lock_pool: PgPoolOptions::new()
+                .max_connections(lock_pool_size)
+                .min_connections(0)
+                .acquire_timeout(MUTATION_LOCK_TIMEOUT)
+                .connect_lazy(url)
+                .expect("build the lazy lock pool")
+                .into(),
+            lock_usage: Arc::new(LockPoolUsage::new(lock_pool_size)),
+            data_lock_slots: Arc::new(Semaphore::new(data_lock_slot_count(max_connections))),
+        }
+    }
+
+    /// Test support only: a `PostgreSQL` URL on a loopback port where nothing
+    /// listens, so every connection attempt is refused.
+    pub(crate) async fn refusing_url_for_tests() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a loopback port");
+        let port = listener.local_addr().expect("loopback address").port();
+        drop(listener);
+        format!("postgres://openshell@127.0.0.1:{port}/openshell")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::mutation_lock::SSH_IDENTITY_LOCK_KEY;
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
+        let url = PostgresStore::refusing_url_for_tests().await;
+        let started = std::time::Instant::now();
+
+        let error = PostgresStore::connect(&url, None, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3),
+            "connect waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn startup_retries_io_errors_only_while_postgres_does_not_answer() {
+        use std::io::ErrorKind;
+        let io = |kind: ErrorKind| map_startup_error(&sqlx::Error::Io(kind.into()));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Unavailable(_)),
+                "{kind:?}"
+            );
+        }
+        // An unresolvable host, a missing certificate file, a failed TLS handshake.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                matches!(io(kind), PersistenceError::Database(_)),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            2,
+        );
+        let usage = &store.lock_usage;
+        let is_contention = |error: PersistenceError| match error {
+            PersistenceError::LockTimeout(detail) => {
+                assert_eq!(detail, "waiting for a mutation lock connection");
+                true
+            }
+            PersistenceError::Database(detail) => {
+                assert_eq!(detail, LOCK_CONNECTION_NOT_OPENED);
+                false
+            }
+            other => panic!("unexpected lock connection error: {other:?}"),
+        };
+
+        // The pool never filled: PostgreSQL did not open a connection.
+        let start = usage.snapshot();
+        let first = LockConnectionCheckout::new(usage);
+        assert!(!is_contention(
+            store.lock_connection_timeout(start, LOCK_CONNECTION_MIN_BUDGET)
+        ));
+
+        // The pool was full when the wait started.
+        let second = LockConnectionCheckout::new(usage);
+        assert!(is_contention(store.lock_connection_timeout(
+            usage.snapshot(),
+            LOCK_CONNECTION_MIN_BUDGET
+        )));
+
+        // A connection went back and was checked out again during the wait,
+        // as when one guard hands its connection to the next.
+        drop(second);
+        let start = usage.snapshot();
+        drop(LockConnectionCheckout::new(usage));
+        assert!(is_contention(
+            store.lock_connection_timeout(start, LOCK_CONNECTION_MIN_BUDGET)
+        ));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn lock_connection_checkout_tracks_the_in_use_gauge() {
+        const IN_USE: &str = "openshell_server_mutation_lock_connections_in_use";
+        let metrics = crate::gateway_metrics::MetricsCapture::install();
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            2,
+        );
+        let usage = &store.lock_usage;
+
+        let first = LockConnectionCheckout::new(usage);
+        let second = LockConnectionCheckout::new(usage);
+        assert_eq!(metrics.value(IN_USE), Some(2));
+        assert_eq!(usage.in_use.load(Ordering::Acquire), 2);
+
+        // A guard moves its checkout out with `std::mem::take`; the empty
+        // checkout left behind must not decrement again.
+        let mut moved = first;
+        let taken = std::mem::take(&mut moved);
+        drop(moved);
+        assert_eq!(metrics.value(IN_USE), Some(2));
+
+        drop(taken);
+        assert_eq!(metrics.value(IN_USE), Some(1));
+        drop(second);
+        assert_eq!(metrics.value(IN_USE), Some(0));
+        assert_eq!(usage.in_use.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn lock_connection_timeout_without_time_to_connect_is_a_lock_timeout() {
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        // The pool never fills, but an earlier wait left too little time to
+        // open a connection.
+        let start = store.lock_usage.snapshot();
+        let budget = LOCK_CONNECTION_MIN_BUDGET.saturating_sub(Duration::from_millis(1));
+        assert!(matches!(
+            store.lock_connection_timeout(start, budget),
+            PersistenceError::LockTimeout(_)
+        ));
+
+        // SQLx retries the refused connection until the deadline.
+        let deadline = tokio::time::Instant::now() + LOCK_CONNECTION_MIN_BUDGET / 4;
+        match store
+            .acquire_mutation_locks(&MutationLockSet::default(), deadline)
+            .await
+        {
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a mutation lock connection");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
+            Ok(_) => panic!("nothing listens, yet a lock connection opened"),
+        }
+        assert_eq!(store.lock_usage.in_use.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn refused_lock_connection_is_a_database_error_not_a_lock_timeout() {
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        // SQLx retries a refused connection until the deadline, which leaves
+        // ample time to open one.
+        let deadline =
+            tokio::time::Instant::now() + LOCK_CONNECTION_MIN_BUDGET + Duration::from_millis(300);
+        match store
+            .acquire_mutation_locks(&MutationLockSet::default(), deadline)
+            .await
+        {
+            Err(PersistenceError::Database(detail)) => assert!(
+                detail.starts_with("could not open a mutation lock connection"),
+                "{detail}"
+            ),
+            Err(error) => panic!("expected a database error, got {error:?}"),
+            Ok(_) => panic!("nothing listens, yet a lock connection opened"),
+        }
+        assert_eq!(store.lock_usage.in_use.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn data_lock_slots_take_half_the_data_pool() {
+        // `PostgresStore::connect` skips the floor check, so a pool of one
+        // still gets a slot.
+        assert_eq!(data_lock_slot_count(1), 1);
+        assert_eq!(data_lock_slot_count(MIN_MAX_CONNECTIONS), 1);
+        assert_eq!(data_lock_slot_count(3), 1);
+        assert_eq!(data_lock_slot_count(DEFAULT_MAX_CONNECTIONS), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pool_lock_slot_wait_is_bounded_by_the_mutation_lock_timeout() {
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || LogWriter(writer.clone()))
+                .finish(),
+        );
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        let available = u32::try_from(store.data_lock_slots.available_permits())
+            .expect("the slot count fits in u32");
+        let _held = Arc::clone(&store.data_lock_slots)
+            .try_acquire_many_owned(available)
+            .expect("take every data-pool lock slot");
+
+        // The outer timeout turns a missing bound into a failure instead of a
+        // hang. It also fails a data connection acquired before the slot:
+        // SQLx retries the refused connection until its 30-second acquire
+        // timeout, past this one.
+        match tokio::time::timeout(
+            MUTATION_LOCK_TIMEOUT * 2,
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
+        )
+        .await
+        .expect("the slot wait must end by the mutation lock timeout")
+        {
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a data-pool lock slot");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
+            Ok(_) => panic!("every slot is held, yet a data-pool lock was acquired"),
+        }
+        // The warning is what tells slot exhaustion apart from lock contention.
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("data-pool lock slots stayed busy; raise database_max_connections"),
+            "{output}"
+        );
+        assert!(output.contains("max_connections=10"), "{output}");
+        assert!(output.contains("slots=5"), "{output}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_data_pool_lock_acquisition_returns_its_slot() {
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        let slots = store.data_lock_slots.available_permits();
+        // SQLx retries the refused connection until its 30-second acquire
+        // timeout, so the acquisition's own deadline ends the wait first.
+        match tokio::time::timeout(
+            MUTATION_LOCK_TIMEOUT * 2,
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
+        )
+        .await
+        .expect("the data connection wait must end by the mutation lock timeout")
+        {
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a data-pool lock connection");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
+            Ok(_) => panic!("nothing listens, yet a data-pool lock was acquired"),
+        }
+        assert_eq!(
+            store.data_lock_slots.available_permits(),
+            slots,
+            "a failed acquisition returns its data-pool lock slot"
+        );
+    }
 }

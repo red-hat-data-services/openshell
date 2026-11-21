@@ -64,6 +64,8 @@ resolves to a different ID. Without that option, it waits for name absence,
 including any same-name replacement. Pass the same `workspace` to deletion and
 its wait when using a non-default workspace.
 
+Sandbox refs from `create`, `get`, and `list` carry `createdAtMs` (epoch milliseconds), absent when the gateway omits it.
+
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
 the client's lifetime. For long-running service automation, use the renewable
@@ -307,6 +309,21 @@ const status = await client.raw.getSandboxPolicyStatus({
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.
+
+### Raw configuration message migration
+
+`SandboxConfigSnapshot` and `GetSandboxConfigResponse` now include a
+`serviceRoutes` array. The protobuf wire change is additive, and ordinary RPC
+callers continue to receive decoded messages. This field is the supervisor's
+declared application ingress allowlist, not service discovery; an empty array
+installs no application routes.
+
+Complete object literals typed as either generated message must add
+`serviceRoutes: []`. Alternatively, use `create(SandboxConfigSnapshotSchema, init)`
+or `create(GetSandboxConfigResponseSchema, init)` from `@bufbuild/protobuf`, with
+the corresponding schema imported from `@nvidia/openshell-sdk/raw`. Schema-based
+initialization supplies the empty array when omitted. The curated SDK API is
+unchanged.
 
 ## Boundaries
 

@@ -3,6 +3,9 @@
 
 //! Runtime-owned policy DNS listeners for combined Linux supervisors.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
@@ -10,10 +13,9 @@ use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedRes
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_isolation_interface::contract::{
-    DnsTransport, NetworkMediationSource, PendingDnsQuery,
-};
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +30,7 @@ const MEDIATION_ACCEPT_WINDOW: usize = 32;
 const MEDIATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MEDIATION_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn accept_mediated_dns(source: Arc<dyn NetworkMediationSource>) -> PendingDnsQuery {
+async fn accept_mediated_dns(source: Arc<NetworkMediationSource>) -> PendingDnsQuery {
     let mut delay = MEDIATION_RETRY_DELAY;
     loop {
         match source.accept_dns().await {
@@ -85,7 +87,7 @@ impl PolicyDnsRuntimeConfig {
 }
 
 pub(crate) struct PolicyDnsRuntime {
-    pub(crate) store: Arc<ResolvedEndpointStore>,
+    pub(crate) service: Arc<PolicyDnsService>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -94,7 +96,7 @@ impl PolicyDnsRuntime {
     /// TCP listener is bound in the supervisor namespace.
     pub(crate) fn start_mediated(
         policy: Arc<OpaEngine>,
-        source: Arc<dyn NetworkMediationSource>,
+        source: Arc<NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
@@ -110,6 +112,7 @@ impl PolicyDnsRuntime {
             store.clone(),
             trusted_host_gateway,
         ));
+        let dns_service = service.clone();
         let task = tokio::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -125,7 +128,7 @@ impl PolicyDnsRuntime {
                 };
                 let source = source.clone();
                 accepts.push(accept_mediated_dns(source).boxed());
-                let service = service.clone();
+                let service = dns_service.clone();
                 tokio::spawn(async move {
                     let timing = query.timing.clone();
                     let response = match query.transport {
@@ -159,7 +162,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -167,7 +170,7 @@ impl PolicyDnsRuntime {
                 let _ = expiry_store.expire(std::time::Instant::now());
             }
         });
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -176,7 +179,7 @@ impl PolicyDnsRuntime {
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![task, expiry_task],
         })
     }
@@ -236,6 +239,7 @@ impl PolicyDnsRuntime {
         });
 
         let mut tcp_engine_ready = engine_ready;
+        let tcp_service = service.clone();
         let tcp_task = tokio::spawn(async move {
             if tcp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -245,7 +249,7 @@ impl PolicyDnsRuntime {
                     break;
                 };
                 set_tcp_nodelay_best_effort(&stream);
-                let service = service.clone();
+                let service = tcp_service.clone();
                 tokio::spawn(async move {
                     // DNS-over-TCP connections may carry multiple sequential
                     // length-prefixed messages. libc commonly reuses one
@@ -273,7 +277,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -282,7 +286,7 @@ impl PolicyDnsRuntime {
             }
         });
 
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -291,7 +295,7 @@ impl PolicyDnsRuntime {
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![udp_task, tcp_task, expiry_task],
         })
     }
@@ -331,7 +335,7 @@ fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn mediated_dns_accept_retries_errors_with_backoff() {
         use openshell_isolation_interface::contract::{
             BackendError, MediationTiming, ResolveError,
@@ -341,7 +345,7 @@ mod tests {
         struct RecoveringSource(AtomicUsize);
 
         #[async_trait::async_trait]
-        impl NetworkMediationSource for RecoveringSource {
+        impl rpc_test::NetworkMediationSource for RecoveringSource {
             async fn accept_tcp(
                 &self,
             ) -> std::result::Result<
@@ -370,13 +374,19 @@ mod tests {
 
         let source = Arc::new(RecoveringSource(AtomicUsize::new(0)));
         let start = tokio::time::Instant::now();
-        let query = accept_mediated_dns(source.clone()).await;
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accept_mediated_dns(rpc_test::network(source.clone())),
+        )
+        .await
+        .expect("RPC DNS source did not recover");
         assert_eq!(query.message, b"recovered query");
-        assert_eq!(source.0.load(Ordering::Acquire), 3);
+        // The RPC mediation stream may prefetch additional bounded queries.
+        assert!(source.0.load(Ordering::Acquire) >= 3);
         assert!(start.elapsed() >= MEDIATION_RETRY_DELAY * 3);
         // The same source remains usable when the accept window replenishes.
         assert_eq!(
-            accept_mediated_dns(source).await.message,
+            accept_mediated_dns(rpc_test::network(source)).await.message,
             b"recovered query"
         );
     }

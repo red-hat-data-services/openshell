@@ -23,6 +23,14 @@ pub struct DeleteOptions {
     pub allow_missing: bool,
 }
 
+/// Options for resuming a suspended sandbox.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeOptions {
+    /// Boot the workload cleanly when the retained memory state cannot be
+    /// restored. When false, resume fails instead.
+    pub restart_if_restore_fails: bool,
+}
+
 /// A deletion acknowledgement is not necessarily completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -215,6 +223,8 @@ pub enum SandboxPhase {
     Stopped,
     Starting,
     Completed,
+    Suspending,
+    Suspended,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -230,6 +240,8 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Stopped => Self::Stopped,
             proto::SandboxPhase::Starting => Self::Starting,
             proto::SandboxPhase::Completed => Self::Completed,
+            proto::SandboxPhase::Suspending => Self::Suspending,
+            proto::SandboxPhase::Suspended => Self::Suspended,
         }
     }
 }
@@ -390,6 +402,10 @@ pub struct SandboxRef {
     /// Service URLs returned by sandbox creation, keyed by service name. The
     /// empty key identifies the unnamed service. Non-create reads leave this empty.
     pub service_urls: HashMap<String, String>,
+    /// Configured application origins; these do not establish installation readiness.
+    pub application_service_urls: HashMap<String, String>,
+    /// Gateway-routed alternatives.
+    pub gateway_service_urls: HashMap<String, String>,
     pub restart_count: u32,
     pub next_restart_at_ms: Option<i64>,
     pub main_process_started_at_ms: Option<i64>,
@@ -443,6 +459,8 @@ impl SandboxRef {
                 .then_some(sandbox.host_key_fingerprint),
             created_from_workload_template,
             service_urls: HashMap::new(),
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             restart_count,
             next_restart_at_ms,
             main_process_started_at_ms,

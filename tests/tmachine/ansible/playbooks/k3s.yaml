@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install K3s and Helm
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    helm_version: 4.2.0
+    k3s_version: 1.33.13+k3s2
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install download prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    # get.k3s.io serves the latest script, so pin the one from the k3s_version
+    # release tag. Update the checksum whenever k3s_version changes.
+    - name: Download K3s installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/k3s-io/k3s/v{{ k3s_version | urlencode }}/install.sh"
+        checksum: sha256:9ca7930c31179d83bc13de20078fd8ad3e1ee00875b31f39a7e524ca4ef7d9de
+        dest: /tmp/install-k3s.sh
+        mode: "0755"
+
+    - name: Install K3s
+      ansible.builtin.command:
+        argv:
+          - /tmp/install-k3s.sh
+          - server
+          - --disable=servicelb
+          - --disable=traefik
+        creates: /usr/local/bin/k3s
+      environment:
+        INSTALL_K3S_VERSION: "v{{ k3s_version }}"
+
+    - name: Wait for K3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - node
+          - --all
+          - --timeout=120s
+      register: k3s_ready
+      changed_when: false
+      until: k3s_ready.rc == 0
+      retries: 12
+      delay: 5
+
+    - name: Download Helm installer
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/06468084e85c244c712834933d25ea232a4c2093/scripts/get-helm-4
+        checksum: sha256:b68c5f694cff19f14ee8a5784ffd3de27fa7034ec8f973d703fc6fb85496ced7
+        dest: /tmp/install-helm.sh
+        mode: "0755"
+
+    - name: Install Helm
+      ansible.builtin.command:
+        argv:
+          - /tmp/install-helm.sh
+        creates: /usr/local/bin/helm
+      environment:
+        DESIRED_VERSION: "v{{ helm_version }}"
+
+    # This layer is cached across runs, so it must not carry cluster
+    # credentials: every disk built on it would share one CA, token and admin
+    # kubeconfig. Stop K3s and delete the state it created on first start,
+    # keeping the containerd image store (agent/containerd) and the K3s data
+    # directory. The next start generates fresh credentials.
+    - name: Stop K3s and its containers
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s-killall.sh]
+      changed_when: true
+
+    - name: Remove the K3s credentials and cluster state
+      ansible.builtin.shell: |
+        set -eu
+        cd /var/lib/rancher/k3s
+        rm -rf server/tls server/cred server/db server/token server/agent-token server/node-token
+        find agent -maxdepth 1 -type f \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' \) -delete
+        rm -rf /etc/rancher/node/password /etc/rancher/k3s/k3s.yaml /var/lib/kubelet/pods /var/lib/cni
+      changed_when: true
+
+    - name: Check no K3s credentials remain
+      ansible.builtin.shell: |
+        find /var/lib/rancher/k3s/server /var/lib/rancher/k3s/agent /etc/rancher/k3s /etc/rancher/node \
+          -maxdepth 1 \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' -o -name token -o -name password \
+             -o -name 'k3s.yaml' -o -name '*.db' -o -name tls -o -name cred \) -print
+      register: k3s_leftover_credentials
+      changed_when: false
+      failed_when: k3s_leftover_credentials.stdout | length > 0

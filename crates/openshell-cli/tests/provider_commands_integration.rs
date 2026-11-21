@@ -7,33 +7,32 @@ use helpers::TempDir;
 use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant,
-    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
-    ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt, ProviderProfile,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderReadinessObservation,
-    ProviderReadinessReason, ProviderReadinessState, ProviderReadinessStatus, ProviderResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, WorkspaceSelector,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    ExecSandboxRequest, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxProviderStatusRequest,
+    GetSandboxProviderStatusResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
+    ProviderCredentialRefresh, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderCredentialTokenGrant, ProviderCredentialTokenGrantSubjectToken,
+    ProviderCredentialTokenGrantType, ProviderDesiredIdentity, ProviderMutationKind,
+    ProviderMutationReceipt, ProviderProfile, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
+    ProviderReadinessStatus, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SettingValue, UpdateProviderRequest, WatchSandboxRequest,
+    WorkspaceSelector,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 use openshell_core::{ObjectId, ObjectName};
+use openshell_server::test_support::grpc::open_shell_server::{OpenShell, OpenShellServer};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -79,6 +78,7 @@ fn selected_workspace(scope: &Option<WorkspaceSelector>) -> Option<&str> {
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    supports_stable_placeholder: Arc<AtomicBool>,
     scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
@@ -110,6 +110,8 @@ struct ProviderState {
     readiness_sequence: Arc<AtomicU64>,
     corrupt_mutation_receipt: Arc<Mutex<Option<ReceiptCorruption>>>,
     fail_mutation_after_save: Arc<Mutex<Option<Status>>>,
+    /// Plain resource-version conflicts to return before an attachment saves.
+    sandbox_provider_conflicts: Arc<AtomicU64>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
@@ -124,6 +126,7 @@ enum ProviderRefreshRequestLog {
         credential_key: String,
         material: HashMap<String, String>,
         secret_material_keys: Vec<String>,
+        material_secrets: HashMap<String, String>,
         expires_at_ms: Option<i64>,
     },
     Rotate {
@@ -232,27 +235,6 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
-    async fn peer_report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_report_endpoint_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn peer_get_sandbox_provider_status(
-        &self,
-        _request: tonic::Request<GetSandboxProviderStatusRequest>,
-    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
@@ -260,34 +242,6 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(
             openshell_core::proto::ReportEndpointStatusResponse {},
         ))
-    }
-
-    async fn begin_rootfs_tar_staging(
-        &self,
-        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
-    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn report_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn finalize_main_process_exit(
-        &self,
-        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
-    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
-    }
-
-    async fn get_current_user(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
-    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
-        Err(Status::unimplemented("not used by this test server"))
     }
 
     async fn health(
@@ -300,32 +254,11 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    async fn get_gateway_info(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
-    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn create_sandbox(
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn stop_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn start_sandbox(
-        &self,
-        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn get_sandbox(
@@ -339,6 +272,8 @@ impl OpenShell for TestOpenShell {
         let name = request.name;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("sb-{name}"),
@@ -364,8 +299,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
-
-    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -421,6 +354,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         if !self
             .state
             .providers
@@ -483,6 +428,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
@@ -639,15 +596,6 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
-    async fn report_provider_readiness(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
-        Err(Status::unimplemented(
-            "provider installation reports are not exercised by this mock",
-        ))
-    }
-
     async fn create_ssh_session(
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,
@@ -664,39 +612,11 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_service(
-        &self,
-        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
-    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn list_services(
-        &self,
-        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
-    async fn delete_service(
-        &self,
-        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
-    }
-
-    async fn exchange_provider_subject_token(
-        &self,
-        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
-    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
-        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(
@@ -749,13 +669,6 @@ impl OpenShell for TestOpenShell {
             provider: Some(provider),
             ..Default::default()
         }))
-    }
-
-    async fn get_provider_credentials(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
-        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(
@@ -1031,6 +944,10 @@ impl OpenShell for TestOpenShell {
             openshell_core::proto::LintProviderProfilesResponse {
                 diagnostics: Vec::new(),
                 valid: true,
+                supports_stable_placeholder: self
+                    .state
+                    .supports_stable_placeholder
+                    .load(Ordering::SeqCst),
             },
         ))
     }
@@ -1190,6 +1107,7 @@ impl OpenShell for TestOpenShell {
                 credential_key: request.credential_key.clone(),
                 material: request.material.clone(),
                 secret_material_keys: request.secret_material_keys.clone(),
+                material_secrets: request.material_secrets.clone(),
                 expires_at_ms: request
                     .expiration_time
                     .as_ref()
@@ -1222,6 +1140,7 @@ impl OpenShell for TestOpenShell {
             failure_code: String::new(),
             provider_error_subtype: String::new(),
             last_error_time: None,
+            material_secrets: HashMap::new(),
         };
         drop(providers);
         self.state
@@ -1365,254 +1284,24 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    type WatchSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
-    type ExecSandboxStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    type ConnectSupervisorStream =
-        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
-
     async fn watch_sandbox(
         &self,
         _request: tonic::Request<WatchSandboxRequest>,
-    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<SandboxStreamEvent>>, Status> {
         let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
     }
 
     async fn exec_sandbox(
         &self,
         _request: tonic::Request<ExecSandboxRequest>,
-    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ExecSandboxEvent>>, Status> {
         let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
-    }
-
-    type ExecSandboxInteractiveStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    async fn exec_sandbox_interactive(
-        &self,
-        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
-    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_config(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_sandbox_policies(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_sandbox_configuration(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_logs(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn push_sandbox_logs(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn submit_policy_analysis(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_policy(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn reject_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_all_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn edit_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn undo_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn clear_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_history(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn issue_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn refresh_sandbox_token(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
-    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn connect_supervisor(
-        &self,
-        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
-    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type RelayStreamStream =
-        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
-
-    async fn relay_stream(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<Response<Self::RelayStreamStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::PeerRelayFrame, Status>,
-    >;
-
-    async fn peer_relay(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
-    ) -> Result<Response<Self::PeerRelayStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::TcpForwardFrame, Status>,
-    >;
-
-    async fn forward_tcp(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
-    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn create_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspaces(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_workspace(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn add_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn remove_workspace_member(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
-    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_workspace_members(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
-    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
@@ -3427,6 +3116,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "table",
         "default",
@@ -3739,6 +3429,7 @@ async fn provider_list_json_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "json",
         "default",
@@ -3782,6 +3473,7 @@ async fn provider_list_yaml_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "yaml",
         "default",
@@ -3809,6 +3501,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
+        "",
         "",
         false,
         "json",
@@ -3849,6 +3542,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             secret_material_env: &[],
             secret_material_keys: &["client_secret".to_string()],
             credential_expires_at_ms: Some(1_767_225_600_000),
+            material_secrets: &[],
         },
         "default",
         &ts.tls,
@@ -3892,6 +3586,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
                 secret_material_keys: vec!["client_secret".to_string()],
+                material_secrets: HashMap::new(),
                 expires_at_ms: Some(1_767_225_600_000),
             },
             ProviderRefreshRequestLog::Status {
@@ -3945,6 +3640,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
                     ],
                     secret_material_keys: &[],
                     credential_expires_at_ms: None,
+                    material_secrets: &[],
                 },
                 "default",
                 &ts.tls,
@@ -3966,11 +3662,94 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
                         ("private_key".to_string(), "pem-from-env".to_string()),
                     ]),
                     secret_material_keys: vec!["private_key".to_string()],
+                    material_secrets: HashMap::new(),
                     expires_at_ms: None,
                 }]
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_sends_workspace_secret_references_as_secret_keys() {
+    let ts = run_server().await;
+    install_test_profile(&ts, "custom-chat", "GOOGLE_CHAT_ACCESS_TOKEN").await;
+    run::provider_create(
+        &ts.endpoint,
+        "alice-mcp",
+        "custom-chat",
+        false,
+        &["GOOGLE_CHAT_ACCESS_TOKEN=pending".to_string()],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "alice-mcp",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "oauth2_client_credentials",
+            material: &["client_id=client-id".to_string()],
+            secret_material_env: &[],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+            material_secrets: &["client_secret=acme-oauth-client".to_string()],
+        },
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![ProviderRefreshRequestLog::Configure {
+            provider: "alice-mcp".to_string(),
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN".to_string(),
+            material: HashMap::from([("client_id".to_string(), "client-id".to_string())]),
+            // Listed so gateways that predate workspace secrets reject the
+            // request rather than ignore the reference.
+            secret_material_keys: vec!["client_secret".to_string()],
+            material_secrets: HashMap::from([(
+                "client_secret".to_string(),
+                "acme-oauth-client".to_string()
+            )]),
+            expires_at_ms: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_rejects_key_supplied_inline_and_by_secret() {
+    let ts = run_server().await;
+    let err = run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "alice-mcp",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "oauth2_client_credentials",
+            material: &["client_secret=inline".to_string()],
+            secret_material_env: &[],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+            material_secrets: &["client_secret=acme-oauth-client".to_string()],
+        },
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("a key cannot come from both inline material and a secret");
+    assert!(
+        err.to_string()
+            .contains("duplicate material key 'client_secret'")
+    );
+    assert!(ts.state.refresh_requests.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -3989,6 +3768,7 @@ async fn provider_refresh_configure_rejects_key_supplied_via_both_material_and_e
                     secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DUP_KEY".to_string()],
                     secret_material_keys: &[],
                     credential_expires_at_ms: None,
+                    material_secrets: &[],
                 },
                 "default",
                 &ts.tls,
@@ -4020,6 +3800,7 @@ async fn provider_refresh_configure_fails_closed_when_secret_material_env_is_uns
             secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DEFINITELY_UNSET".to_string()],
             secret_material_keys: &[],
             credential_expires_at_ms: None,
+            material_secrets: &[],
         },
         "default",
         &ts.tls,
@@ -4056,6 +3837,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     );
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &["team=ml".into()],
         server: &ts.endpoint,
         name: "custom-refresh-provider",
         provider_type: "custom-refresh",
@@ -4072,6 +3854,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let stored = ts.state.providers.lock().await;
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
+    assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
     assert!(provider.credentials.is_empty());
 }
 
@@ -4353,6 +4136,73 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
             provider: "missing-provider".to_string(),
         }]
     );
+}
+
+#[tokio::test]
+async fn provider_profile_stable_placeholder_checks_support_before_writing() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().expect("profile directory");
+    let path = dir.path().join("external.yaml");
+    let stable = r"
+id: external
+display_name: External
+category: other
+resource_version: 1
+credentials:
+  - name: token
+    env_vars: [EXTERNAL_TOKEN]
+    stable_placeholder: true
+endpoints:
+  - host: api.example.com
+    port: 443
+";
+    std::fs::write(&path, stable).expect("stable profile");
+    let error =
+        run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+            .await
+            .expect_err("legacy gateway cannot import the opt-in");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support stable_placeholder")
+    );
+    assert!(ts.state.profiles.lock().await.is_empty());
+    assert!(
+        run::provider_profile_lint(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+
+    // A legacy gateway still accepts ordinary profiles through the old path.
+    std::fs::write(
+        &path,
+        stable.replace("stable_placeholder: true", "stable_placeholder: false"),
+    )
+    .expect("ordinary profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+        .await
+        .expect("ordinary import");
+    let original = ts.state.profiles.lock().await["external"].clone();
+    std::fs::write(&path, stable).expect("enable opt-in");
+    assert!(
+        run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+    assert_eq!(ts.state.profiles.lock().await["external"], original);
+
+    ts.state
+        .supports_stable_placeholder
+        .store(true, Ordering::SeqCst);
+    run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+        .await
+        .expect("supporting gateway update");
+    assert!(ts.state.profiles.lock().await["external"].credentials[0].stable_placeholder);
+    std::fs::write(&path, stable.replace("id: external", "id: second")).expect("second profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+        .await
+        .expect("supporting gateway import");
+    assert!(ts.state.profiles.lock().await["second"].credentials[0].stable_placeholder);
 }
 
 #[tokio::test]
@@ -5305,6 +5155,7 @@ async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "openai-inline",
         provider_type: "openai",
@@ -5341,6 +5192,7 @@ async fn provider_create_prefers_exact_imported_alias_profile() {
     install_test_profile(&ts, "gh", "GITHUB_TOKEN").await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "enterprise-github",
         provider_type: "gh",
@@ -5535,17 +5387,18 @@ async fn provider_create_from_gcloud_adc_happy_path() {
 
     Environment::from_pairs(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)])
         .run_async(async {
-            run::provider_create(
-                &ts.endpoint,
-                "my-vertex",
-                "google-vertex-ai",
-                false,
-                &[],  // no explicit credentials; refresh bootstrap covers it
-                true, // from_gcloud_adc
-                &[],
-                "default",
-                &ts.tls,
-            )
+            run::provider_create_with_options(run::ProviderCreateOptions {
+                server: &ts.endpoint,
+                name: "my-vertex",
+                provider_type: "google-vertex-ai",
+                labels: &["team=ml".into()],
+                credentials: &[],
+                credential_source: run::ProviderCreateCredentialSource::GcloudAdc,
+                config: &[],
+                workspace: "default",
+                profile_workspace: "default",
+                tls: &ts.tls,
+            })
             .await
             .expect("provider_create with --from-gcloud-adc should succeed");
 
@@ -5555,6 +5408,7 @@ async fn provider_create_from_gcloud_adc_happy_path() {
                 .get("my-vertex")
                 .expect("provider should be stored after create");
             assert_eq!(provider.r#type, "google-vertex-ai");
+            assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
             assert_eq!(
                 provider
                     .credentials
@@ -6092,4 +5946,96 @@ async fn provider_create_from_gcloud_adc_missing_client_secret() {
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn provider_attachment_retries_resource_version_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for action in ["attach", "detach"] {
+        let sandbox_name = "conflicted";
+        server.state.sandbox_providers.lock().await.insert(
+            sandbox_name.to_string(),
+            if action == "attach" {
+                Vec::new()
+            } else {
+                vec![READINESS_PROVIDER.to_string()]
+            },
+        );
+        server.state.sandbox_provider_requests.lock().await.clear();
+        server
+            .state
+            .sandbox_provider_conflicts
+            .store(2, Ordering::SeqCst);
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "sandbox",
+                "provider",
+                action,
+                sandbox_name,
+                READINESS_PROVIDER,
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{action}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            server.state.sandbox_provider_requests.lock().await.len(),
+            3,
+            "{action} retried each conflict once"
+        );
+        assert_eq!(
+            server
+                .state
+                .sandbox_providers
+                .lock()
+                .await
+                .get(sandbox_name)
+                .unwrap()
+                .contains(&READINESS_PROVIDER.to_string()),
+            action == "attach"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_attachment_reports_persistent_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("contended".to_string(), Vec::new());
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(u64::MAX, Ordering::SeqCst);
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "attach",
+            "contended",
+            READINESS_PROVIDER,
+        ],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Please retry the command"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.state.sandbox_provider_requests.lock().await.len(), 5);
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(0, Ordering::SeqCst);
 }

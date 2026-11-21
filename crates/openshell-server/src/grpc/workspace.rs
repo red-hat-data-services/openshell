@@ -68,8 +68,8 @@ fn membership_filter_subject<'a>(
             }
         }
         Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot list workspaces",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals cannot list workspaces",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
@@ -130,7 +130,7 @@ pub async fn resolve_workspace(
     let ws: Option<Workspace> = store
         .get_message_by_name("", &name)
         .await
-        .map_err(|e| Status::internal(format!("workspace lookup failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "workspace lookup"))?;
 
     match ws {
         Some(ws) => {
@@ -403,6 +403,10 @@ pub(super) async fn handle_delete_workspace(
             StoredProviderCredentialRefreshState::object_type(),
             "credential refresh state",
         ),
+        (
+            crate::storage_proto::StoredWorkspaceSecret::object_type(),
+            "secret",
+        ),
     ] {
         let records = state
             .store
@@ -457,7 +461,11 @@ pub(super) async fn handle_delete_workspace(
     }))
 }
 
-pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), Status> {
+pub(super) fn authorize_member_role(
+    role: i32,
+    grant: AuthGrant,
+    principal: &Principal,
+) -> Result<(), Status> {
     let role = WorkspaceRole::try_from(role).unwrap_or(WorkspaceRole::Unspecified);
     if role == WorkspaceRole::Unspecified {
         return Err(Status::invalid_argument(
@@ -465,7 +473,9 @@ pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), S
         ));
     }
     if role == WorkspaceRole::Admin && grant != AuthGrant::PlatformAdmin {
-        return Err(Status::permission_denied(
+        return Err(crate::auth::audit::deny(
+            principal,
+            crate::auth::audit::AuthzDenial::PlatformAdminRequired,
             "only platform admins can assign the workspace admin role",
         ));
     }
@@ -495,7 +505,7 @@ pub(super) async fn handle_add_workspace_member(
         return Err(Status::invalid_argument("principal_subject is required"));
     }
 
-    authorize_member_role(req.role, authz.grant)?;
+    authorize_member_role(req.role, authz.grant, &principal)?;
 
     let count = state
         .store
@@ -982,6 +992,54 @@ mod tests {
         assert!(
             err.message().contains("ssh session"),
             "error should name ssh session as blocker: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_blocked_by_workspace_secret() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "secretive".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let secret = crate::storage_proto::StoredWorkspaceSecret {
+            metadata: Some(ObjectMeta {
+                id: "secret-1".to_string(),
+                name: "acme".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "secretive".to_string(),
+                deletion_time: None,
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&secret).await.unwrap();
+
+        let err = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
+                allow_missing: false,
+                name: "secretive".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("secret"),
+            "error should name secret as blocker: {}",
             err.message()
         );
     }

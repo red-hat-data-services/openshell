@@ -32,6 +32,10 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_TLS=1 with an overlay that keeps gateway TLS on (for
+# example ci/values-tls-port-forward.yaml) to reach the gateway over mTLS
+# through the port-forward with the chart-generated client certificate.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local
 #     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
@@ -54,12 +58,26 @@
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
 #
+# SPIFFE Broker API fixture:
+#   Set OPENSHELL_E2E_KUBE_SPIRE_BROKER=1 to install pinned SPIRE hardened
+#   charts (ci/values-spire-broker-stack.yaml) before OpenShell, with an
+#   mTLS Broker endpoint and enforced object authorization. The fixture needs a
+#   cluster without SPIRE CRDs and creates a fresh namespace
+#   (OPENSHELL_E2E_SPIRE_NAMESPACE, default openshell-e2e-spire); it removes
+#   both, and the registration entries tests label with that namespace, on exit.
+#
 # Credential-driver fixture:
 #   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
 #   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
 #   `vault`; the Rust `credential_drivers` e2e test validates the active
 #   backend. Vault mode installs a dev OpenBao fixture because it exposes the
 #   Vault-compatible API used by the driver.
+#
+# Trace collector fixture:
+#   Set OPENSHELL_E2E_KUBE_JAEGER=1 to deploy a Jaeger collector, point the
+#   gateway's OTLP export at it, and export OPENSHELL_E2E_JAEGER_QUERY_URL for
+#   tests that query the spans it received. Otherwise the gateway exports no
+#   traces.
 
 set -euo pipefail
 
@@ -114,17 +132,33 @@ VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 VAULT_CA_CONFIG_MAP="openbao-ca"
 VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
+SPIRE_FIXTURE_DEPLOYED=0
+SPIRE_NAMESPACE="${OPENSHELL_E2E_SPIRE_NAMESPACE:-openshell-e2e-spire}"
+SPIRE_CRDS=(clusterspiffeids.spire.spiffe.io clusterstaticentries.spire.spiffe.io clusterfederatedtrustdomains.spire.spiffe.io)
+SPIRE_CHART_REPO="https://spiffe.github.io/helm-charts-hardened/"
+SPIRE_CHART_VERSION="${OPENSHELL_E2E_SPIRE_CHART_VERSION:-0.30.3}"
+SPIRE_CRDS_CHART_VERSION="${OPENSHELL_E2E_SPIRE_CRDS_CHART_VERSION:-0.6.1}"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
 CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
-OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
 OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SOURCE_CONFIG_MAP="openshell-e2e-additional-ca"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_SOURCE_CREATED=0
+JAEGER_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/jaeger-fixture.yaml"
+JAEGER_FIXTURE_SERVICE="openshell-e2e-jaeger"
+JAEGER_FIXTURE_DEPLOYED=0
+JAEGER_PORTFORWARD_PID=""
+JAEGER_PORTFORWARD_LOG="${WORKDIR}/portforward-jaeger.log"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -240,6 +274,41 @@ deploy_postgres_fixture() {
     --from-literal=uri="${pg_uri}"
 }
 
+deploy_jaeger_fixture() {
+  local values_file="$1"
+
+  echo "Deploying Jaeger trace collector fixture ${JAEGER_FIXTURE_SERVICE}..."
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" apply -f "${JAEGER_FIXTURE_MANIFEST}"
+  JAEGER_FIXTURE_DEPLOYED=1
+  kctl -n "${NAMESPACE}" rollout status "deployment/${JAEGER_FIXTURE_SERVICE}" --timeout=120s
+
+  cat >"${values_file}" <<EOF
+gatewayConfig:
+  openshell.gateway.otlp:
+    endpoint: http://${JAEGER_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:4317
+EOF
+}
+
+start_jaeger_portforward() {
+  local port
+  port="$(e2e_pick_port)"
+  kctl -n "${NAMESPACE}" port-forward "svc/${JAEGER_FIXTURE_SERVICE}" \
+    "${port}:16686" >"${JAEGER_PORTFORWARD_LOG}" 2>&1 &
+  JAEGER_PORTFORWARD_PID=$!
+
+  for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null --connect-timeout 1 "http://127.0.0.1:${port}/api/v3/services"; then
+      export OPENSHELL_E2E_JAEGER_QUERY_URL="http://127.0.0.1:${port}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: Jaeger query port-forward did not become reachable" >&2
+  cat "${JAEGER_PORTFORWARD_LOG}" >&2 || true
+  return 1
+}
+
 use_envoy_gateway() {
   case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
     1 | true | TRUE | yes | YES) return 0 ;;
@@ -326,8 +395,7 @@ start_gateway_portforward() {
     echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
   fi
 
-  kctl -n "${target_namespace}" port-forward "svc/${target_service}" \
-    "${LOCAL_PORT}:${target_port}" >"${PORTFORWARD_LOG}" 2>&1 &
+  gateway_portforward_loop "svc/${target_service}" "${LOCAL_PORT}:${target_port}" "${PORTFORWARD_LOG}" "${target_namespace}" &
   PORTFORWARD_PID=$!
 
   while [ "${elapsed}" -lt "${pf_timeout}" ]; do
@@ -336,7 +404,13 @@ start_gateway_portforward() {
       cat "${PORTFORWARD_LOG}" >&2 || true
       return 1
     fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+    if [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+      # The TLS listener resets plaintext HTTP, so only check that the
+      # forward accepts TCP.
+      if (exec 3<>"/dev/tcp/127.0.0.1/${LOCAL_PORT}") 2>/dev/null; then
+        return 0
+      fi
+    elif curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
       return 0
     fi
     sleep 1
@@ -482,6 +556,166 @@ provision_vault_auth() {
     ttl=1h >/dev/null
 }
 
+deploy_spire_fixture() {
+  # The fixture owns only what it creates: refuse a cluster that already has
+  # the namespace or SPIRE CRDs, so cleanup can never remove another install.
+  local crd
+  for crd in "${SPIRE_CRDS[@]}"; do
+    if kctl get crd "${crd}" >/dev/null 2>&1; then
+      echo "ERROR: CRD ${crd} already exists; the SPIRE fixture needs a cluster without SPIRE." >&2
+      exit 2
+    fi
+  done
+  if ! kctl create namespace "${SPIRE_NAMESPACE}" >/dev/null; then
+    echo "ERROR: could not create a fresh SPIRE fixture namespace ${SPIRE_NAMESPACE}; set OPENSHELL_E2E_SPIRE_NAMESPACE to an unused name." >&2
+    exit 2
+  fi
+  SPIRE_FIXTURE_DEPLOYED=1
+  echo "Installing SPIRE ${SPIRE_CHART_VERSION} fixture in namespace ${SPIRE_NAMESPACE}..."
+  helmctl install spire-crds spire-crds --repo "${SPIRE_CHART_REPO}" \
+    --version "${SPIRE_CRDS_CHART_VERSION}" \
+    --namespace "${SPIRE_NAMESPACE}" --wait
+  local spire_values="${ROOT}/deploy/helm/openshell/ci/values-spire-broker-stack.yaml"
+  helmctl install spire spire --repo "${SPIRE_CHART_REPO}" \
+    --version "${SPIRE_CHART_VERSION}" \
+    --namespace "${SPIRE_NAMESPACE}" \
+    --values "${spire_values}" \
+    --wait --timeout 5m
+  kctl -n "${SPIRE_NAMESPACE}" rollout status daemonset/spire-agent --timeout=180s
+  if [ "${OPENSHELL_E2E_KUBE_SPIRE_BROKER:-0}" = "1" ]; then
+    # UID-only references are resolved by SPIRE, never by a supervisor. The
+    # agent needs object lookup and SAR access; the broker's grant is namespace scoped.
+    kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+    if [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" != "1" ]; then
+    kctl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-broker
+  namespace: ${SPIRE_NAMESPACE}
+spec:
+  selector:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/instance: spire
+  ports:
+    - name: broker
+      port: 8443
+      targetPort: 8443
+EOF
+    fi
+    kctl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [get, list]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: ${SPIRE_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openshell-e2e-spire-broker-${SPIRE_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openshell-e2e-spire-broker
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [impersonate-via-spire]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openshell-e2e-spire-broker
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: User
+    name: spiffe://openshell.local/ns/${NAMESPACE}/sa/openshell
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: openshell-e2e-spire-broker
+EOF
+    kctl apply -f - <<EOF
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: openshell-broker-agents-${SPIRE_NAMESPACE}
+  labels:
+    openshell.ai/e2e-spire-fixture: ${SPIRE_NAMESPACE}
+spec:
+  className: ${SPIRE_NAMESPACE}-spire
+  spiffeID: spiffe://openshell.local/openshell/broker-agents
+  parentID: spiffe://openshell.local/spire/server
+  selectors:
+    - k8s_psat:cluster:openshell-e2e
+    - k8s_psat:agent_ns:${SPIRE_NAMESPACE}
+    - k8s_psat:agent_sa:spire-agent
+EOF
+    local broker_values
+    broker_values="${WORKDIR}/spire-broker-values.yaml"
+    if [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" = "1" ]; then
+      cat >"${broker_values}" <<EOF
+gatewayConfig:
+  openshell.gateway.spiffe_broker:
+    node_local_port: 8443
+EOF
+    else
+      cat >"${broker_values}" <<EOF
+gatewayConfig:
+  openshell.gateway.spiffe_broker:
+    endpoint: https://spire-broker.${SPIRE_NAMESPACE}.svc:8443
+EOF
+    fi
+    cat >>"${broker_values}" <<EOF
+    server_spiffe_id_prefix: spiffe://openshell.local/spire/agent/k8s_psat/openshell-e2e
+EOF
+    helm_values_args+=(--values "${broker_values}")
+  fi
+  # Tests label the registration entries they create with this namespace.
+  export OPENSHELL_E2E_SPIRE_NAMESPACE="${SPIRE_NAMESPACE}"
+}
+
+cleanup_spire_fixture() {
+  [ "${SPIRE_FIXTURE_DEPLOYED}" = "1" ] || return 0
+  kctl delete clusterroles,clusterrolebindings -l "openshell.ai/e2e-spire-fixture=${SPIRE_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+  kctl delete clusterstaticentries.spire.spiffe.io \
+    -l "openshell.ai/e2e-spire-fixture=${SPIRE_NAMESPACE}" --ignore-not-found \
+    >/dev/null 2>&1 || true
+  helmctl uninstall spire --namespace "${SPIRE_NAMESPACE}" --wait --timeout 120s \
+    >/dev/null 2>&1 || true
+  helmctl uninstall spire-crds --namespace "${SPIRE_NAMESPACE}" --wait --timeout 60s \
+    >/dev/null 2>&1 || true
+  # The CRD chart keeps its CRDs on uninstall. None existed before the
+  # fixture, so these are the fixture's own.
+  kctl delete crd "${SPIRE_CRDS[@]}" --ignore-not-found --wait=false \
+    >/dev/null 2>&1 || true
+  kctl delete namespace "${SPIRE_NAMESPACE}" --wait=true --timeout=120s \
+    --ignore-not-found >/dev/null 2>&1 || true
+  SPIRE_FIXTURE_DEPLOYED=0
+}
+
 cleanup_vault_fixture() {
   [ -n "${KUBE_CONTEXT}" ] || return 0
   [ -n "${VAULT_NAMESPACE}" ] || return 0
@@ -507,6 +741,16 @@ cleanup() {
   local exit_code=$?
 
   stop_gateway_portforward
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
+  e2e_stop_process "${JAEGER_PORTFORWARD_PID}" "Jaeger query port-forward"
+
+  if [ "${ADDITIONAL_CA_SOURCE_CREATED}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ] \
+     && command -v kubectl >/dev/null 2>&1; then
+    kctl -n "${NAMESPACE}" delete configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    ADDITIONAL_CA_SOURCE_CREATED=0
+  fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
@@ -568,6 +812,12 @@ cleanup() {
     cleanup_vault_fixture
   fi
 
+  if [ "${JAEGER_FIXTURE_DEPLOYED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    kctl -n "${NAMESPACE}" delete -f "${JAEGER_FIXTURE_MANIFEST}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    JAEGER_FIXTURE_DEPLOYED=0
+  fi
+
   if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     if command -v kubectl >/dev/null 2>&1; then
       kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
@@ -587,14 +837,6 @@ cleanup() {
   if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
       --ignore-not-found >/dev/null 2>&1 || true
-  fi
-
-  if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
-    oc adm policy remove-scc-from-user privileged \
-      --context "${KUBE_CONTEXT}" \
-      -z openshell-sandbox -n "${NAMESPACE}" \
-      2>/dev/null || true
-    OPENSHIFT_SANDBOX_SCC_GRANTED=0
   fi
 
   # Remove the extracted client mTLS material (also covered by the WORKDIR sweep
@@ -631,6 +873,9 @@ cleanup() {
         --ignore-not-found >/dev/null 2>&1 || true
     fi
   fi
+
+  # Remove CSI consumers before uninstalling SPIRE and its CSI driver.
+  cleanup_spire_fixture
 
   if [ "${ENVOY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     if command -v helm >/dev/null 2>&1; then
@@ -762,7 +1007,20 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export OPENSHELL_E2E_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
+
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
@@ -888,6 +1146,22 @@ openshift_register_route_gateway() {
     "${pki_dir}"
 }
 
+# Preserve the test endpoint when node-local coverage relocates the gateway.
+# The wrapper owns its kubectl child and stops it on cleanup.
+gateway_portforward_loop() (
+  trap - EXIT
+  local target="$1" mapping="$2" log="$3" target_namespace="${4:-${NAMESPACE}}" forward_pid=""
+  trap 'if [ -n "$forward_pid" ]; then kill "$forward_pid" 2>/dev/null || true; wait "$forward_pid" 2>/dev/null || true; fi; exit 0' TERM INT
+  while true; do
+    kubectl --context "${KUBE_CONTEXT}" -n "${target_namespace}" port-forward "$target" "$mapping" >>"$log" 2>&1 &
+    forward_pid=$!
+    wait "$forward_pid" || true
+    forward_pid=""
+    [ "${OPENSHELL_E2E_KUBE_SPIRE_NODE_LOCAL:-0}" = "1" ] || return 0
+    sleep 1
+  done
+)
+
 # Start `kubectl port-forward svc/openshell` for the gRPC endpoint and wait for
 # it to accept TCP. Sets LOCAL_PORT and PORTFORWARD_PID. Prints the port-forward
 # log and returns non-zero on failure. Used for the vanilla-Kubernetes transport
@@ -895,8 +1169,7 @@ openshift_register_route_gateway() {
 start_grpc_portforward() {
   LOCAL_PORT="$(e2e_pick_port)"
   echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  gateway_portforward_loop "svc/openshell" "${LOCAL_PORT}:8080" "${PORTFORWARD_LOG}" &
   PORTFORWARD_PID=$!
 
   local elapsed=0 timeout=30
@@ -927,8 +1200,7 @@ start_health_portforward() {
   local workload_ref
   workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
   echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
-    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  gateway_portforward_loop "${workload_ref}" "${HEALTH_LOCAL_PORT}:health" "${PORTFORWARD_HEALTH_LOG}" &
   PORTFORWARD_HEALTH_PID=$!
 
   local elapsed=0 timeout=30
@@ -947,6 +1219,38 @@ start_health_portforward() {
   done
   echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
   cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+  return 1
+}
+
+# Shared supervisor pool members are TCP-ready before they attach to the
+# gateway, and the gateway refuses sandbox creates until a member attaches.
+wait_for_shared_supervisors() {
+  local selector="app.kubernetes.io/component=supervisor"
+  local elapsed=0 timeout=180 pods pod attached
+  pods="$(kctl -n "${NAMESPACE}" get pods -l "${selector}" -o name 2>/dev/null)"
+  [ -n "${pods}" ] || return 0
+
+  echo "Waiting for shared supervisor pool members to attach to the gateway..."
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    pods="$(kctl -n "${NAMESPACE}" get pods -l "${selector}" -o name 2>/dev/null)"
+    attached=1
+    for pod in ${pods}; do
+      if ! kctl -n "${NAMESPACE}" logs "${pod}" -c supervisor 2>/dev/null \
+        | grep -q "gateway accepted the supervisor host"; then
+        attached=0
+        break
+      fi
+    done
+    if [ -n "${pods}" ] && [ "${attached}" = "1" ]; then
+      # Placement reads the membership record the gateway writes after attach.
+      sleep 2
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo "ERROR: shared supervisor pool members did not attach within ${timeout}s" >&2
+  kctl -n "${NAMESPACE}" get pods -l "${selector}" -o wide >&2 || true
   return 1
 }
 
@@ -1224,6 +1528,29 @@ if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | 
   fi
 fi
 
+start_additional_ca_fixture() {
+  [ "${ADDITIONAL_CA_MODE}" = "1" ] || return 0
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires the in-process Kubernetes driver." >&2
+    return 1
+  fi
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires a host gateway IP for host.openshell.internal." >&2
+    return 1
+  fi
+
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --from-file="ca.crt=${ADDITIONAL_CA_DIR}/ca.crt" \
+    --dry-run=client -o yaml | kctl apply -f -
+  ADDITIONAL_CA_SOURCE_CREATED=1
+}
+
+start_additional_ca_fixture
+
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
    && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
@@ -1234,12 +1561,22 @@ helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  helm_extra_args+=(--set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}")
+fi
+# This wrapper installs an isolated, uniformly built test gateway, not a
+# production rolling upgrade. Explicitly activate the image-update scenario;
+# callers can keep activation disabled for negative coverage.
+if [ "${OPENSHELL_E2E_KUBE_IMAGE_UPDATES:-1}" = "1" ]; then
+  helm_extra_args+=(--set 'gatewayConfig.openshell\.gateway.enable_sandbox_updates=true')
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
     exit 2
   fi
   export HELM_PLUGINS="${ROOT}/e2e/helm-plugins"
+  export OPENSHELL_E2E_EXPECTED_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
   helm_post_renderer_args+=(
     --post-renderer openshell-external-compute-driver
   )
@@ -1258,12 +1595,6 @@ if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
-
-  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
-  oc adm policy add-scc-to-user privileged \
-    --context "${KUBE_CONTEXT}" \
-    -z openshell-sandbox -n "${NAMESPACE}"
-  OPENSHIFT_SANDBOX_SCC_GRANTED=1
 
   # Drive the gateway through a passthrough Route with mTLS instead of
   # port-forward. The Route host is deterministic: OpenShift serves any name
@@ -1406,9 +1737,17 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     helm_values_args+=(--values "${values_file}")
   done
 fi
+if [ "${OPENSHELL_E2E_KUBE_JAEGER:-0}" = "1" ]; then
+  JAEGER_VALUES="${WORKDIR}/jaeger-values.yaml"
+  deploy_jaeger_fixture "${JAEGER_VALUES}"
+  helm_values_args+=(--values "${JAEGER_VALUES}")
+fi
 if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
+fi
+if [ "${OPENSHELL_E2E_KUBE_SPIRE_BROKER:-0}" = "1" ]; then
+  deploy_spire_fixture
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
@@ -1480,6 +1819,27 @@ else
     # OpenShift: reach the gateway over the passthrough Route with mTLS so the
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
+  elif [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+    # Topologies that require gateway TLS: reach the gateway over mTLS through
+    # the port-forward with the chart-generated client certificate. The
+    # server certificate names 127.0.0.1.
+    start_gateway_portforward || exit 1
+    kube_pki_dir="${WORKDIR}/kube-client-pki"
+    mkdir -p "${kube_pki_dir}/client"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.ca\.crt}' | base64 -d >"${kube_pki_dir}/ca.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.crt}' | base64 -d >"${kube_pki_dir}/client/tls.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.key}' | base64 -d >"${kube_pki_dir}/client/tls.key"
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="https://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_mtls_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}" \
+      "${kube_pki_dir}"
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1
@@ -1493,6 +1853,10 @@ else
   fi
 
   start_health_portforward || exit 1
+  wait_for_shared_supervisors || exit 1
+  if [ "${JAEGER_FIXTURE_DEPLOYED}" = "1" ]; then
+    start_jaeger_portforward || exit 1
+  fi
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
@@ -1506,7 +1870,20 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export OPENSHELL_E2E_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
+
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1

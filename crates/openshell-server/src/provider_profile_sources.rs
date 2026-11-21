@@ -5,8 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
+use metrics::{counter, gauge};
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
 use openshell_core::policy_identity::canonical_rule_bytes;
@@ -20,13 +23,23 @@ use openshell_providers::{
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::ServerState;
 use crate::persistence::{ObjectListQuery, ObjectType, Store};
 use crate::storage_proto::StoredProviderProfile;
 
 const USER_SOURCE_ID: &str = "user";
+/// How often the gateway re-fetches interceptor provider-profile sources.
+/// Matches the supervisor configuration poll interval.
+pub const PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A cached snapshot older than this many refresh intervals fails closed: a
+/// stale profile could keep injecting credentials for an endpoint its source
+/// has withdrawn.
+const CACHED_SNAPSHOT_MAX_AGE_INTERVALS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileScope {
@@ -63,6 +76,29 @@ pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
         store: &Store,
         workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status>;
+
+    /// Read one profile without rebuilding unrelated user-managed profiles.
+    async fn snapshot_profile(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let mut snapshot = self.snapshot(store, workspace).await?;
+        // Uncached sources must still validate their complete contract. Cached
+        // sources validate on refresh and override this with an indexed read.
+        build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: self.source_id().to_string(),
+            revision: snapshot.revision.clone(),
+            profiles: snapshot.profiles.clone(),
+            user_managed: self.user_managed(),
+            allow_empty: self.allow_empty(),
+        }])?;
+        snapshot
+            .profiles
+            .retain(|profile| normalize_profile_id(&profile.profile.id).as_deref() == Some(id));
+        Ok(snapshot)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +116,44 @@ impl ProviderProfileSource for UserProviderProfileSource {
 
     fn allow_empty(&self) -> bool {
         true
+    }
+
+    async fn snapshot_profile(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let mut profiles = Vec::with_capacity(2);
+        for (namespace, scope) in [
+            ("", ProfileScope::Platform),
+            (workspace, ProfileScope::Workspace),
+        ] {
+            if namespace.is_empty() && scope == ProfileScope::Workspace {
+                continue;
+            }
+            if let Some(stored) = store
+                .get_message_by_name::<StoredProviderProfile>(namespace, id)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("fetch provider profile failed: {error}"))
+                })?
+            {
+                let version = stored_profile_resource_version(&stored);
+                if let Some(profile) = stored.profile {
+                    let mut profile = profile_response_payload(profile, version);
+                    normalize_provider_profile_mcp_fields(&mut profile);
+                    profiles.push(ScopedSnapshotProfile { scope, profile });
+                }
+            }
+        }
+        let revision = profile_snapshot_revision(
+            &profiles
+                .iter()
+                .map(|entry| entry.profile.clone())
+                .collect::<Vec<_>>(),
+        );
+        Ok(ProviderProfileSnapshot { revision, profiles })
     }
 
     async fn snapshot(
@@ -167,7 +241,7 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
                         "provider profile source '{}' snapshot failed: {err}",
                         self.source_id()
                     ),
-                    std::time::Duration::from_secs(1),
+                    Duration::from_secs(1),
                 )
             })?;
         let profiles = profiles
@@ -181,9 +255,145 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
     }
 }
 
+/// A source served from a snapshot that a background task refreshes, so
+/// configuration builds and polls do not call the source on every read.
+#[derive(Debug)]
+struct CachedProviderProfileSource {
+    inner: Arc<dyn ProviderProfileSource>,
+    cached: ArcSwapOption<CachedSnapshot>,
+    max_age: Duration,
+}
+
+#[derive(Debug)]
+struct CachedSnapshot {
+    snapshot: ProviderProfileSnapshot,
+    fetched_at: Instant,
+    profiles_by_id: BTreeMap<String, Vec<ScopedSnapshotProfile>>,
+    validation: Result<(), Status>,
+}
+
+impl CachedProviderProfileSource {
+    fn new(inner: Arc<dyn ProviderProfileSource>, refresh_interval: Duration) -> Self {
+        Self {
+            inner,
+            cached: ArcSwapOption::empty(),
+            max_age: refresh_interval.saturating_mul(CACHED_SNAPSHOT_MAX_AGE_INTERVALS),
+        }
+    }
+
+    /// Fetch a new snapshot. Returns whether its revision differs from the
+    /// cached one. Transport failures keep the cache until it ages out;
+    /// invalid snapshots revoke it immediately.
+    async fn refresh(&self, store: &Store) -> Result<bool, Status> {
+        let snapshot = self.inner.snapshot(store, "").await?;
+        // Validate the complete source once when it changes, not on every
+        // provider-token request. Invalid snapshots revoke cached authorization.
+        let validation = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: self.source_id().to_string(),
+            revision: snapshot.revision.clone(),
+            profiles: snapshot.profiles.clone(),
+            user_managed: self.user_managed(),
+            allow_empty: self.allow_empty(),
+        }])
+        .map(drop);
+        let mut profiles_by_id: BTreeMap<String, Vec<ScopedSnapshotProfile>> = BTreeMap::new();
+        for profile in &snapshot.profiles {
+            if let Some(id) = normalize_profile_id(&profile.profile.id) {
+                profiles_by_id.entry(id).or_default().push(profile.clone());
+            }
+        }
+        let changed = self
+            .cached
+            .load()
+            .as_ref()
+            .is_none_or(|cached| cached.snapshot.revision != snapshot.revision);
+        self.cached.store(Some(Arc::new(CachedSnapshot {
+            snapshot,
+            fetched_at: Instant::now(),
+            profiles_by_id,
+            validation: validation.clone(),
+        })));
+        validation.map(|()| changed)
+    }
+
+    fn age(&self) -> Option<Duration> {
+        self.cached
+            .load()
+            .as_ref()
+            .map(|cached| cached.fetched_at.elapsed())
+    }
+}
+
+#[async_trait]
+impl ProviderProfileSource for CachedProviderProfileSource {
+    fn source_id(&self) -> &str {
+        self.inner.source_id()
+    }
+
+    fn user_managed(&self) -> bool {
+        self.inner.user_managed()
+    }
+
+    fn allow_empty(&self) -> bool {
+        self.inner.allow_empty()
+    }
+
+    async fn snapshot_profile(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+        id: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let cached = self.cached.load();
+        let cached = cached
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= self.max_age)
+            .ok_or_else(|| {
+                openshell_core::rpc_error::unavailable(
+                    "PROFILE_SOURCE_UNAVAILABLE",
+                    format!(
+                        "provider profile source '{}' has no current snapshot",
+                        self.source_id()
+                    ),
+                    Duration::from_secs(1),
+                )
+            })?;
+        cached.validation.clone()?;
+        Ok(ProviderProfileSnapshot {
+            revision: cached.snapshot.revision.clone(),
+            profiles: cached.profiles_by_id.get(id).cloned().unwrap_or_default(),
+        })
+    }
+
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let cached = self.cached.load();
+        let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= self.max_age)
+        else {
+            return Err(openshell_core::rpc_error::unavailable(
+                "PROFILE_SOURCE_UNAVAILABLE",
+                format!(
+                    "provider profile source '{}' has no current snapshot",
+                    self.source_id()
+                ),
+                Duration::from_secs(1),
+            ));
+        };
+        Ok(cached.snapshot.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSources {
     sources: Vec<Arc<dyn ProviderProfileSource>>,
+    /// Sources served from a refreshed snapshot, also present in `sources`.
+    cached: Vec<Arc<CachedProviderProfileSource>>,
+    refresh_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -224,14 +434,24 @@ impl ProviderProfileSources {
     /// A gateway with nothing imported serves an empty catalog, which is a
     /// valid state, not a startup failure.
     pub fn with_default_sources() -> Self {
+        Self::uncached(vec![Arc::new(UserProviderProfileSource)])
+    }
+
+    fn uncached(sources: Vec<Arc<dyn ProviderProfileSource>>) -> Self {
         Self {
-            sources: vec![Arc::new(UserProviderProfileSource)],
+            sources,
+            cached: Vec::new(),
+            refresh_interval: Duration::ZERO,
         }
     }
 
+    /// With a `refresh_interval`, interceptor sources are served from a
+    /// snapshot that [`spawn_refresh`] refreshes at that interval. Without
+    /// one, every read calls the interceptor.
     pub fn from_config(
         configured: &[GatewayProviderProfileSourceConfig],
         runtime: Option<&GatewayInterceptorRuntime>,
+        refresh_interval: Option<Duration>,
     ) -> Result<Self, String> {
         if configured.is_empty() {
             return Err("provider_profile_sources must contain at least one source".to_string());
@@ -239,6 +459,7 @@ impl ProviderProfileSources {
 
         let mut source_ids = BTreeSet::new();
         let mut sources: Vec<Arc<dyn ProviderProfileSource>> = Vec::with_capacity(configured.len());
+        let mut cached = Vec::new();
         for source in configured {
             let source: Arc<dyn ProviderProfileSource> = match source {
                 GatewayProviderProfileSourceConfig::User => Arc::new(UserProviderProfileSource),
@@ -254,7 +475,18 @@ impl ProviderProfileSources {
                                 "provider profile source interceptor '{name}' is not configured or does not advertise provider_profiles"
                             )
                         })?;
-                    Arc::new(source)
+                    let source: Arc<dyn ProviderProfileSource> = Arc::new(source);
+                    match refresh_interval {
+                        Some(refresh_interval) => {
+                            let source = Arc::new(CachedProviderProfileSource::new(
+                                source,
+                                refresh_interval,
+                            ));
+                            cached.push(Arc::clone(&source));
+                            source
+                        }
+                        None => source,
+                    }
                 }
             };
             let source_id = source.source_id().to_string();
@@ -265,7 +497,40 @@ impl ProviderProfileSources {
             }
             sources.push(source);
         }
-        Ok(Self { sources })
+        Ok(Self {
+            sources,
+            cached,
+            refresh_interval: refresh_interval.unwrap_or_default(),
+        })
+    }
+
+    /// Refresh every cached source. Returns whether any revision changed.
+    pub(crate) async fn refresh_cached(&self, store: &Store) -> bool {
+        if self.cached.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut oldest = Duration::ZERO;
+        for source in &self.cached {
+            match source.refresh(store).await {
+                Ok(source_changed) => {
+                    changed |= source_changed;
+                    record_refresh("ok");
+                }
+                Err(error) => {
+                    record_refresh("failed");
+                    warn!(
+                        source_id = source.source_id(),
+                        error = error.message(),
+                        "provider profile source refresh failed"
+                    );
+                }
+            }
+            oldest = oldest.max(source.age().unwrap_or(Duration::MAX));
+        }
+        gauge!("openshell_server_provider_profile_source_snapshot_age_seconds")
+            .set(oldest.as_secs_f64());
+        changed
     }
 
     pub fn source_ids(&self) -> Vec<&str> {
@@ -285,14 +550,12 @@ impl ProviderProfileSources {
                 profile,
             })
             .collect();
-        Self {
-            sources: vec![Arc::new(StaticProviderProfileSource {
-                snapshot: ProviderProfileSnapshot {
-                    revision,
-                    profiles: scoped,
-                },
-            })],
-        }
+        Self::uncached(vec![Arc::new(StaticProviderProfileSource {
+            snapshot: ProviderProfileSnapshot {
+                revision,
+                profiles: scoped,
+            },
+        })])
     }
 
     /// A source-managed catalog composed with the user-managed source.
@@ -304,7 +567,7 @@ impl ProviderProfileSources {
     pub(crate) fn from_test_profiles_with_user_source(profiles: Vec<ProviderProfile>) -> Self {
         let mut sources = Self::from_test_profiles(profiles).sources;
         sources.push(Arc::new(UserProviderProfileSource));
-        Self { sources }
+        Self::uncached(sources)
     }
 
     #[cfg(test)]
@@ -316,24 +579,22 @@ impl ProviderProfileSources {
             !snapshots.is_empty(),
             "test snapshot sequence must not be empty"
         );
-        Self {
-            sources: vec![Arc::new(SequencedProviderProfileSource {
-                snapshots: snapshots
-                    .into_iter()
-                    .map(|(revision, profiles)| ProviderProfileSnapshot {
-                        revision,
-                        profiles: profiles
-                            .into_iter()
-                            .map(|profile| ScopedSnapshotProfile {
-                                scope: ProfileScope::Static,
-                                profile,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                fetch_count,
-            })],
-        }
+        Self::uncached(vec![Arc::new(SequencedProviderProfileSource {
+            snapshots: snapshots
+                .into_iter()
+                .map(|(revision, profiles)| ProviderProfileSnapshot {
+                    revision,
+                    profiles: profiles
+                        .into_iter()
+                        .map(|profile| ScopedSnapshotProfile {
+                            scope: ProfileScope::Static,
+                            profile,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            fetch_count,
+        })])
     }
 
     pub(crate) async fn snapshot_catalog(
@@ -350,6 +611,29 @@ impl ProviderProfileSources {
             "captured provider profile catalog snapshot"
         );
         Ok(catalog)
+    }
+
+    pub(crate) async fn profile_catalog(
+        &self,
+        store: &Store,
+        workspace: &str,
+        id: &str,
+    ) -> Result<EffectiveProviderProfileCatalog, Status> {
+        let id = normalize_profile_id(id)
+            .ok_or_else(|| Status::failed_precondition("invalid provider profile id"))?;
+        let mut snapshots = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            let snapshot = source.snapshot_profile(store, workspace, &id).await?;
+            snapshots.push(CollectedProviderProfileSnapshot {
+                source_id: source.source_id().to_string(),
+                revision: snapshot.revision,
+                profiles: snapshot.profiles,
+                user_managed: source.user_managed(),
+                // A valid non-empty source may not contain this particular ID.
+                allow_empty: true,
+            });
+        }
+        build_effective_profiles(snapshots)
     }
 
     async fn snapshots(
@@ -370,6 +654,41 @@ impl ProviderProfileSources {
         }
         Ok(snapshots)
     }
+}
+
+fn record_refresh(outcome: &'static str) {
+    counter!(
+        "openshell_server_provider_profile_source_refreshes_total",
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// Keep cached provider profile sources fresh, and push a changed catalog to
+/// this replica's supervisor sessions. Every replica runs its own refresh, so
+/// none notifies its peers. The first refresh runs before the gateway serves,
+/// in `run_server`.
+pub fn spawn_refresh(state: Arc<ServerState>) {
+    let sources = &state.provider_profile_sources;
+    if sources.cached.is_empty() {
+        return;
+    }
+    let interval = sources.refresh_interval;
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            if state
+                .provider_profile_sources
+                .refresh_cached(&state.store)
+                .await
+            {
+                crate::config_delivery::publish_all_local(&state);
+            }
+        }
+    });
 }
 
 impl EffectiveProviderProfileCatalog {
@@ -731,7 +1050,6 @@ fn format_diagnostic(diagnostic: ProfileValidationDiagnostic) -> String {
     }
 }
 
-#[cfg(test)]
 fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut profiles = profiles.to_vec();
     profiles
@@ -1147,6 +1465,7 @@ mod tests {
             Arc::clone(&fetch_count),
         );
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let first = sources.snapshot_catalog(&store, "default").await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
@@ -1286,6 +1605,7 @@ mod tests {
                 GatewayProviderProfileSourceConfig::User,
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
 
@@ -1293,9 +1613,53 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn interceptor_sources_are_cached_only_with_a_refresh_interval() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
+        let store = crate::persistence::test_store().await;
+        let configured = [GatewayProviderProfileSourceConfig::Interceptor {
+            name: "governance".to_string(),
+        }];
+
+        // A cached source fails closed until its first refresh, so a read
+        // that succeeds without one went to the interceptor.
+        let uncached =
+            ProviderProfileSources::from_config(&configured, Some(&runtime), None).unwrap();
+        assert!(uncached.cached.is_empty());
+        uncached
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("an uncached interceptor source is read on request");
+
+        let cached = ProviderProfileSources::from_config(
+            &configured,
+            Some(&runtime),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert_eq!(cached.cached.len(), 1);
+        assert_eq!(
+            cached
+                .snapshot_catalog(&store, "default")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        task.abort();
+    }
+
     #[test]
     fn configured_sources_must_not_be_empty() {
-        let err = ProviderProfileSources::from_config(&[], None).unwrap_err();
+        let err = ProviderProfileSources::from_config(&[], None, Some(Duration::from_secs(10)))
+            .unwrap_err();
         assert!(err.contains("at least one source"));
     }
 
@@ -1307,6 +1671,7 @@ mod tests {
                 GatewayProviderProfileSourceConfig::User,
             ],
             None,
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
         assert!(err.contains("duplicate provider profile source 'user'"));
@@ -1319,6 +1684,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             None,
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
         assert!(err.contains("not configured or does not advertise provider_profiles"));
@@ -1384,9 +1750,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let profiles = sources
             .snapshot_catalog(&store, "default")
@@ -1420,9 +1788,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1447,9 +1817,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1477,9 +1849,11 @@ mod tests {
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
         store
             .put_message(&stored_provider_profile(profile("github")))
             .await
@@ -1517,9 +1891,11 @@ mod tests {
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
         store
             .put_message(&stored_provider_profile(profile("github")))
             .await
@@ -1551,9 +1927,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1581,9 +1959,11 @@ mod tests {
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
         store
             .put_message(&stored_provider_profile(profile("github")))
             .await
@@ -1606,6 +1986,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
 
@@ -1703,6 +2084,90 @@ mod tests {
         assert_ne!(
             canonical_provider_profile_bytes(&first),
             canonical_provider_profile_bytes(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn point_lookup_preserves_scopes_and_excludes_unrelated_profiles() {
+        let store = crate::persistence::test_store().await;
+        for (id, workspace) in [
+            ("selected", ""),
+            ("selected", "alpha"),
+            ("unrelated", "alpha"),
+            ("beta-only", "beta"),
+        ] {
+            store
+                .put_message(&stored_profile_in_workspace(id, workspace))
+                .await
+                .unwrap();
+        }
+        let sources = ProviderProfileSources::with_default_sources();
+        let full = sources.snapshot_catalog(&store, "alpha").await.unwrap();
+        let selected = sources
+            .profile_catalog(&store, "alpha", "selected")
+            .await
+            .unwrap();
+        for scope in ["", "alpha"] {
+            assert_eq!(
+                selected.get_type_profile_for_scope("selected", scope),
+                full.get_type_profile_for_scope("selected", scope)
+            );
+        }
+        assert_eq!(selected.profiles.len(), 1);
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "beta-only")
+                .await
+                .unwrap()
+                .get_profile("beta-only")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn point_lookup_preserves_source_authority_and_collision_checks() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("user-only", "alpha"))
+            .await
+            .unwrap();
+        let sources =
+            ProviderProfileSources::from_test_profiles_with_user_source(vec![profile("external")]);
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "user-only")
+                .await
+                .unwrap()
+                .get_profile("user-only")
+                .is_some()
+        );
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .unwrap()
+                .get_profile("external")
+                .is_some()
+        );
+        let invalid_source = ProviderProfileSources::from_test_profiles_with_user_source(vec![
+            profile("external"),
+            profile(""),
+        ]);
+        assert!(
+            invalid_source
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .is_err()
+        );
+        store
+            .put_message(&stored_profile_in_workspace("external", "alpha"))
+            .await
+            .unwrap();
+        assert!(
+            sources
+                .profile_catalog(&store, "alpha", "external")
+                .await
+                .is_err()
         );
     }
 
@@ -2209,5 +2674,139 @@ mod tests {
             .expect("custom profile reusing unloaded default ID");
         assert_eq!(resolved.id, "github");
         assert_eq!(resolved.display_name, "Private GitHub");
+    }
+
+    /// Serves `revision` until `fail` is set.
+    #[derive(Debug, Default)]
+    struct SwitchableSource {
+        revision: std::sync::Mutex<String>,
+        fail: std::sync::atomic::AtomicBool,
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderProfileSource for SwitchableSource {
+        fn source_id(&self) -> &'static str {
+            "switchable"
+        }
+
+        fn user_managed(&self) -> bool {
+            false
+        }
+
+        fn allow_empty(&self) -> bool {
+            false
+        }
+
+        async fn snapshot(
+            &self,
+            _store: &Store,
+            _workspace: &str,
+        ) -> Result<ProviderProfileSnapshot, Status> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Status::unavailable("source down"));
+            }
+            Ok(ProviderProfileSnapshot {
+                revision: self.revision.lock().unwrap().clone(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: profile("github"),
+                }],
+            })
+        }
+    }
+
+    fn cached_source(inner: &Arc<SwitchableSource>) -> CachedProviderProfileSource {
+        *inner.revision.lock().unwrap() = "r1".to_string();
+        CachedProviderProfileSource::new(
+            Arc::<SwitchableSource>::clone(inner),
+            Duration::from_secs(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn cached_source_fails_closed_before_its_first_refresh() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+
+        let error = cached.snapshot(&store, "default").await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            cached
+                .snapshot_profile(&store, "default", "github")
+                .await
+                .is_err()
+        );
+        assert_eq!(inner.fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_source_reads_do_not_fetch_and_refresh_reports_revision_changes() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+
+        assert!(cached.refresh(&store).await.unwrap(), "first snapshot");
+        for _ in 0..3 {
+            assert_eq!(
+                cached.snapshot(&store, "default").await.unwrap().revision,
+                "r1"
+            );
+            assert_eq!(
+                cached
+                    .snapshot_profile(&store, "default", "github")
+                    .await
+                    .unwrap()
+                    .profiles
+                    .len(),
+                1
+            );
+            assert!(
+                cached
+                    .snapshot_profile(&store, "default", "missing")
+                    .await
+                    .unwrap()
+                    .profiles
+                    .is_empty()
+            );
+        }
+        assert_eq!(inner.fetches.load(Ordering::SeqCst), 1);
+
+        assert!(!cached.refresh(&store).await.unwrap(), "unchanged revision");
+        *inner.revision.lock().unwrap() = "r2".to_string();
+        assert!(cached.refresh(&store).await.unwrap(), "changed revision");
+        assert_eq!(
+            cached.snapshot(&store, "default").await.unwrap().revision,
+            "r2"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_source_serves_a_failed_refresh_until_the_snapshot_ages_out() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+        tokio::time::pause();
+        cached.refresh(&store).await.unwrap();
+        inner.fail.store(true, Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(cached.refresh(&store).await.is_err());
+        assert_eq!(
+            cached.snapshot(&store, "default").await.unwrap().revision,
+            "r1"
+        );
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let error = cached.snapshot(&store, "default").await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            cached
+                .snapshot_profile(&store, "default", "github")
+                .await
+                .is_err()
+        );
     }
 }

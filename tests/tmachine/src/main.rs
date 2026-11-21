@@ -5,11 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{Config, Environment, Installer, Machine};
-
-mod ansible;
-mod config;
-mod qemu;
+use tmachine::config::{Config, Environment, Installer, Machine};
+use tmachine::{install, setup, setup_layer_key, test};
 
 #[derive(Parser)]
 #[command(name = "tmachine")]
@@ -26,6 +23,11 @@ enum Command {
     Setup {
         environment: String,
     },
+    /// Print the hash that names the environment's setup layer, without
+    /// starting a VM.
+    LayerKey {
+        environment: String,
+    },
     Install {
         environment: String,
         installer: String,
@@ -40,12 +42,23 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // A SIGTERM from CI cancellation must not leave QEMU holding the SSH port.
+    tmachine::until_signal(run(cli))
+        .await
+        .unwrap_or_else(|status| std::process::exit(status))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     match cli.command {
         Command::Setup { environment } => {
             let (machine, environment) = find_environment(&config, &environment)?;
-            qemu::setup(&machine, &environment).await?;
+            setup(&machine, &environment).await?;
+        }
+        Command::LayerKey { environment } => {
+            let (machine, environment) = find_environment(&config, &environment)?;
+            println!("{}", setup_layer_key(&machine, &environment)?);
         }
         Command::Install {
             environment,
@@ -53,7 +66,7 @@ async fn main() -> Result<()> {
         } => {
             let (machine, environment) = find_environment(&config, &environment)?;
             let installer = find_installer(&config, &installer)?;
-            qemu::install(&machine, &environment, &installer).await?;
+            install(&machine, &environment, &installer).await?;
         }
         Command::Test {
             environment,
@@ -67,7 +80,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .find(|candidate| candidate.name == testsuite)
                 .with_context(|| format!("testsuite {testsuite:?} is not defined"))?;
-            qemu::test(&machine, &environment, &installer, testsuite).await?;
+            test(&machine, &environment, &installer, testsuite).await?;
         }
     }
 

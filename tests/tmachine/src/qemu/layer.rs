@@ -10,9 +10,17 @@ use blake3::Hasher;
 use directories::ProjectDirs;
 
 use super::img::QemuImage;
-use super::vm::QemuVm;
+use super::vm::{LAYER_POWER_OFF_TIMEOUT, QemuVm};
+
+/// Where setup layers are kept, under tmachine's cache directory. They depend
+/// only on the environment, so CI caches the disks here across commits.
+pub(super) const SETUP_DISKS: &str = "disks/setup";
+/// Where install layers are kept. They hold the build under test, so CI leaves
+/// them out of its cache.
+pub(super) const INSTALL_DISKS: &str = "disks/install";
 
 pub(super) async fn cached_layer(
+    disks: &str,
     base_image: &Path,
     hash: &str,
     use_galaxy: bool,
@@ -20,7 +28,7 @@ pub(super) async fn cached_layer(
     inputs: &BTreeMap<String, PathBuf>,
 ) -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("com", "nvidia", "tmachine").unwrap();
-    let disks_dir = project_dirs.cache_dir().join("disks");
+    let disks_dir = project_dirs.cache_dir().join(disks);
     std::fs::create_dir_all(&disks_dir).unwrap();
 
     let disk = disks_dir.join(format!("{hash}.qcow2"));
@@ -29,7 +37,7 @@ pub(super) async fn cached_layer(
     }
 
     if use_galaxy {
-        crate::ansible::install_roles().await;
+        crate::ansible::install_roles().await?;
     }
 
     let temporary_disk = disks_dir.join(format!("{hash}.tmp"));
@@ -38,10 +46,12 @@ pub(super) async fn cached_layer(
     }
 
     let image = QemuImage::create(base_image, temporary_disk.clone()).await;
-    let vm = QemuVm::start(&image).await;
+    let vm = QemuVm::start(&image).await?;
     run_playbooks(playbooks, inputs).await?;
-    vm.shutdown().await;
-    vm.wait().await;
+    // A layer is only cached after a clean power-off, so failing here is an
+    // error rather than something to log and move past.
+    vm.shutdown().await.context("power off the VM")?;
+    vm.wait(LAYER_POWER_OFF_TIMEOUT).await?;
 
     std::fs::rename(temporary_disk, &disk).unwrap();
     Ok(disk)
