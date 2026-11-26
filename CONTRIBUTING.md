@@ -20,20 +20,11 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 
 ## First-Time Contributors
 
-We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
-
-1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
-2. Describe what you want to change and why.
-3. Write in your own words. AI-generated vouch requests will be denied.
-4. A maintainer will comment `/vouch` if approved, and the request discussion
-   will close automatically.
-5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
-
-**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
+Pull requests from authors without write access must link an issue labeled `state:accepted`. See [Pull Requests](#pull-requests).
 
 ### Finding Work
 
-Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/ai-openshell/openshell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
@@ -59,7 +50,7 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 
 ### When NOT to Open an Issue
 
-- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/ai-openshell/openshell/discussions).
 - Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
 
 ## Before You Submit a Change
@@ -70,9 +61,13 @@ Use agents and the repository skills as needed to understand the affected code, 
 
 Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
 
-Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+Pull requests that touch the enforcement machinery or reviewer routing — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `REVIEWERS.md`, `.github/CODEOWNERS`, or the enforcement and reviewer-routing scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+Once your pull request represents [accepted work](#accepted-work), it needs exactly one `area:` label and any relevant `topic:` labels; see [Labeling and Notifications](#labeling-and-notifications) for guidance. Choose labels from the `area:*` and `topic:*` headings in [REVIEWERS.md](REVIEWERS.md); labels without a matching heading do not route reviewers. The [reviewer routing workflow](.github/workflows/review-readiness.yml) adds reviewers from that file based on these labels. The same workflow fails a ready PR from a personal fork that does not allow edits by maintainers; `gh pr create` enables that setting by default.
+
+Branch Checks requires accounts in `REVIEWERS.md` to appear in the repository collaborator list or have confirmed write or admin permission. Public read access alone does not qualify; read and triage accounts must appear in the collaborator list.
+
+If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
 
@@ -80,7 +75,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add ai-openshell/openshell`.
 
 | Skill | Purpose |
 | --- | --- |
@@ -104,13 +99,15 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
+| Reviewing       | `omit-needless-words`     | Flag wordy, historical, duplicated, or out-of-spec prose and code in a change                       |
 | Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
-| Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `triage-issue`            | Assess and route community-filed issues                                                  |
+| Triage          | `label-issue`             | Classify accepted issues and PRs, correct labels, and migrate legacy associations                   |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
@@ -129,7 +126,34 @@ A direct request to an agent authorizes the requested planning or implementation
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
 
+### Accepted Work
+
+Accepted work is work the project intends to pursue. Work submitted by a maintainer listed in the merged [MAINTAINERS.md](MAINTAINERS.md), or someone with repository `WRITE`, `MAINTAIN`, or `ADMIN` access, qualifies immediately. Other issues require a maintainer's acceptance, recorded with `state:accepted`.
+
+A PR represents accepted work when either:
+
+- Its author is a maintainer or has repository write access as described above.
+- It closes at least one issue in this repository that has `state:accepted`, and the PR author is that issue's submitter or a current assignee.
+
+Use GitHub closing references such as `Closes #123` or `Fixes #123`.
+
+The definition of accepted work is encoded in `tasks/scripts/label_accepted_work.py` and should be directly imported where needed.
+
+Acceptance classifies work, not implementation quality or approval to merge. Existing issue-linking rules, the separate `PR Issue Acceptance` check (which requires every linked issue to be accepted for community authors), and maintainer/code-owner approvals still apply. Acceptance does not certify that the diff implements the issue, and the existing Dependabot gate exemption does not automatically qualify a PR as accepted work.
+
+### Labeling and Notifications
+
+Labels drive notification streams as well as classification. Contributors use the GitHub app in Slack, and other integrations, to follow issues and PRs filtered by area or topic. Applying those labels can notify subscribers immediately, before they have chosen to follow the individual item.
+
+Apply `area:` and `topic:` classification labels only after the issue or PR meets the shared [accepted-work definition](#accepted-work). Once accepted, apply the relevant classification labels using the [label-issue skill](.agents/skills/label-issue/SKILL.md) so subscribers can find the work.
+
+Do not classify an issue merely because it was filed or its subject is clear. Waiting until acceptance keeps label-filtered streams focused on work the project intends to pursue and avoids sending unaccepted intake to subscribers. Workflow labels such as `state:triage-needed` still record intake status; they do not establish acceptance.
+
+Automatic classification at issue creation and filters that exclude unaccepted work are being discussed separately in [#5261](https://github.com/ai-openshell/openshell/issues/5261). Until that policy changes, defer classification labels until acceptance.
+
 ### Label Discovery
+
+Classify SDK work with `topic:sdk:go`, `topic:sdk:python`, `topic:sdk:rust`, or `topic:sdk:typescript`. For work spanning SDKs, apply each supported language topic. Propose individual reviewer membership changes through review. Only apply a topic after its live definition and routing support are available.
 
 Retrieve every page of repository labels and their descriptions:
 
@@ -143,7 +167,7 @@ When recording a triage outcome, replace the previous assessment state rather th
 
 ## Prerequisites
 
-Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Native Windows development uses the [`windows` branch](https://github.com/ai-openshell/openshell/tree/windows).
 Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
 runtime requirements, and limitations. Target Windows implementation PRs at
 `windows`. Shared documentation can merge into `main`, but Windows-specific
@@ -211,6 +235,22 @@ system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 The linker uses the installed static or shared library. The Nix development
 shell provides a static Z3 library.
 
+Without Z3, linking fails with `ld: library 'z3' not found`. To run a command
+that links Z3 from a plain terminal, wrap it in the Nix shell:
+
+```bash
+nix develop --command cargo test -p openshell-server --lib
+```
+
+If every crate then fails to compile with `Set a global default version with
+one of the following:`, the `RUSTC_WRAPPER=sccache` setting from `mise.toml`
+resolves to a mise shim with no installed `sccache`. Run `mise install`, or
+clear the wrapper for the command:
+
+```bash
+RUSTC_WRAPPER= nix develop --command cargo test -p openshell-server --lib
+```
+
 ```bash
 # macOS
 brew install z3
@@ -272,7 +312,7 @@ mise run --skip-tools windows:build:x64
 
 For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
 LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
-See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+See [Windows validation](https://github.com/ai-openshell/openshell/blob/windows/TESTING.md#native-windows-validation)
 for native tests and MXC E2E requirements. Docker is not required for the native
 Windows build or MXC runtime.
 
@@ -305,6 +345,18 @@ mise trust
 # Run a standalone gateway for local development
 mise run gateway
 ```
+
+The workspace build, check, lint, and test tasks (`build:rust:workspace`,
+`rust:check`, `rust:lint`, `test:rust`) and CI Branch Checks enable the
+`experimental` feature flag. Standalone launchers such as `mise run gateway`
+and direct Cargo builds leave it off unless you pass `--features experimental`;
+prerelease and stable builds leave it off as well.
+
+Workspace builds select the Cedar runtime member and unify its shared policy
+features, so use per-package checks to verify that Cedar is excluded.
+
+The `experimental` build flag includes Cedar. Build the gateway and supervisor
+with `--features experimental`, or use published Release Dev artifacts.
 
 ## Building the `openshell` CLI
 
@@ -371,7 +423,13 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run monitoring:generate` | Render OpenShell Grafana dashboards           |
+| `mise run monitoring:check` | Check and render the monitoring mixin            |
 | `mise run clean`     | Clean build artifacts                                   |
+
+## TypeScript SDK contributions
+
+The TypeScript SDK moved to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript); open TypeScript SDK PRs there.
 
 ## Project Structure
 
@@ -379,23 +437,28 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the development `experimental` feature |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `experimental` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar analysis adapted to policy messages for gateway and runtime composition |
+| `crates/openshell-policy-cedar-runtime/` | Cedar implementation of the shared runtime contracts, selected by supervisor composition |
+| `crates/openshell-policy-runtime-interface/` | Shared policy decisions, request metadata, snapshots, and staged reload contracts; no engine implementations |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
-| `python/`       | Python SDK and bindings                       |
-| `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
-| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
+| `python/`       | Python SDK (frozen, moved to ai-openshell/sdk-python) |
+| `sdk/typescript/` | Deprecated `@nvidia/openshell-sdk` stub re-exporting `@ai-openshell/sdk` (moved to ai-openshell/sdk-typescript) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `tests/policy-conformance/` | Policy backend conformance through production networking paths |
 | `tests/suites/` | End-to-end suites, grouped by test family |
 | `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
-| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
+| `tests/runner/` | `openshell-test-runner`: builds a test family for tmachine guests, runs it in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
 | `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
-| `.agents/`      | Contributor skills and persona definitions    |
+| `.agents/`      | Contributor skills and [agents](.agents/agents/README.md) |
 
 ## RFCs
 
@@ -449,7 +512,7 @@ For release notes, describe the user-facing change in a few short, easy-to-read 
 
 Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, and other labels do not bypass acceptance.
 
 The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
 
@@ -457,13 +520,19 @@ Automated dependency update PRs, including Dependabot PRs, are exempt from the s
 
 Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
 
+### Automatic Acceptance Labeling
+
+The existing [review-readiness workflow](.github/workflows/review-readiness.yml) checks [accepted work](#accepted-work) when a PR is opened and adds `state:accepted` if it qualifies. The label event's `intent.rationale` contains JSON with `schema: openshell-acceptance-v1` and a `basis`: `maintainer`, `repository_permission` (with `permission`), or `accepted_issue` (with issue number and author/assignee `relationship`). This includes drafts and PRs awaiting area/topic classification. Reviewer requests still wait until a PR is ready and has an area label.
+
+This is an additive check at creation, not continuous reconciliation: later edits, permission changes, and issue-label or assignment changes do not refresh or remove the PR label. The shared library is read-only; review-readiness applies the label. The label does not replace the issue-acceptance gate or merge approvals.
+
 ### Branch Names
 
 Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
 
 For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
-Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
+Branches created by automation, such as Dependabot, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 
@@ -509,7 +578,7 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. The DCO check fails a PR if any of its commits lacks the trailer; add it with `git rebase --signoff` and force-push.
 
 The project uses version 1.1 of the [Developer Certificate of Origin](https://developercertificate.org/):
 
@@ -556,8 +625,8 @@ git commit --signoff --message "feat(sandbox): add new capability"
 
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
-- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
-- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor and every commit.
+- **Cryptographic commit signing** applies to org members and collaborators only; see [CI.md](CI.md#commit-signing) for setup.
 
 ### PR testing checklist
 
@@ -565,4 +634,4 @@ Only mark a checklist item as complete after you have run and verified it, not a
 
 ## CI
 
-How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e`, `test:e2e-kubernetes`, and `test:e2e:continuity` labels, and commit-signing setup are documented in [CI.md](CI.md).

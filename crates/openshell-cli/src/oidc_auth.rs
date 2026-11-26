@@ -20,6 +20,7 @@ use oauth2::{
     RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
+use openshell_core::token_endpoint::parse_auth_url;
 use openshell_sdk::oidc::RefreshTokenInput;
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -30,6 +31,7 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 const AUTH_TIMEOUT: Duration = Duration::from_mins(2);
+const CLIENT_SECRET_ENV: &str = "OPENSHELL_OIDC_CLIENT_SECRET";
 
 /// OIDC discovery document (subset of fields we need).
 #[derive(Debug, Deserialize)]
@@ -64,6 +66,10 @@ struct DeviceTokenErrorResponse {
     error_description: String,
 }
 
+fn parse_oidc_url(raw: &str, field: &str) -> Result<reqwest::Url> {
+    parse_auth_url(raw).map_err(|reason| miette::miette!("OIDC {field} {reason}"))
+}
+
 /// Discover OIDC endpoints from the issuer's well-known configuration.
 ///
 /// Validates that the discovery document's `issuer` field matches the
@@ -73,7 +79,7 @@ async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
     let url = format!("{normalized_issuer}/.well-known/openid-configuration");
     let client = http_client(insecure);
     let resp: OidcDiscovery = client
-        .get(&url)
+        .get(parse_oidc_url(&url, "issuer URL")?)
         .send()
         .await
         .into_diagnostic()?
@@ -89,6 +95,7 @@ async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
             discovered_issuer
         ));
     }
+    parse_oidc_url(&resp.token_endpoint, "token endpoint")?;
     Ok(resp)
 }
 
@@ -203,7 +210,10 @@ pub async fn oidc_browser_auth_flow(
     let redirect_uri = callback_redirect_uri(&listener)?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
-        .set_auth_uri(AuthUrl::new(discovery.authorization_endpoint).into_diagnostic()?)
+        .set_auth_uri(AuthUrl::from_url(parse_oidc_url(
+            &discovery.authorization_endpoint,
+            "authorization endpoint",
+        )?))
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
         .set_redirect_uri(RedirectUrl::new(redirect_uri).into_diagnostic()?);
 
@@ -277,7 +287,8 @@ pub async fn oidc_browser_auth_flow(
 
 /// Run the OIDC Client Credentials flow (for CI/automation).
 ///
-/// Reads `OPENSHELL_OIDC_CLIENT_SECRET` from the environment.
+/// Reads `OPENSHELL_OIDC_CLIENT_SECRET` from the environment. The secret is
+/// never stored; the returned bundle is marked so it can be renewed later.
 pub async fn oidc_client_credentials_flow(
     issuer: &str,
     client_id: &str,
@@ -285,9 +296,9 @@ pub async fn oidc_client_credentials_flow(
     scopes: Option<&str>,
     insecure: bool,
 ) -> Result<OidcTokenBundle> {
-    let client_secret = std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").map_err(|_| {
+    let client_secret = std::env::var(CLIENT_SECRET_ENV).map_err(|_| {
         miette::miette!(
-            "OPENSHELL_OIDC_CLIENT_SECRET environment variable is required for client credentials flow"
+            "{CLIENT_SECRET_ENV} environment variable is required for client credentials flow"
         )
     })?;
 
@@ -312,11 +323,10 @@ pub async fn oidc_client_credentials_flow(
         .await
         .map_err(|e| miette::miette!("client credentials token exchange failed: {e}"))?;
 
-    Ok(bundle_from_oauth2_response(
-        &token_response,
-        issuer,
-        client_id,
-    ))
+    Ok(OidcTokenBundle {
+        client_credentials: true,
+        ..bundle_from_oauth2_response(&token_response, issuer, client_id)
+    })
 }
 
 /// Run the OIDC Device Authorization Grant flow (RFC 8628).
@@ -339,6 +349,9 @@ pub async fn oidc_device_code_flow(
              Enable the device authorization grant on this client, or use client credentials for headless automation."
         )
     })?;
+
+    let device_auth_endpoint =
+        parse_oidc_url(device_auth_endpoint, "device authorization endpoint")?;
 
     // Step 1: Request device and user codes
     let http = http_client(insecure);
@@ -482,7 +495,7 @@ pub async fn oidc_device_code_flow(
 ///
 /// Preserves the existing refresh token if the server does not return a new
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
-pub async fn oidc_refresh_token(
+async fn oidc_refresh_token(
     bundle: &OidcTokenBundle,
     scopes: Option<&str>,
     insecure: bool,
@@ -523,7 +536,37 @@ fn bundle_from_refresh_output(
         expires_at,
         issuer: previous.issuer.clone(),
         client_id: previous.client_id.clone(),
+        client_credentials: previous.client_credentials,
     }
+}
+
+/// Renew a stored OIDC token.
+///
+/// Uses the refresh token when there is one. A client credentials token has
+/// none, so it is renewed by repeating that grant, which needs
+/// `OPENSHELL_OIDC_CLIENT_SECRET` in the environment.
+pub async fn oidc_renew_token(
+    bundle: &OidcTokenBundle,
+    audience: Option<&str>,
+    scopes: Option<&str>,
+    insecure: bool,
+) -> Result<OidcTokenBundle> {
+    if bundle.refresh_token.is_some() || !bundle.client_credentials {
+        return oidc_refresh_token(bundle, scopes, insecure).await;
+    }
+    if std::env::var_os(CLIENT_SECRET_ENV).is_none() {
+        return Err(miette::miette!(
+            "token was issued via client credentials; set {CLIENT_SECRET_ENV} to renew it, or run: openshell gateway login"
+        ));
+    }
+    oidc_client_credentials_flow(
+        &bundle.issuer,
+        &bundle.client_id,
+        audience,
+        scopes,
+        insecure,
+    )
+    .await
 }
 
 /// Ensure we have a valid OIDC token bundle for the given gateway, refreshing if needed.
@@ -547,10 +590,14 @@ pub async fn ensure_valid_oidc_token_bundle(
         gateway = gateway_name,
         "OIDC token expired, attempting refresh"
     );
-    let scopes = openshell_bootstrap::load_gateway_metadata(gateway_name)
-        .ok()
-        .and_then(|metadata| metadata.oidc_scopes);
-    let refreshed = oidc_refresh_token(&bundle, scopes.as_deref(), insecure).await?;
+    let metadata = openshell_bootstrap::load_gateway_metadata(gateway_name).ok();
+    let refreshed = oidc_renew_token(
+        &bundle,
+        metadata.as_ref().and_then(|m| m.oidc_audience.as_deref()),
+        metadata.as_ref().and_then(|m| m.oidc_scopes.as_deref()),
+        insecure,
+    )
+    .await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
     Ok(refreshed)
 }
@@ -582,6 +629,7 @@ fn bundle_from_oauth2_response(
         expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
+        client_credentials: false,
     }
 }
 
@@ -743,6 +791,103 @@ fn html_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn expired_bundle(issuer: &str, client_credentials: bool) -> OidcTokenBundle {
+        OidcTokenBundle {
+            access_token: "expired-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(0),
+            issuer: issuer.to_string(),
+            client_id: "client-id".to_string(),
+            client_credentials,
+        }
+    }
+
+    #[test]
+    fn expired_client_credentials_bundle_renews_without_refresh_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let renewed = temp_env::with_var(CLIENT_SECRET_ENV, Some("s3cret"), || {
+            rt.block_on(async {
+                let server = MockServer::start().await;
+                let issuer = server.uri();
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/openid-configuration"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/token"))
+                    .and(body_string_contains("grant_type=client_credentials"))
+                    .and(body_string_contains("client_id=client-id"))
+                    .and(body_string_contains("client_secret=s3cret"))
+                    .and(body_string_contains("audience=openshell-api"))
+                    .and(body_string_contains("scope=custom"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "access_token": "renewed-access",
+                        "token_type": "bearer",
+                        "expires_in": 300,
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                oidc_renew_token(
+                    &expired_bundle(&issuer, true),
+                    Some("openshell-api"),
+                    Some("custom"),
+                    false,
+                )
+                .await
+                .unwrap()
+            })
+        });
+
+        assert_eq!(renewed.access_token, "renewed-access");
+        assert!(renewed.client_credentials);
+        assert!(renewed.refresh_token.is_none());
+        assert!(renewed.expires_at.is_some_and(|at| at > 0));
+        assert!(!serde_json::to_string(&renewed).unwrap().contains("s3cret"));
+    }
+
+    #[test]
+    fn client_credentials_renewal_without_secret_names_the_secret() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = temp_env::with_var_unset(CLIENT_SECRET_ENV, || {
+            rt.block_on(oidc_renew_token(
+                &expired_bundle("https://issuer.example", true),
+                None,
+                None,
+                false,
+            ))
+            .unwrap_err()
+        });
+
+        let message = err.to_string();
+        assert!(message.contains(CLIENT_SECRET_ENV), "{message}");
+        assert!(!message.contains("no refresh token"), "{message}");
+    }
+
+    #[test]
+    fn interactive_bundle_without_refresh_token_keeps_refresh_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = temp_env::with_var(CLIENT_SECRET_ENV, Some("s3cret"), || {
+            rt.block_on(oidc_renew_token(
+                &expired_bundle("https://issuer.example", false),
+                None,
+                None,
+                false,
+            ))
+            .unwrap_err()
+        });
+
+        assert!(err.to_string().contains("no refresh token"), "{err}");
+    }
 
     #[test]
     fn http_client_secure_rejects_self_signed() {
@@ -762,6 +907,45 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { client.get("https://127.0.0.1:1").send().await });
         assert!(result.is_err(), "connection to closed port should fail");
+    }
+
+    #[tokio::test]
+    async fn device_flow_refuses_ambiguous_endpoints_before_requesting_codes() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let invalid = format!("{issuer}/private^endpoint");
+        for (token, device, field) in [
+            (invalid.as_str(), issuer.as_str(), "token endpoint"),
+            (
+                issuer.as_str(),
+                invalid.as_str(),
+                "device authorization endpoint",
+            ),
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": issuer,
+                    "token_endpoint": token,
+                    "device_authorization_endpoint": device,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let error = oidc_device_code_flow(&issuer, "cli", None, None, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(field) && error.contains("literal caret"),
+                "{error}"
+            );
+            assert!(!error.contains("private^endpoint"), "{error}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -910,6 +1094,7 @@ mod tests {
             expires_at: Some(0),
             issuer: "https://issuer.example".to_string(),
             client_id: "client-id".to_string(),
+            client_credentials: false,
         };
 
         let refreshed =

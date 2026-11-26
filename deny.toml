@@ -14,7 +14,11 @@ yanked = "warn"
 unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — required by russh/ssh-key and RSA test fixtures; no patched release is available" },
+    # chrono 0.4.45 is unmaintained with no patched release. Migration requires
+    # changes to OpenShell's time and logging APIs and to dependencies including
+    # oauth2, oci-client, russh-sftp, and russh-util.
+    # https://github.com/chronotope/chrono/issues/1768
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; remove after first-party time APIs and all covered dependency graphs migrate to maintained alternatives and pass validation" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
@@ -64,6 +68,11 @@ external-default-features = "allow"
 name = "ring"
 wrappers = ["rustls", "rustls-webpki"]
 reason = "Use the selected crypto backend instead. These wrappers are allowed for z3-sys's prebuilt archive downloader."
+
+[[bans.deny]]
+name = "stacker"
+deny-multiple-versions = true
+reason = "Cedar's stack checks read the thread-local of the stacker that openshell-policy-cedar grows the stack with; a second version would not share it."
 
 [[bans.deny]]
 name = "aws-lc-rs"
@@ -185,6 +194,7 @@ wrappers = [
 name = "sha3"
 reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
 wrappers = [
+    "lalrpop",
     "ml-kem",
     "russh",
 ]
@@ -199,6 +209,7 @@ wrappers = [
     "openshell-server",
     "pbkdf2",
     "rfc6979",
+    "rsa",
     "russh",
     "sqlx-postgres",
     "ssh-key",
@@ -403,4 +414,5 @@ reason = "SSH ciphers are dependency-owned."
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# OpenShell's Cedar (ai-openshell), pinned by commit in Cargo.toml.
+allow-git = ["https://github.com/ai-openshell/cedar.git"]

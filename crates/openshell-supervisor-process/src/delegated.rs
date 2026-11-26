@@ -92,7 +92,10 @@ pub async fn start_boundary_access(
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     config_push_updates: tokio::sync::watch::Sender<bool>,
+    supported_capabilities: Vec<String>,
     host_key: Option<russh::keys::PrivateKey>,
+    gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    app_installations: Option<openshell_core::app_listener::InstallationSource>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -127,9 +130,12 @@ pub async fn start_boundary_access(
                 terminating.clone(),
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
+                    app_installations,
                     session_id_updates: supervisor_session_updates,
                     config_apply_tx,
                     config_push_updates,
+                    gateway_home,
+                    supported_capabilities,
                 },
             );
             (Some(task), Some(accepted))
@@ -373,6 +379,9 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            Vec::new(),
+            None,
+            None,
             None,
         )
         .await
@@ -414,6 +423,9 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            Vec::new(),
+            None,
+            None,
             None,
         )
         .await;

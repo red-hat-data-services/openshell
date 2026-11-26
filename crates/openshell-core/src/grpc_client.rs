@@ -253,6 +253,7 @@ impl GatewayCredentials {
 pub struct GatewayEndpoint {
     url: Arc<str>,
     credentials: GatewayCredentials,
+    supported_capabilities: Vec<String>,
 }
 
 impl GatewayEndpoint {
@@ -260,7 +261,16 @@ impl GatewayEndpoint {
         Self {
             url: url.into(),
             credentials,
+            supported_capabilities: Vec::new(),
         }
+    }
+
+    /// Advertises the policy capabilities this caller can enforce when
+    /// receiving sandbox configuration. Missing capabilities are unsupported.
+    #[must_use]
+    pub fn with_supported_capabilities(mut self, supported: Vec<String>) -> Self {
+        self.supported_capabilities = supported;
+        self
     }
 
     #[must_use]
@@ -277,6 +287,7 @@ impl GatewayEndpoint {
     #[must_use]
     pub fn with_url(&self, url: impl Into<Arc<str>>) -> Self {
         Self::new(url, self.credentials.clone())
+            .with_supported_capabilities(self.supported_capabilities.clone())
     }
 }
 
@@ -388,7 +399,7 @@ fn configure_gateway_tls(
         .wrap_err("failed to configure TLS")
 }
 
-/// Build the plain (un-intercepted) gRPC channel.
+/// Configure the plain (un-intercepted) gRPC endpoint.
 ///
 /// When the endpoint uses `https://`, server-authenticated TLS is configured
 /// using this env var:
@@ -396,7 +407,7 @@ fn configure_gateway_tls(
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
-async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -431,7 +442,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
-    ep.connect()
+    Ok(ep)
+}
+
+async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_endpoint(endpoint)?
+        .connect()
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
@@ -1220,7 +1236,12 @@ pub async fn fetch_policy(
 
     debug!("Connected, fetching sandbox policy");
 
-    fetch_policy_with_client(&mut client, sandbox_name).await
+    fetch_policy_with_client(
+        &mut client,
+        sandbox_name,
+        gateway.supported_capabilities.clone(),
+    )
+    .await
 }
 
 /// Fetch the authoritative policy and revision metadata in one response.
@@ -1241,16 +1262,26 @@ pub async fn fetch_settings_snapshot(
     let status = ClientSpanStatus::current();
     debug!(endpoint = %gateway.url(), sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
     let mut client = connect(gateway).await?;
-    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await)
+    status.finish(
+        fetch_settings_snapshot_with_client(
+            &mut client,
+            sandbox_name,
+            None,
+            gateway.supported_capabilities.clone(),
+        )
+        .await,
+    )
 }
 
 async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
     workspace: Option<&str>,
+    supported_capabilities: Vec<String>,
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supported_capabilities,
             workspace_scope: workspace.map(crate::proto::workspace_selector),
             name: sandbox_name.to_string(),
         })
@@ -1268,8 +1299,11 @@ fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::W
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
+    supported_capabilities: Vec<String>,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_name, None).await?;
+    let snapshot =
+        fetch_settings_snapshot_with_client(client, sandbox_name, None, supported_capabilities)
+            .await?;
 
     // version 0 with no policy means the sandbox was created without one.
     if snapshot.version == 0 && snapshot.policy.is_none() {
@@ -1324,12 +1358,15 @@ pub async fn discover_and_sync_policy(
     sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace))
-        .await?
-        .policy
-        .ok_or_else(|| {
-            miette::miette!("Server still returned no policy after sync — this is a bug")
-        })
+    fetch_settings_snapshot_with_client(
+        &mut client,
+        sandbox,
+        Some(workspace),
+        gateway.supported_capabilities.clone(),
+    )
+    .await?
+    .policy
+    .ok_or_else(|| miette::miette!("Server still returned no policy after sync — this is a bug"))
 }
 
 /// Sync an enriched policy back to the gateway.
@@ -1362,7 +1399,15 @@ pub async fn sync_policy_and_fetch_snapshot(
     let status = ClientSpanStatus::current();
     let mut client = connect(gateway).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)
+    status.finish(
+        fetch_settings_snapshot_with_client(
+            &mut client,
+            sandbox,
+            Some(workspace),
+            gateway.supported_capabilities.clone(),
+        )
+        .await,
+    )
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
@@ -1702,6 +1747,106 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// Final provider access tokens for one sandbox instance over one reused
+/// gateway channel.
+///
+/// The lazy channel connects when used, so initialization never waits on a
+/// network connection. Concurrent requests share it without holding a
+/// lock across the call, and tonic reconnects it after transport loss. Each
+/// request reads the instance's current bearer, so renewal and revocation
+/// apply without reconnecting, and the gateway authorizes every request.
+pub struct SandboxProviderTokenClient {
+    // The validated endpoint shares the instance's rotating credentials.
+    gateway: std::result::Result<(url::Url, GatewayEndpoint), TokenGrantFailure>,
+    client: tokio::sync::OnceCell<OpenShellClient<AuthedChannel>>,
+    deadline: Duration,
+}
+
+impl SandboxProviderTokenClient {
+    #[must_use]
+    pub fn new(gateway: GatewayEndpoint) -> Self {
+        Self::with_deadline(
+            gateway,
+            crate::token_grant_failure::BROKERED_TOKEN_CLIENT_DEADLINE,
+        )
+    }
+
+    fn with_deadline(gateway: GatewayEndpoint, deadline: Duration) -> Self {
+        Self {
+            gateway: token_grant_gateway_endpoint(gateway.url()).map(|endpoint| {
+                let gateway = gateway.with_url(endpoint.as_str());
+                (endpoint, gateway)
+            }),
+            client: tokio::sync::OnceCell::new(),
+            deadline,
+        }
+    }
+
+    /// Obtain only the final access token; the gateway selects and verifies
+    /// the sandbox identity and resolves all grant parameters from its
+    /// configuration.
+    ///
+    /// One deadline bounds connection readiness and the call. Network failures
+    /// do not serialize channel initialization for concurrent requests.
+    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+    pub async fn get_access_token(
+        &self,
+        credential_key: &str,
+        request_id: Option<&str>,
+    ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+        let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
+        // Like connect(), refuse locally revoked sandbox instance credentials
+        // before the call; the response boundary rejects them again.
+        let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
+        if gateway.credentials().is_revoked() {
+            return Err(unavailable());
+        }
+        let key = crate::dynamic_credential_key::unscoped_owned_key(credential_key)
+            .ok_or_else(|| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
+        let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
+            credential_key: key,
+        });
+        if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
+            request.metadata_mut().insert("x-request-id", value);
+        }
+        let response = tokio::time::timeout(self.deadline, async {
+            let mut client = self
+                .client
+                .get_or_try_init(|| async {
+                    let channel = build_plain_endpoint(gateway.url())?.connect_lazy();
+                    let intercepted = InterceptedService::new(
+                        channel.clone(),
+                        AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
+                    );
+                    gateway
+                        .credentials
+                        .start_renewal(&intercepted, &channel, gateway.url());
+                    Ok::<_, miette::Report>(OpenShellClient::new(intercepted))
+                })
+                .await
+                .map_err(|_| unavailable())?
+                .clone();
+            client
+                .get_sandbox_provider_access_token(request)
+                .await
+                .map_err(|status| provider_subject_token_exchange_status(&status, endpoint))
+        })
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))??
+        .into_inner();
+        if gateway.credentials().is_revoked() {
+            return Err(gateway_grant_failure(
+                TokenGrantFailureKind::WorkloadIdentityRejected,
+            ));
+        }
+        provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: response.access_token,
+            expires_after: response.expires_after,
+            token_type: response.token_type,
+        })
+    }
+}
+
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.
@@ -1828,6 +1973,53 @@ mod token_grant_exchange_tests {
         assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
     }
 
+    #[tokio::test]
+    async fn access_token_deadline_bounds_connection_and_call_for_each_request() {
+        // The gateway accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let credentials = GatewayCredentials::new(
+            AsciiMetadataValue::from_static("Bearer test"),
+            TokenSource::Env,
+        );
+        let deadline = Duration::from_millis(300);
+        let client = SandboxProviderTokenClient::with_deadline(
+            GatewayEndpoint::new(format!("http://{address}"), credentials),
+            deadline,
+        );
+        let started = tokio::time::Instant::now();
+        let results: [_; 2] = tokio::join!(
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+        )
+        .into();
+        for result in results {
+            let failure = result.err().expect("unanswered gateway times out");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
+        }
+        assert!(
+            client.client.get().is_some(),
+            "an unresponsive gateway must not prevent channel initialization"
+        );
+        // Concurrent requests share one budget rather than queueing behind it.
+        assert!(started.elapsed() < deadline * 3);
+        held.abort();
+
+        let invalid = SandboxProviderTokenClient::new(GatewayEndpoint::new(
+            "https://localhost/SECRET",
+            GatewayCredentials::new(
+                AsciiMetadataValue::from_static("Bearer test"),
+                TokenSource::Env,
+            ),
+        ));
+        let failure = invalid.get_access_token("key", None).await.err().unwrap();
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+    }
+
     #[test]
     fn gateway_response_keeps_expiration_and_rejects_invalid_duration() {
         let response = |seconds, nanos| crate::proto::ExchangeProviderSubjectTokenResponse {
@@ -1852,6 +2044,8 @@ mod token_grant_exchange_tests {
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
+    /// See [`GatewayEndpoint::with_supported_capabilities`].
+    supported_capabilities: Vec<String>,
     /// Sandbox instance gateway credentials rotated alongside extension
     /// credentials.
     credentials: GatewayCredentials,
@@ -1865,6 +2059,7 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub service_routes: Vec<crate::proto::SandboxServiceRoute>,
     pub configuration_instance_id: String,
     pub configuration_admitted: bool,
     pub configuration_error: String,
@@ -1892,6 +2087,7 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        service_routes: inner.service_routes,
         configuration_instance_id: inner.configuration_instance_id,
         configuration_admitted: inner.configuration_admitted,
         configuration_error: inner.configuration_error,
@@ -1921,6 +2117,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
     fn from(snapshot: crate::proto::SandboxConfigSnapshot) -> Self {
         settings_poll_result(crate::proto::GetSandboxConfigResponse {
+            service_routes: snapshot.service_routes,
             policy: snapshot.policy,
             version: snapshot.version,
             policy_hash: snapshot.policy_hash,
@@ -2201,6 +2398,7 @@ impl CachedOpenShellClient {
         let client = connect(gateway).await?;
         Ok(Self {
             client,
+            supported_capabilities: gateway.supported_capabilities.clone(),
             credentials: gateway.credentials.clone(),
             workspace: Arc::new(tokio::sync::OnceCell::new()),
             extension_credentials,
@@ -2222,6 +2420,7 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
+                supported_capabilities: self.supported_capabilities.clone(),
                 workspace_scope,
                 name: sandbox_name.to_string(),
             })

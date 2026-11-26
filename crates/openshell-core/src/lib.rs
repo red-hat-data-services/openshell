@@ -10,10 +10,13 @@
 //! - Build version metadata
 
 pub mod activity;
+pub mod app_listener;
 pub mod auth;
+pub mod color;
 pub mod compute;
 pub mod config;
 pub mod container_paths;
+pub mod create_retry;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
@@ -46,6 +49,7 @@ pub mod network_trust;
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub mod policy_l7;
 pub use openshell_policy_schema::yaml;
 pub mod policy_identity;
 pub mod progress;
@@ -63,19 +67,20 @@ pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
-pub mod spiffe;
 pub mod telemetry;
 pub mod time;
+pub mod token_endpoint;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
+    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuditConfig, GatewayAuthConfig,
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig, MtlsAuthConfig,
+    OidcConfig, PolicyDnsIpv6Egress, PolicyValidationFailureMode, SupervisorIpv6EgressConfig,
+    TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

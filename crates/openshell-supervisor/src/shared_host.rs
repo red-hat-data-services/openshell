@@ -35,14 +35,15 @@ use miette::Result;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_client::SupervisorHostClient;
 use openshell_core::proto::supervisor_host::v1::{
     AssignmentSnapshot, HostGatewayMessage, HostHeartbeat, HostHello, HostMessage, HostStatus,
-    PoolMember, SandboxInstanceAssignment, SandboxInstanceTakeover, host_gateway_message,
-    host_message,
+    PoolMember, RouteLookup, RouteOwner, SandboxInstanceAssignment, SandboxInstanceTakeover,
+    host_gateway_message, host_message,
 };
 use openshell_extension_core::BearerTokenSlot;
 use openshell_sandbox_backend::BoundaryTakeover;
-use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
+use openshell_sandbox_backend::runtime_routed::{ResolveRoute, RuntimeRouter};
 use openshell_supervisor_control::{
-    SandboxInstancePhaseReport, SandboxInstanceRegistration, SandboxInstanceStatusReport,
+    PoolLimits, SandboxInstancePhaseReport, SandboxInstanceRegistration,
+    SandboxInstanceStatusReport,
 };
 use tokio::sync::watch;
 use tokio_stream::StreamExt as _;
@@ -77,15 +78,85 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Host-to-gateway messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
-/// Most sandbox instances one snapshot may assign to a host; the gateway
-/// enforces the same bound before it assigns.
-pub const MAX_ASSIGNED_INSTANCES: usize = openshell_supervisor_control::MAX_ASSIGNED_INSTANCES;
-/// Largest gateway message the host decodes: a full snapshot of
-/// `MAX_ASSIGNED_INSTANCES` assignments at their largest, plus framing.
-const MAX_GATEWAY_MESSAGE_BYTES: usize =
-    MAX_ASSIGNED_INSTANCES * (openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES + 1024);
-/// Largest host message: a status report is a few hundred bytes per instance.
-const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Routes whose owner the host asks the gateway for at once.
+const MAX_ROUTE_LOOKUPS: usize = 64;
+
+/// Asks the gateway that accepts the host's stream where a route this member
+/// does not own is supervised.
+#[derive(Default)]
+struct RouteLookups {
+    /// The accepted stream's outbound queue.
+    stream: Mutex<Option<tokio::sync::mpsc::Sender<HostMessage>>>,
+    /// Connections waiting for each route's owner.
+    waiting: Mutex<
+        std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Option<SocketAddr>>>>,
+    >,
+}
+
+impl RouteLookups {
+    /// Send lookups on `stream`, or on none. Lookups sent on an earlier
+    /// stream are never answered, so their callers resolve no owner.
+    fn connect(&self, stream: Option<tokio::sync::mpsc::Sender<HostMessage>>) {
+        *self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stream;
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn answer(&self, owner: RouteOwner) {
+        let waiters = self
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&owner.route);
+        let address = owner.runtime_address.parse().ok();
+        for waiter in waiters.into_iter().flatten() {
+            let _ = waiter.send(address);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ResolveRoute for RouteLookups {
+    async fn owner(&self, route: &str) -> Option<SocketAddr> {
+        let (waiter, answer) = tokio::sync::oneshot::channel();
+        {
+            let mut waiting = self
+                .waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(waiters) = waiting.get_mut(route) {
+                waiters.push(waiter);
+            } else {
+                if waiting.len() >= MAX_ROUTE_LOOKUPS {
+                    return None;
+                }
+                let stream = self
+                    .stream
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()?;
+                // Half the queue stays free for heartbeats and status reports.
+                if stream.capacity() <= OUTBOUND_QUEUE / 2 {
+                    return None;
+                }
+                stream
+                    .try_send(HostMessage {
+                        payload: Some(host_message::Payload::RouteLookup(RouteLookup {
+                            route: route.to_string(),
+                        })),
+                    })
+                    .ok()?;
+                waiting.insert(route.to_string(), vec![waiter]);
+            }
+        }
+        answer.await.ok().flatten()
+    }
+}
 
 /// How a host notices a silent gateway and paces its reconnects: it must
 /// reach a responsive gateway replica well before its membership record
@@ -175,17 +246,29 @@ pub struct SharedHostConfig {
     pub runtime_listen: SocketAddr,
     /// Time a withdrawn sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
+    /// Initial boundary attachment and image-policy discovery budget.
+    pub attach_request_timeout: Duration,
     /// This process's identity as a member of the supervisor pool.
     pub pool: PoolIdentity,
+    /// This member's cap of sandbox instances, which also sizes its stream's
+    /// message bounds. The gateway enforces the same cap before it assigns.
+    pub limits: PoolLimits,
+    /// AAAA handling for the policy DNS of every hosted instance.
+    pub policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
+    /// NAT64 prefixes for the SSRF checks of every hosted instance.
+    pub nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
 }
 
 /// The sandbox instance registry and the routed runtime listener its
 /// instances claim routes on, reconciled to the gateway's assignments.
 pub struct SharedHost {
+    app_listener: Option<crate::app_listener::HostHandle>,
     host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
+    route_lookups: Arc<RouteLookups>,
     gateway_endpoint: String,
     removal_grace: Duration,
+    attach_request_timeout: Duration,
     /// Assignments of the latest snapshot that could not be admitted, reported
     /// as failed instances until the gateway withdraws them.
     rejected: Mutex<BTreeMap<String, SandboxInstanceStatusReport>>,
@@ -194,6 +277,10 @@ pub struct SharedHost {
     desired_routes: Mutex<Option<std::collections::BTreeSet<String>>>,
     /// This process's identity as a member of the supervisor pool.
     pool: PoolIdentity,
+    /// This member's cap, which also sizes its stream's message bounds.
+    limits: PoolLimits,
+    policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
+    nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
     /// Routes of the latest snapshot listed for stopping. Every other route
     /// it omits is relinquished.
     stop_routes: Mutex<std::collections::BTreeSet<String>>,
@@ -209,6 +296,10 @@ pub struct SharedHost {
     leaving: watch::Sender<bool>,
     /// A gateway currently accepts this host's stream.
     gateway_connected: watch::Sender<bool>,
+    /// Peer endpoint of the gateway replica accepting this host's stream;
+    /// hosted instances dial their sessions there. Empty when that replica
+    /// has none, and `None` while no replica accepts the stream.
+    gateway_home: watch::Sender<Option<String>>,
     /// Recovery deadline (seconds) the latest snapshot offers the runtimes
     /// of instances this host starts or takes over; `None` keeps the runtime
     /// default.
@@ -287,22 +378,35 @@ impl From<SandboxInstanceHostError> for ControlError {
 impl SharedHost {
     /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
+        let app_listener = crate::app_listener::Config::from_env()?
+            .map(crate::app_listener::Config::bind)
+            .transpose()?
+            .map(crate::app_listener::BoundListener::start);
         let host = SandboxInstanceHost::new(config.instance_root)?;
         let router = RuntimeRouter::bind(config.runtime_listen)
             .map_err(|error| miette::miette!("{error}"))?;
+        let route_lookups = Arc::new(RouteLookups::default());
+        router.set_resolver(route_lookups.clone());
         Ok(Arc::new(Self {
+            app_listener,
             host,
             router,
+            route_lookups,
             gateway_endpoint: config.gateway_endpoint,
             removal_grace: config.removal_grace,
+            attach_request_timeout: config.attach_request_timeout,
             rejected: Mutex::new(BTreeMap::new()),
             desired_routes: Mutex::new(None),
             pool: config.pool,
+            limits: config.limits,
+            policy_dns_ipv6_egress: config.policy_dns_ipv6_egress,
+            nat64_prefixes: config.nat64_prefixes,
             stop_routes: Mutex::new(std::collections::BTreeSet::new()),
             deferred: Mutex::new(None),
             deferred_reports: Mutex::new(BTreeMap::new()),
             leaving: watch::Sender::new(false),
             gateway_connected: watch::Sender::new(false),
+            gateway_home: watch::Sender::new(None),
             recovery_timeout_secs: Mutex::new(None),
             #[cfg(test)]
             reconcile_probe: ReconcileProbe::default(),
@@ -476,8 +580,8 @@ impl SharedHost {
     /// every hosted instance it omits. Assignments that cannot be admitted are
     /// reported as failed instances; they never affect a running instance.
     ///
-    /// A snapshot that would run more than [`MAX_ASSIGNED_INSTANCES`]
-    /// instances still applies its stops, directory, and kept routes, and
+    /// A snapshot that would run more than this member's cap of instances
+    /// still applies its stops, directory, and kept routes, and
     /// keeps every hosted instance it assigns; only the new instances beyond
     /// capacity are left unstarted, as kept routes are, until a later
     /// snapshot fits.
@@ -513,31 +617,23 @@ impl SharedHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             snapshot.stop_routes.iter().cloned().collect();
-        // Runtimes that reach this member for an instance another member
-        // supervises are redirected there.
-        let owners = snapshot
-            .route_directory
-            .iter()
-            .filter_map(|entry| {
-                let address = entry.runtime_address.parse().ok();
-                if address.is_none() {
-                    tracing::warn!(route = %entry.route, "ignoring a malformed route directory address");
-                }
-                Some((entry.route.clone(), address?))
-            })
-            .collect();
-        self.router
-            .set_directory(Some(self.pool.runtime_address), owners);
         // Owned instances the gateway could not describe yet are kept as they
         // are: neither started, released, nor stopped.
         routes.extend(snapshot.keep_routes.iter().cloned());
+        // Runtimes that reach this member for any other route are redirected
+        // to the owner the gateway names.
+        self.router.set_owned(
+            Some(self.pool.runtime_address),
+            routes.iter().cloned().collect(),
+        );
         let hosted = self
             .host
             .list()
             .into_iter()
             .map(|status| status.route)
             .collect::<std::collections::BTreeSet<_>>();
-        let (admitted, unstarted) = within_capacity(snapshot, &hosted);
+        let (admitted, unstarted) =
+            within_capacity(snapshot, &hosted, self.limits.max_instances_per_member());
         if !unstarted.is_empty() {
             tracing::warn!(
                 assigned = snapshot.instances.len(),
@@ -776,6 +872,10 @@ impl SharedHost {
         crate::sandbox_instance_host::prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = dir.join("ssh.sock");
         let config = crate::SandboxInstanceConfig {
+            app_router: self
+                .app_listener
+                .as_ref()
+                .map(crate::app_listener::HostHandle::leased_router),
             command: main_process.command,
             workdir: registration.workdir,
             timeout_secs: 0,
@@ -784,25 +884,30 @@ impl SharedHost {
             sandbox_id: Some(registration.sandbox_id),
             sandbox: Some(registration.sandbox_name),
             container_image: registration.container_image,
+            container_image_uid: None,
             openshell_endpoint: Some(self.gateway_endpoint.clone()),
+            gateway_home: Some(self.gateway_home.subscribe()),
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: Some(ssh_socket.to_string_lossy().into_owned()),
             shared_ssh_socket: false,
             // The Kubernetes driver refuses the gateway topology when an
-            // upstream proxy or provider workload identity is configured,
+            // upstream proxy is configured,
             // and it configures no extra CA for dedicated supervisors.
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
             additional_ca_bundle: None,
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
             backend_descriptor: descriptor,
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
             main_exit_marker: None,
+            attach_request_timeout: self.attach_request_timeout,
             trace_context: registration.trace_context,
-            // One process cannot hold a per-sandbox workload identity, so
-            // providers that need one fail closed.
-            provider_workload_api_socket: None,
+            // The gateway owns each sandbox's workload identity and returns
+            // only final provider access tokens.
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::Gateway,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles {
                 ca_certificate: Some(ca_certificate),
                 ca_private_key: Some(ca_private_key),
@@ -816,6 +921,7 @@ impl SharedHost {
             // The shared host has no per-instance collector endpoint yet, so
             // hosted instances do not relay agent traces.
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(
@@ -934,6 +1040,8 @@ pub struct GatewayLink {
     /// connection attempt, so the gateway's renewals take effect at the next
     /// reconnect without a restart.
     pub token_file: PathBuf,
+    /// Sizes the stream's message bounds; the host's limits.
+    pub limits: PoolLimits,
 }
 
 impl GatewayLink {
@@ -984,9 +1092,24 @@ fn status_message(host: &SharedHost, applied_revision: u64) -> HostMessage {
 /// Why one gateway stream ended.
 enum StreamEnd {
     /// The gateway rejected or closed the stream; reconnect after a backoff.
+    /// `accepted` records whether the gateway had accepted the host, and
+    /// `redial` is the replica that accepted it: the next attempt goes there
+    /// first, as after a token expiry, so the hosted sessions stay in place.
+    Lost {
+        accepted: bool,
+        redial: Option<String>,
+    },
+    /// The gateway sent the host to another replica; dial it at once.
     /// `accepted` records whether the gateway had accepted the host.
-    Lost { accepted: bool },
+    Redirected {
+        peer_endpoint: String,
+        accepted: bool,
+    },
 }
+
+/// Redirects a host follows in a row: the replica a redirect names may find
+/// itself full and send the host on once more.
+const REDIRECT_HOPS: u32 = 2;
 
 /// What a gateway sends a host on its assignment stream.
 type GatewayInbound = std::pin::Pin<
@@ -996,35 +1119,39 @@ type GatewayInbound = std::pin::Pin<
 /// Opens a host's assignment stream: hands the gateway the host's outbound
 /// messages and returns the gateway's.
 trait GatewayConnector: Send + Sync {
-    /// Connect and attach, each stage bounded by `deadline`.
-    fn open(
-        &self,
+    /// Connect to `endpoint`, or the configured endpoint when `None`, and
+    /// attach, each stage bounded by `deadline`.
+    fn open<'a>(
+        &'a self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         deadline: tokio::time::Instant,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>;
+        endpoint: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>>;
 }
 
 impl GatewayConnector for GatewayLink {
-    fn open(
-        &self,
+    fn open<'a>(
+        &'a self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         deadline: tokio::time::Instant,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>> {
+        endpoint: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>> {
         Box::pin(async move {
-            if !self.endpoint.starts_with("https://") {
+            let endpoint = endpoint.unwrap_or(&self.endpoint);
+            if !endpoint.starts_with("https://") {
                 return Err("the supervisor token requires an https gateway endpoint".to_string());
             }
             let token = self
                 .read_token()
                 .map_err(|error| format!("no usable supervisor token: {error}"))?;
-            let connect = openshell_core::grpc_client::connect_gateway_channel(&self.endpoint);
+            let connect = openshell_core::grpc_client::connect_gateway_channel(endpoint);
             let channel = tokio::time::timeout_at(deadline, connect)
                 .await
                 .map_err(|_| "connecting to the gateway timed out".to_string())?
                 .map_err(|error| format!("could not connect to the gateway: {error}"))?;
             let mut client = SupervisorHostClient::with_interceptor(channel, token.interceptor())
-                .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
+                .max_decoding_message_size(self.limits.max_gateway_message_bytes())
+                .max_encoding_message_size(self.limits.max_host_message_bytes());
             let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(outbound));
             let response = tokio::time::timeout_at(deadline, attach)
                 .await
@@ -1067,6 +1194,12 @@ async fn attach_with(
     // attempt bound depends on it, so the attempt after the covered
     // unanswered ones is still quick.
     let mut unanswered = 0_u32;
+    let mut redial = None;
+    // `hops`: redirects followed since the host was last placed. `stay`: the
+    // attempt after a failed redirect stays wherever the Service lands it, so
+    // a stale ring cannot send it back to the replica it could not reach.
+    let mut hops = 0_u32;
+    let mut stay = false;
     tokio::pin!(shutdown);
     loop {
         connection_epoch += 1;
@@ -1077,12 +1210,41 @@ async fn attach_with(
                 member_id: host.pool.member_id.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
+            accepts_redirect: !stay
+                && if hops == 0 {
+                    redial.is_none()
+                } else {
+                    hops < REDIRECT_HOPS
+                },
         };
+        let accepts_redirect = hello.accepts_redirect;
         let attempt_timeout = timings.attempt_timeout(unanswered);
-        let StreamEnd::Lost { accepted } = tokio::select! {
-            end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout) => end,
+        let end = tokio::select! {
+            end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout, redial.as_deref()) => end,
             () = &mut shutdown => return reconciler.shut_down().await,
         };
+        let (accepted, next) = match end {
+            StreamEnd::Redirected {
+                peer_endpoint,
+                accepted,
+            } if accepted || accepts_redirect => {
+                tracing::info!(%peer_endpoint, "gateway redirected the supervisor host");
+                if accepted {
+                    failed = 0;
+                    unanswered = 0;
+                    hops = 0;
+                }
+                hops += 1;
+                stay = false;
+                redial = Some(peer_endpoint);
+                continue;
+            }
+            StreamEnd::Redirected { accepted, .. } => (accepted, None),
+            StreamEnd::Lost { accepted, redial } => (accepted, redial),
+        };
+        stay = hops > 0 && !accepted;
+        hops = 0;
+        redial = next;
         if accepted {
             failed = 0;
             unanswered = 0;
@@ -1093,6 +1255,7 @@ async fn attach_with(
         let backoff = timings.backoff(failed, jitter_sample());
         tracing::info!(
             retry_in_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            redial = redial.as_deref().unwrap_or_default(),
             "gateway assignment stream lost; hosted sandbox instances keep running"
         );
         tokio::select! {
@@ -1287,11 +1450,11 @@ impl Drop for ReconcilerHandle {
 
 /// The assignments of `snapshot` a host admits, and the routes it leaves
 /// unstarted. Hosted instances the snapshot assigns or keeps stay; new ones
-/// are admitted in route order while fewer than [`MAX_ASSIGNED_INSTANCES`]
-/// would run.
+/// are admitted in route order while fewer than `max_instances` would run.
 fn within_capacity<'a>(
     snapshot: &'a AssignmentSnapshot,
     hosted: &std::collections::BTreeSet<String>,
+    max_instances: usize,
 ) -> (Vec<&'a SandboxInstanceAssignment>, Vec<&'a str>) {
     let assigned = snapshot
         .instances
@@ -1302,7 +1465,7 @@ fn within_capacity<'a>(
         .iter()
         .filter(|route| assigned.contains(route.as_str()) || snapshot.keep_routes.contains(*route))
         .count();
-    let mut room = MAX_ASSIGNED_INSTANCES.saturating_sub(staying);
+    let mut room = max_instances.saturating_sub(staying);
     let mut fresh = snapshot
         .instances
         .iter()
@@ -1341,8 +1504,15 @@ async fn run_stream(
     hello: HostHello,
     timings: &StreamTimings,
     attempt_timeout: Duration,
+    endpoint: Option<&str>,
 ) -> StreamEnd {
-    let lost = |accepted| StreamEnd::Lost { accepted };
+    let lost = |accepted: bool| StreamEnd::Lost {
+        accepted,
+        redial: accepted
+            .then(|| host.gateway_home.borrow().clone())
+            .flatten()
+            .filter(|endpoint| !endpoint.is_empty()),
+    };
     // One deadline covers saying hello, connecting, attaching, and being
     // accepted, so a slow stage leaves less time for the next; the reconnect
     // budget counts on it.
@@ -1372,7 +1542,7 @@ async fn run_stream(
     {
         return lost(false);
     }
-    let opened = tokio::time::timeout_at(deadline, connector.open(rx, deadline))
+    let opened = tokio::time::timeout_at(deadline, connector.open(rx, deadline, endpoint))
         .await
         .unwrap_or_else(|_| Err("connecting to the gateway timed out".to_string()));
     let mut inbound = match opened {
@@ -1417,6 +1587,9 @@ async fn run_stream(
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
                         accepted = true;
                         host.gateway_connected.send_replace(true);
+                        host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
+                        host.route_lookups
+                            .connect(accepted_message.route_lookups.then(|| tx.clone()));
                         tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
@@ -1439,6 +1612,10 @@ async fn run_stream(
                         tracing::error!(reason = %rejected.reason, "gateway rejected the supervisor host");
                         break lost(accepted);
                     }
+                    Some(host_gateway_message::Payload::Redirect(redirect)) if !redirect.peer_endpoint.is_empty() => {
+                        break StreamEnd::Redirected { peer_endpoint: redirect.peer_endpoint, accepted };
+                    }
+                    Some(host_gateway_message::Payload::Redirect(_)) => break lost(accepted),
                     Some(host_gateway_message::Payload::Assignments(snapshot)) => {
                         if !accepted {
                             tracing::warn!("gateway sent assignments before accepting the host");
@@ -1451,6 +1628,7 @@ async fn run_stream(
                         received_revision = snapshot.revision;
                         reconciler.submit(stream, snapshot);
                     }
+                    Some(host_gateway_message::Payload::RouteOwner(owner)) => host.route_lookups.answer(owner),
                     Some(host_gateway_message::Payload::Heartbeat(_)) | None => {}
                 }
             }
@@ -1516,16 +1694,59 @@ async fn run_stream(
             }
         }
     };
+    host.route_lookups.connect(None);
     host.gateway_connected.send_replace(false);
+    host.gateway_home.send_replace(None);
     end
 }
 
-#[cfg(test)]
+// Hosted sandbox instances require a Unix host.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sandbox_instance_host::SandboxInstanceAdmission;
     use openshell_core::jwt::CredentialEpoch;
     use openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId;
+
+    const TEST_MAX_INSTANCES: usize = 16;
+
+    fn test_limits() -> PoolLimits {
+        PoolLimits::new(TEST_MAX_INSTANCES, 1).unwrap()
+    }
+
+    #[test]
+    fn capacity_admits_new_instances_only_up_to_the_configured_cap() {
+        let assignment = |route: &str| SandboxInstanceAssignment {
+            sandbox_id: route.to_string(),
+            route: route.to_string(),
+            generation: "generation".to_string(),
+            launch_material: b"{}".to_vec(),
+            takeover: None,
+        };
+        let snapshot = AssignmentSnapshot {
+            instances: (0..40)
+                .map(|index| assignment(&format!("rt-{index:02}")))
+                .collect(),
+            keep_routes: vec!["rt-kept".to_string()],
+            ..AssignmentSnapshot::default()
+        };
+        let hosted = ["rt-00", "rt-kept", "rt-gone"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for cap in [16, 32] {
+            let (admitted, unstarted) = within_capacity(&snapshot, &hosted, cap);
+            // The hosted and kept instances count; the one being released
+            // does not.
+            assert_eq!(admitted.len(), cap - 1, "{cap}");
+            assert_eq!(admitted.len() + unstarted.len(), 40, "{cap}");
+            assert!(
+                admitted
+                    .iter()
+                    .any(|assignment| assignment.route == "rt-00")
+            );
+        }
+    }
 
     /// A hosted instance whose stop path reports on `stopped`.
     fn admit_supervising(host: &SharedHost, route: &str, stopped: tokio::sync::mpsc::Sender<()>) {
@@ -1578,10 +1799,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         for (revision, (offered, kept)) in [
@@ -1606,6 +1831,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn hosted_instances_get_the_configured_policy_dns_ipv6_settings() {
+        use openshell_supervisor_network::run::PolicyDnsIpv6Egress;
+        let prefix: openshell_supervisor_network::run::Nat64Prefix =
+            "2001:db8:64::/96".parse().unwrap();
+        for mode in [PolicyDnsIpv6Egress::Enabled, PolicyDnsIpv6Egress::Disabled] {
+            let root = tempfile::tempdir().unwrap();
+            let host = SharedHost::start(SharedHostConfig {
+                gateway_endpoint: "https://gateway.invalid".to_string(),
+                instance_root: root.path().join("instances"),
+                runtime_listen: "127.0.0.1:0".parse().unwrap(),
+                removal_grace: Duration::from_secs(10),
+                attach_request_timeout: Duration::from_mins(5),
+                pool: PoolIdentity {
+                    member_id: "member-1".to_string(),
+                    runtime_address: "127.0.0.1:5500".parse().unwrap(),
+                },
+                limits: test_limits(),
+                policy_dns_ipv6_egress: mode,
+                nat64_prefixes: vec![prefix],
+            })
+            .unwrap();
+            assert_eq!(host.policy_dns_ipv6_egress, mode);
+            assert_eq!(host.nat64_prefixes, [prefix]);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn pool_members_keep_release_or_stop_unassigned_instances_as_snapshots_say() {
         let root = tempfile::tempdir().unwrap();
@@ -1614,10 +1866,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let routes = [
@@ -1735,10 +1991,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
@@ -1831,10 +2091,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
@@ -1867,7 +2131,7 @@ mod tests {
         };
         let mut instances = vec![assignment(hosted_route.to_string())];
         instances.extend(
-            (0..MAX_ASSIGNED_INSTANCES)
+            (0..TEST_MAX_INSTANCES)
                 .map(|index| assignment(format!("rt-new-{index:04}-0123456789"))),
         );
         let elsewhere = "rt-elsewhere-0123456789";
@@ -1877,17 +2141,34 @@ mod tests {
             pool: true,
             instances,
             stop_routes: vec![stopped_route.to_string()],
-            route_directory: vec![openshell_core::proto::supervisor_host::v1::RouteOwner {
-                route: elsewhere.to_string(),
-                runtime_address: owner.to_string(),
-            }],
             ..AssignmentSnapshot::default()
         })
         .await
         .expect("an oversized snapshot is applied, not refused");
+        // The gateway names the owner of a route this member does not own.
+        let (lookups, mut asked) = tokio::sync::mpsc::channel(OUTBOUND_QUEUE);
+        host.route_lookups.connect(Some(lookups));
+        let gateway = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                while let Some(HostMessage {
+                    payload: Some(host_message::Payload::RouteLookup(lookup)),
+                }) = asked.recv().await
+                {
+                    host.route_lookups.answer(RouteOwner {
+                        runtime_address: if lookup.route == elsewhere {
+                            owner.to_string()
+                        } else {
+                            String::new()
+                        },
+                        route: lookup.route,
+                    });
+                }
+            })
+        };
 
-        // The listed stop ran, the hosted instance stays, and the directory
-        // redirects runtimes of routes owned elsewhere.
+        // The listed stop ran, the hosted instance stays, and runtimes of
+        // routes owned elsewhere are redirected to the owner.
         assert_eq!(stops.try_recv(), Ok(()));
         assert!(host.status(stopped_route).is_none());
         assert_eq!(
@@ -1895,27 +2176,80 @@ mod tests {
             Some(SandboxInstancePhaseReport::Supervising)
         );
         assert!(kept_stops.try_recv().is_err());
-        let mut stream = tokio::net::TcpStream::connect(host.router.local_addr())
-            .await
-            .unwrap();
+        let mut stream =
+            openshell_core::net::connect_tcp_nodelay_best_effort(host.router.local_addr())
+                .await
+                .unwrap();
         assert_eq!(
             openshell_sandbox_backend::runtime_routed::negotiate_route(&mut stream, elsewhere)
                 .await
                 .unwrap(),
             openshell_sandbox_backend::runtime_routed::RouteReply::Redirect(owner)
         );
+        host.route_lookups.connect(None);
+        gateway.abort();
         // Only up to capacity was attempted: the hosted instance and all but
         // the last new one in route order; the last stays unstarted.
         let rejected = host.rejected.lock().unwrap().clone();
-        assert_eq!(rejected.len(), MAX_ASSIGNED_INSTANCES);
-        let last = format!("rt-new-{:04}-0123456789", MAX_ASSIGNED_INSTANCES - 1);
+        assert_eq!(rejected.len(), TEST_MAX_INSTANCES);
+        let last = format!("rt-new-{:04}-0123456789", TEST_MAX_INSTANCES - 1);
         assert!(!rejected.contains_key(&last));
         assert!(rejected.contains_key("rt-new-0000-0123456789"));
         assert!(host.list().iter().all(|status| status.route != last));
         host.shut_down().await;
     }
 
+    #[tokio::test]
+    async fn route_lookups_share_one_request_and_never_crowd_the_stream() {
+        let lookups = Arc::new(RouteLookups::default());
+        assert_eq!(lookups.owner("rt-a").await, None, "no stream, no owner");
+
+        let (stream, mut sent) = tokio::sync::mpsc::channel(OUTBOUND_QUEUE);
+        lookups.connect(Some(stream.clone()));
+        let first = tokio::spawn({
+            let lookups = lookups.clone();
+            async move { lookups.owner("rt-a").await }
+        });
+        let second = tokio::spawn({
+            let lookups = lookups.clone();
+            async move { lookups.owner("rt-a").await }
+        });
+        let asked = sent.recv().await.expect("a lookup is sent");
+        assert!(matches!(
+            asked.payload,
+            Some(host_message::Payload::RouteLookup(RouteLookup { ref route })) if route == "rt-a"
+        ));
+        while lookups.waiting.lock().unwrap().get("rt-a").map(Vec::len) != Some(2) {
+            tokio::task::yield_now().await;
+        }
+        assert!(sent.try_recv().is_err(), "the same route is asked once");
+        let owner: SocketAddr = "10.0.0.2:5500".parse().unwrap();
+        lookups.answer(RouteOwner {
+            route: "rt-a".to_string(),
+            runtime_address: owner.to_string(),
+        });
+        assert_eq!(first.await.unwrap(), Some(owner));
+        assert_eq!(second.await.unwrap(), Some(owner));
+
+        // A lookup the stream would have to queue behind heartbeats is not sent.
+        for _ in 0..=OUTBOUND_QUEUE / 2 {
+            stream.try_send(HostMessage::default()).unwrap();
+        }
+        assert_eq!(lookups.owner("rt-b").await, None);
+        while sent.try_recv().is_ok() {}
+
+        // Dropping the stream releases lookups it will never answer.
+        let pending = tokio::spawn({
+            let lookups = lookups.clone();
+            async move { lookups.owner("rt-c").await }
+        });
+        sent.recv().await.expect("a lookup is sent");
+        lookups.connect(None);
+        assert_eq!(pending.await.unwrap(), None);
+    }
+
     /// How one connection attempt to a [`FakeGateway`] goes.
+    #[derive(Clone, Copy)]
     enum Attempt {
         /// Never opens.
         Hang,
@@ -1929,6 +2263,8 @@ mod tests {
     struct Opened {
         /// When the host asked for it.
         at: tokio::time::Instant,
+        /// The replica the host redialed, or `None` for the Service.
+        endpoint: Option<String>,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         inbound: tokio::sync::mpsc::Sender<Result<HostGatewayMessage, tonic::Status>>,
     }
@@ -1942,13 +2278,15 @@ mod tests {
     }
 
     impl GatewayConnector for FakeGateway {
-        fn open(
-            &self,
+        fn open<'a>(
+            &'a self,
             outbound: tokio::sync::mpsc::Receiver<HostMessage>,
             _deadline: tokio::time::Instant,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>
+            endpoint: Option<&'a str>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>>
         {
             let at = tokio::time::Instant::now();
+            let endpoint = endpoint.map(str::to_string);
             self.calls.lock().unwrap().push(at);
             let attempt = self
                 .plan
@@ -1965,6 +2303,7 @@ mod tests {
                 let (inbound, stream) = tokio::sync::mpsc::channel(1);
                 let _ = self.opened.send(Opened {
                     at,
+                    endpoint,
                     outbound,
                     inbound,
                 });
@@ -1982,6 +2321,10 @@ mod tests {
     }
 
     fn accepted() -> HostGatewayMessage {
+        accepted_by("")
+    }
+
+    fn accepted_by(peer_endpoint: &str) -> HostGatewayMessage {
         gateway_message(host_gateway_message::Payload::Accepted(
             openshell_core::proto::supervisor_host::v1::HostAccepted {
                 session_id: "session".to_string(),
@@ -1989,6 +2332,8 @@ mod tests {
                     seconds: 1,
                     nanos: 0,
                 }),
+                peer_endpoint: peer_endpoint.to_string(),
+                route_lookups: true,
             },
         ))
     }
@@ -2041,10 +2386,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let (opened, streams) = tokio::sync::mpsc::unbounded_channel();
@@ -2116,6 +2465,47 @@ mod tests {
             }
         });
         (reported, gateway)
+    }
+
+    /// A replica that predates lookups ends the stream on one, so the host
+    /// asks only replicas that accept with `route_lookups`.
+    #[tokio::test(start_paused = true)]
+    async fn route_lookups_go_only_to_a_gateway_that_answers_them() {
+        for answers in [false, true] {
+            let (host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now]);
+            let mut stream = streams.recv().await.unwrap();
+            assert!(is_hello(stream.outbound.recv().await));
+            let mut accepted = accepted();
+            if let Some(host_gateway_message::Payload::Accepted(message)) = &mut accepted.payload {
+                message.route_lookups = answers;
+            }
+            stream.inbound.send(Ok(accepted)).await.unwrap();
+            assert!(next_status(&mut stream.outbound).await.is_some());
+
+            let lookup = tokio::spawn({
+                let host = host.clone();
+                async move { host.route_lookups.owner("rt-elsewhere-0123456789").await }
+            });
+            if answers {
+                loop {
+                    match stream.outbound.recv().await.and_then(|m| m.payload) {
+                        Some(host_message::Payload::RouteLookup(_)) => break,
+                        Some(_) => {}
+                        None => panic!("the stream ended before a lookup was sent"),
+                    }
+                }
+                lookup.abort();
+            } else {
+                assert_eq!(lookup.await.unwrap(), None);
+                while let Ok(message) = stream.outbound.try_recv() {
+                    assert!(!matches!(
+                        message.payload,
+                        Some(host_message::Payload::RouteLookup(_))
+                    ));
+                }
+            }
+            host.shut_down().await;
+        }
     }
 
     /// The part of the reconnect budget the host itself spends: everything
@@ -2218,6 +2608,133 @@ mod tests {
         );
         assert!(attempt >= pool_timing::HOST_ATTEMPT_TIMEOUT);
         assert_eq!(gateway.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Hosted instances dial the replica that accepted the host, until its
+    /// stream is lost.
+    #[tokio::test(start_paused = true)]
+    async fn the_accepting_replica_is_the_hosted_instances_gateway() {
+        let (host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Hang]);
+        let mut home = host.gateway_home.subscribe();
+        let stream = streams.recv().await.unwrap();
+        stream
+            .inbound
+            .send(Ok(accepted_by("https://gw-a:8443")))
+            .await
+            .unwrap();
+        home.wait_for(|home| home.as_deref() == Some("https://gw-a:8443"))
+            .await
+            .unwrap();
+        drop(stream);
+        home.wait_for(Option::is_none).await.unwrap();
+    }
+
+    /// A host whose accepted stream is lost, as on token expiry, redials the
+    /// replica that accepted it, so the hosted sessions stay in place; when
+    /// that replica does not accept it, the host goes back to the Service.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_stream_redials_its_replica_once() {
+        let (_host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Now, Attempt::Now]);
+        let first = streams.recv().await.unwrap();
+        assert_eq!(first.endpoint, None);
+        first
+            .inbound
+            .send(Ok(accepted_by("https://gw-a:8443")))
+            .await
+            .unwrap();
+        drop(first);
+
+        let refused = streams.recv().await.unwrap();
+        assert_eq!(refused.endpoint.as_deref(), Some("https://gw-a:8443"));
+        drop(refused);
+
+        let next = streams.recv().await.unwrap();
+        assert_eq!(next.endpoint, None);
+    }
+
+    fn accepts_redirect(message: Option<HostMessage>) -> bool {
+        match message {
+            Some(HostMessage {
+                payload: Some(host_message::Payload::Hello(hello)),
+            }) => hello.accepts_redirect,
+            other => panic!("expected a hello, got {other:?}"),
+        }
+    }
+
+    fn redirect_to(peer_endpoint: &str) -> HostGatewayMessage {
+        openshell_supervisor_control::controller::redirect(peer_endpoint.to_string())
+    }
+
+    /// A redirected host dials the named replica at once and takes one more
+    /// redirect from it, then stays; when the replica it was sent to does not
+    /// accept it, the host asks the replica the Service picks to keep it.
+    #[tokio::test(start_paused = true)]
+    async fn a_redirected_host_follows_at_most_two_redirects_then_stays() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 5]);
+        let mut first = streams.recv().await.unwrap();
+        assert!(accepts_redirect(first.outbound.recv().await));
+        first
+            .inbound
+            .send(Ok(redirect_to("https://gw-b:8443")))
+            .await
+            .unwrap();
+
+        let mut second = streams.recv().await.unwrap();
+        assert_eq!(second.endpoint.as_deref(), Some("https://gw-b:8443"));
+        assert_eq!(second.at, first.at);
+        assert!(accepts_redirect(second.outbound.recv().await));
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, first.at);
+        assert!(!accepts_redirect(third.outbound.recv().await));
+        drop(third);
+
+        let mut fallback = streams.recv().await.unwrap();
+        assert_eq!(fallback.endpoint, None);
+        assert!(!accepts_redirect(fallback.outbound.recv().await));
+        drop(fallback);
+
+        let mut next = streams.recv().await.unwrap();
+        assert!(accepts_redirect(next.outbound.recv().await));
+    }
+
+    /// A host accepted where a redirect sent it follows that replica's own
+    /// redirect when it stops, at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_host_follows_a_later_handoff_redirect() {
+        let (_host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now; 3]);
+        let first = streams.recv().await.unwrap();
+        first
+            .inbound
+            .send(Ok(redirect_to("https://gw-b:8443")))
+            .await
+            .unwrap();
+
+        let second = streams.recv().await.unwrap();
+        second
+            .inbound
+            .send(Ok(accepted_by("https://gw-b:8443")))
+            .await
+            .unwrap();
+        let handed_off = tokio::time::Instant::now();
+        second
+            .inbound
+            .send(Ok(redirect_to("https://gw-c:8443")))
+            .await
+            .unwrap();
+
+        let mut third = streams.recv().await.unwrap();
+        assert_eq!(third.endpoint.as_deref(), Some("https://gw-c:8443"));
+        assert_eq!(third.at, handed_off);
+        assert!(accepts_redirect(third.outbound.recv().await));
     }
 
     /// A replica that keeps writing but stops reading fills the host's
@@ -2350,10 +2867,14 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            attach_request_timeout: Duration::from_mins(5),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
+            limits: test_limits(),
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
         })
         .unwrap();
         let reconciler = Reconciler::start(host.clone());

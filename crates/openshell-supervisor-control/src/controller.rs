@@ -30,6 +30,7 @@
 //! at once.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,9 +39,10 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
+use crate::pool_limits::PoolLimits;
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
-    HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
+    HostMessage, HostRedirect, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
 
@@ -69,16 +71,6 @@ const SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 const OUTBOUND_QUEUE: usize = 16;
 /// How long a withdrawn pool instance stays on its owner's stop list.
 const POOL_STOP_RETENTION: Duration = Duration::from_mins(2);
-/// Most sandbox instances one shared supervisor host runs. The gateway
-/// refuses to assign beyond it, and the host refuses snapshots beyond it, so
-/// a sandbox is never created that its host could not accept.
-pub const MAX_ASSIGNED_INSTANCES: usize = 256;
-/// Most sandbox instances a supervisor pool runs across its members; the
-/// gateway places at most [`MAX_ASSIGNED_INSTANCES`] on each member.
-pub const MAX_POOL_INSTANCES: usize = 16 * MAX_ASSIGNED_INSTANCES;
-/// Most instances one host status report may describe: every assignment plus
-/// instances still being removed.
-pub const MAX_REPORTED_INSTANCES: usize = 4 * MAX_ASSIGNED_INSTANCES;
 
 /// Verified identity of a connected supervisor host: the claims of the
 /// supervisor token that authenticated its stream.
@@ -114,7 +106,7 @@ pub enum ObservedInstance {
     /// assigned this route.
     Pending,
     /// The host reconciled to that snapshot (or the route is not assigned)
-    /// and does not host the route.
+    /// and does not host the route, or the pool reports the route expired.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -187,6 +179,9 @@ pub struct PoolView {
     /// gateway replica that serves the owner, for judging instances whose
     /// owner streams to another replica.
     pub reports: BTreeMap<String, SandboxInstanceStatus>,
+    /// Routes whose owner's process has been gone past the runtime's
+    /// recovery deadline, so the runtime has ended their workloads.
+    pub expired: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for PoolView {
@@ -198,6 +193,7 @@ impl std::fmt::Debug for PoolView {
             .field("desired", &self.desired)
             .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
             .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .field("expired", &self.expired)
             .finish()
     }
 }
@@ -356,6 +352,12 @@ struct Inner {
     /// stream attached or ended, or a member announced leaving.
     membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
+    /// This replica's peer endpoint, sent in every `HostAccepted`.
+    peer_endpoint: Mutex<String>,
+    /// Size limits of the pool and each member.
+    limits: Mutex<PoolLimits>,
+    /// Live gateway replicas serving the pool, which scale its capacity.
+    gateway_replicas: AtomicUsize,
 }
 
 /// Gateway-owned desired assignments and observed status of the shared
@@ -406,8 +408,44 @@ impl SupervisorHostController {
                 revision: watch::Sender::new(0),
                 membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
+                peer_endpoint: Mutex::new(String::new()),
+                limits: Mutex::new(PoolLimits::default()),
+                gateway_replicas: AtomicUsize::new(1),
             }),
         }
+    }
+
+    /// Size the pool and each member by `limits` instead of the defaults.
+    /// Call it before any host attaches.
+    pub fn set_pool_limits(&self, limits: PoolLimits) {
+        *lock(&self.inner.limits) = limits;
+    }
+
+    /// The pool's size limits.
+    #[must_use]
+    pub fn pool_limits(&self) -> PoolLimits {
+        *lock(&self.inner.limits)
+    }
+
+    /// Record how many gateway replicas are live; the pool's capacity scales
+    /// with them.
+    pub fn set_gateway_replicas(&self, gateway_replicas: usize) {
+        self.inner
+            .gateway_replicas
+            .store(gateway_replicas.max(1), Ordering::Relaxed);
+    }
+
+    /// Most sandbox instances the pool runs with the live gateway replicas.
+    #[must_use]
+    pub fn max_pool_instances(&self) -> usize {
+        self.pool_limits()
+            .max_pool_instances(self.inner.gateway_replicas.load(Ordering::Relaxed))
+    }
+
+    /// Tell attaching hosts to dial their sandbox sessions to `peer_endpoint`.
+    /// Call it before any host attaches.
+    pub fn set_peer_endpoint(&self, peer_endpoint: String) {
+        *lock(&self.inner.peer_endpoint) = peer_endpoint;
     }
 
     /// Offer every instance's runtime `recovery_timeout_secs` instead of
@@ -483,9 +521,10 @@ impl SupervisorHostController {
     /// replica. Refused beyond the pool's capacity, so the caller fails its
     /// create before anything runs.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
+        let max_pool_instances = self.max_pool_instances();
         let mut desired = lock(&self.inner.desired);
         if !desired.assignments.contains_key(&assignment.route)
-            && desired.assignments.len() >= MAX_POOL_INSTANCES
+            && desired.assignments.len() >= max_pool_instances
         {
             return Err(AssignmentError::Capacity);
         }
@@ -757,6 +796,9 @@ impl SupervisorHostController {
         let desired = lock(&self.inner.desired);
         let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
+        if pool.view.expired.contains(route) {
+            return ObservedInstance::Absent;
+        }
         let Some(owner) = pool.view.owners.get(route) else {
             return ObservedInstance::NoHost;
         };
@@ -803,12 +845,16 @@ impl SupervisorHostController {
     }
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
-    /// session it replaces, and returns the gateway-to-host stream.
+    /// session it replaces, and returns the host's member ID and the
+    /// gateway-to-host stream. `home` sees every member and whether its host
+    /// accepts a redirect; a host that does is redirected, without a session,
+    /// to the peer endpoint `home` names.
     pub async fn attach(
         &self,
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
-    ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        home: impl FnOnce(&str, bool) -> Option<String>,
+    ) -> Result<(String, ReceiverStream<Result<HostGatewayMessage, Status>>), Status> {
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
@@ -839,10 +885,20 @@ impl SupervisorHostController {
             return Err(Status::failed_precondition(MISSING_MEMBER));
         };
         validate_member(member).map_err(Status::invalid_argument)?;
-        let heartbeat = POOL_HEARTBEAT_INTERVAL;
+        let member_id = member.member_id.clone();
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let home = home(&member_id, hello.accepts_redirect);
+        if hello.accepts_redirect
+            && let Some(peer_endpoint) = home
+        {
+            tracing::info!(member_id, peer_endpoint, "redirecting supervisor host");
+            let _ = tx.try_send(Ok(redirect(peer_endpoint)));
+            return Ok((member_id, ReceiverStream::new(rx)));
+        }
+        let heartbeat = POOL_HEARTBEAT_INTERVAL;
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
+        let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
@@ -850,6 +906,8 @@ impl SupervisorHostController {
                     seconds: i64::try_from(heartbeat.as_secs()).unwrap_or(15),
                     nanos: 0,
                 }),
+                peer_endpoint,
+                route_lookups: true,
             })),
         }))
         .await
@@ -861,7 +919,7 @@ impl SupervisorHostController {
                 .await;
             controller.end_session(session_id);
         });
-        Ok(ReceiverStream::new(rx))
+        Ok((member_id, ReceiverStream::new(rx)))
     }
 
     /// Start a session for `hello`, superseding the same member's session. A
@@ -995,6 +1053,7 @@ impl SupervisorHostController {
     /// of revisions never sent on this session, regressing acks, and
     /// oversized reports are dropped.
     fn record_status(&self, id: u64, status: HostStatus) -> Result<(), &'static str> {
+        let max_reported_instances = self.pool_limits().max_reported_instances();
         let mut observed = lock(&self.inner.observed);
         let Some(session) = observed.sessions.get_mut(&id) else {
             return Err("report from a superseded supervisor host session");
@@ -1002,7 +1061,7 @@ impl SupervisorHostController {
         if status.applied_revision > session.sent_revision {
             return Err("supervisor host acknowledged a revision it was never sent");
         }
-        if status.instances.len() > MAX_REPORTED_INSTANCES {
+        if status.instances.len() > max_reported_instances {
             return Err("supervisor host status reports too many instances");
         }
         if session
@@ -1028,9 +1087,30 @@ impl SupervisorHostController {
         Ok(())
     }
 
+    /// Where `route` is supervised: the runtime listener of the live member
+    /// that owns it, or empty when none does.
+    fn route_owner(&self, route: String) -> RouteOwner {
+        let pool = lock(&self.inner.pool);
+        let runtime_address = pool
+            .view
+            .owners
+            .get(&route)
+            .and_then(|owner| {
+                pool.view
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == owner.member_id)
+            })
+            .map(|member| member.runtime_address.clone())
+            .unwrap_or_default();
+        RouteOwner {
+            route,
+            runtime_address,
+        }
+    }
+
     /// The snapshot for session `id`'s member: the instances its process
-    /// owns, the stop list, and the route directory. `None` until it can be
-    /// authoritative.
+    /// owns and the stop list. `None` until it can be authoritative.
     fn snapshot(&self, id: u64) -> Option<AssignmentSnapshot> {
         let mut desired = lock(&self.inner.desired);
         if !desired.initialized {
@@ -1085,23 +1165,6 @@ impl SupervisorHostController {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let addresses = pool
-            .view
-            .members
-            .iter()
-            .map(|member| (member.member_id.as_str(), member.runtime_address.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        let route_directory = pool
-            .view
-            .owners
-            .iter()
-            .filter_map(|(route, owner)| {
-                Some(RouteOwner {
-                    route: route.clone(),
-                    runtime_address: (*addresses.get(owner.member_id.as_str())?).to_string(),
-                })
-            })
-            .collect();
         // Owned desired instances whose launch material this gateway has not
         // loaded yet are kept as they are rather than released.
         let kept_terms = pool
@@ -1127,12 +1190,12 @@ impl SupervisorHostController {
             instances,
             pool: true,
             stop_routes,
-            route_directory,
             keep_routes,
             recovery_timeout: Some(prost_types::Duration {
                 seconds: i64::from(pool.recovery_timeout_secs),
                 nanos: 0,
             }),
+            ..AssignmentSnapshot::default()
         })
     }
 
@@ -1182,7 +1245,6 @@ impl SupervisorHostController {
                 let unchanged = last_snapshot.as_ref().is_some_and(|previous| {
                     previous.instances == snapshot.instances
                         && previous.stop_routes == snapshot.stop_routes
-                        && previous.route_directory == snapshot.route_directory
                         && previous.keep_routes == snapshot.keep_routes
                 });
                 if !unchanged {
@@ -1216,6 +1278,13 @@ impl SupervisorHostController {
                     }
                     Some(Ok(HostMessage { payload: Some(host_message::Payload::Heartbeat(_)) })) => {
                         last_heard = tokio::time::Instant::now();
+                    }
+                    Some(Ok(HostMessage { payload: Some(host_message::Payload::RouteLookup(lookup)) })) => {
+                        last_heard = tokio::time::Instant::now();
+                        let owner = self.route_owner(lookup.route);
+                        if !send(host_gateway_message::Payload::RouteOwner(owner)).await {
+                            return;
+                        }
                     }
                     Some(Ok(_)) => {
                         let _ = tx
@@ -1257,6 +1326,16 @@ impl SupervisorHostController {
 const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member; set \
 OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID and \
 OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes";
+
+/// Sends a host to another gateway replica.
+#[must_use]
+pub fn redirect(peer_endpoint: String) -> HostGatewayMessage {
+    HostGatewayMessage {
+        payload: Some(host_gateway_message::Payload::Redirect(HostRedirect {
+            peer_endpoint,
+        })),
+    }
+}
 
 /// Check a pool member's identity, naming the setting that is wrong.
 fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
@@ -1335,7 +1414,9 @@ mod tests {
     #[test]
     fn assignments_are_refused_beyond_the_pools_capacity() {
         let controller = SupervisorHostController::new();
-        for index in 0..MAX_POOL_INSTANCES {
+        controller.set_pool_limits(PoolLimits::new(16, 2).unwrap());
+        assert_eq!(controller.max_pool_instances(), 32);
+        for index in 0..32 {
             controller
                 .assign(assignment(&format!("rt-{index}"), b"x"))
                 .unwrap();
@@ -1346,6 +1427,13 @@ mod tests {
         );
         // Assigning a route again is not a new instance.
         assert_eq!(controller.assign(assignment("rt-0", b"x")), Ok(()));
+        // Another live gateway replica adds its members' capacity.
+        controller.set_gateway_replicas(2);
+        assert_eq!(controller.max_pool_instances(), 64);
+        assert_eq!(
+            controller.assign(assignment("rt-one-too-many", b"x")),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1427,6 +1515,7 @@ mod tests {
                 member_id: member.to_string(),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
+            accepts_redirect: false,
         }
     }
 
@@ -1480,6 +1569,7 @@ mod tests {
                 .collect(),
             owners,
             reports: BTreeMap::new(),
+            expired: BTreeSet::new(),
         }
     }
 
@@ -1525,6 +1615,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_snapshot_does_not_grow_with_the_pool() {
+        use prost::Message as _;
+
+        let controller = SupervisorHostController::new();
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        let mut view = loaded_view(
+            vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+            [("rt-own-0000000000000", owner("m1", "p1", 1))],
+        );
+        for index in 0..crate::pool_limits::MAX_POOL_INSTANCES_CEILING {
+            let route = format!("rt-{index:029}");
+            view.desired.insert(route.clone());
+            view.owners.insert(route, owner("m-2", "p2", 1));
+        }
+        controller.update_pool(view, tokio::time::Instant::now());
+
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-own-0000000000000"]);
+        assert!(
+            snapshot.encoded_len() <= PoolLimits::new(1, 1).unwrap().max_gateway_message_bytes()
+        );
+    }
+
+    #[tokio::test]
     async fn pool_members_receive_only_what_their_process_owns() {
         let controller = SupervisorHostController::new();
         controller.set_recovery_timeout_secs(75);
@@ -1562,14 +1678,11 @@ mod tests {
         assert_eq!(routes(&first), ["rt-a"]);
         assert!(first.instances[0].takeover.is_none());
         assert_eq!(routes(&controller.snapshot(two).unwrap()), ["rt-b"]);
-        // Every member can redirect runtimes to any instance's owner.
+        // Every member can look up any instance's owner to redirect runtimes.
+        let owner_of = |route: &str| controller.route_owner(route.to_string()).runtime_address;
         assert_eq!(
-            first
-                .route_directory
-                .iter()
-                .map(|entry| (entry.route.as_str(), entry.runtime_address.as_str()))
-                .collect::<Vec<_>>(),
-            [("rt-a", "10.0.0.2:5500"), ("rt-b", "10.0.0.3:5500")]
+            [owner_of("rt-a"), owner_of("rt-b"), owner_of("rt-unknown")],
+            ["10.0.0.2:5500", "10.0.0.3:5500", ""]
         );
 
         // A takeover moves rt-b to m1 with the new term's credentials; m2's
@@ -1856,10 +1969,10 @@ mod tests {
         assert_eq!(routes(&snapshot), ["rt-a", "rt-b"]);
         assert_eq!(snapshot.keep_routes, ["rt-c"]);
         assert!(
-            snapshot
-                .route_directory
-                .iter()
-                .any(|entry| entry.route == "rt-c")
+            !controller
+                .route_owner("rt-c".to_string())
+                .runtime_address
+                .is_empty()
         );
         // Once loaded, it is assigned.
         controller.update_pool(
@@ -1944,6 +2057,7 @@ mod tests {
                     instance_id: "p1".to_string(),
                     connection_epoch: 1,
                     member: None,
+                    accepts_redirect: false,
                 },
             )
             .unwrap_err();

@@ -23,7 +23,7 @@ use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{BinaryIdentity, ExecutableIdentity, Sha256Digest};
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -33,6 +33,7 @@ use crate::l7::tls::{
     write_ca_files,
 };
 use crate::opa::OpaEngine;
+use crate::policy_engine::PolicyEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 
@@ -96,7 +97,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         ));
     }
 
-    let engine = Arc::new(OpaEngine::from_proto(&config.policy)?);
+    let engine = PolicyEngine::from(Arc::new(OpaEngine::from_proto(&config.policy)?));
     let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(
         Some(config.policy.clone()),
@@ -125,7 +126,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
                         Ok(upstream_config) => {
                             let cert_cache = CertCache::new(ca);
                             let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
-                            ocsf_emit!(
+                            crate::telemetry::egress_emit!(
                                 ConfigStateChangeBuilder::new(ocsf_ctx())
                                     .severity(SeverityId::Informational)
                                     .status(StatusId::Success)
@@ -138,7 +139,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
                             (Some(state), Some(paths), Some(tls_dir))
                         }
                         Err(e) => {
-                            ocsf_emit!(
+                            crate::telemetry::egress_emit!(
                                     ConfigStateChangeBuilder::new(ocsf_ctx())
                                         .severity(SeverityId::High)
                                         .status(StatusId::Failure)
@@ -152,7 +153,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
                         }
                     },
                     Err(e) => {
-                        ocsf_emit!(
+                        crate::telemetry::egress_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::High)
                                 .status(StatusId::Failure)
@@ -167,7 +168,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
                 }
             }
             Err(e) => {
-                ocsf_emit!(
+                crate::telemetry::egress_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::High)
                         .status(StatusId::Failure)
@@ -181,7 +182,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             }
         },
         Err(e) => {
-            ocsf_emit!(
+            crate::telemetry::egress_emit!(
                 ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::High)
                     .status(StatusId::Failure)
@@ -204,6 +205,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         },
         ancestors: Vec::new(),
         cmdline_paths: Vec::new(),
+        process: None,
     };
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
@@ -245,7 +247,6 @@ mod tests {
         MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy as ProtoSandboxPolicy,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     use super::*;
 
@@ -345,7 +346,9 @@ mod tests {
                 .contains("BEGIN CERTIFICATE")
         );
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         client
             .write_all(
                 b"GET http://policy.local/v1/policy/current HTTP/1.1\r\n\

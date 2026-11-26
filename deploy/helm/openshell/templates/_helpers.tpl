@@ -46,7 +46,7 @@ Common labels
 helm.sh/chart: {{ include "openshell.chart" . }}
 {{ include "openshell.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | replace "+" "_" | trunc 63 | trimAll "-_." | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
@@ -191,7 +191,7 @@ Name of the gateway ClusterRoleBinding.
 
 {{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
 {{- define "openshell.defaultSandboxRuntimeRepository" -}}
-ghcr.io/nvidia/openshell/sandbox
+quay.io/ai-openshell/sandbox
 {{- end }}
 
 {{/* Whether Helm must propagate a sandbox runtime image override. */}}
@@ -269,6 +269,11 @@ shared workspace mode.
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $names := list -}}
+{{- $app := include "openshell.appListenerConfig" . | fromYaml -}}
+{{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml -}}
+{{- if and (get $app "enabled") (get $appDeployment "tls_secret_name") (not (include "openshell.supervisorEnabled" .)) -}}
+{{- $names = append $names (get $appDeployment "tls_secret_name") -}}
+{{- end -}}
 {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}
 {{- $names = append $names .Values.server.tls.clientTlsSecretName -}}
 {{- end -}}
@@ -388,6 +393,44 @@ fullname, so the name never collapses into another release resource's name.
 {{- printf "%s%s" $base $suffix -}}
 {{- end }}
 
+{{/* Validate gateway-owned SPIFFE Broker API settings. */}}
+{{- define "openshell.validateSpiffeBroker" -}}
+{{- $broker := .broker -}}
+{{- $nodeLocal := hasKey $broker "node_local_port" -}}
+{{- if eq $nodeLocal (not (empty (get $broker "endpoint"))) -}}
+{{- fail "spiffe_broker requires exactly one of endpoint and node_local_port" -}}
+{{- end -}}
+{{- if $nodeLocal -}}
+{{- $port := get $broker "node_local_port" -}}
+{{- if or (kindIs "string" $port) (not (regexMatch "^[0-9]+$" (toString $port))) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail "spiffe_broker.node_local_port must be between 1 and 65535" -}}
+{{- end -}}
+{{- else -}}
+{{- $url := urlParse (get $broker "endpoint" | default "") -}}
+{{- if or (ne $url.scheme "https") (empty $url.host) $url.userinfo $url.query $url.fragment (not (has $url.path (list "" "/"))) -}}
+{{- fail "spiffe_broker.endpoint must be an HTTPS endpoint" -}}
+{{- end -}}
+{{- end -}}
+{{- $socket := get $broker "workload_api_socket_path" | default "" -}}
+{{- if or (not (hasPrefix "/" $socket)) (ne (trim $socket) $socket) (eq (dir $socket) "/") (hasSuffix "/" $socket) (regexMatch "(^|/)\\.\\.?(/|$)" $socket) -}}
+{{- fail "spiffe_broker.workload_api_socket_path must be an absolute UNIX socket path" -}}
+{{- end -}}
+{{- $exact := get $broker "server_spiffe_id" | default "" -}}
+{{- $prefix := get $broker "server_spiffe_id_prefix" | default "" -}}
+{{- if eq (empty $exact) (empty $prefix) -}}
+{{- fail "spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix" -}}
+{{- end -}}
+{{- $peerField := ternary "server_spiffe_id" "server_spiffe_id_prefix" (not (empty $exact)) -}}
+{{- range $field := list $peerField "spiffe_id_prefix" -}}
+{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" (get $broker $field | default "")) -}}
+{{- fail (printf "spiffe_broker.%s must be a SPIFFE ID" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $prefix (not (regexMatch "^spiffe://[^/]+/.+" $prefix)) -}}
+{{- fail "spiffe_broker.server_spiffe_id_prefix requires an agent path" -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 Pod labels of the shared supervisor; its Service selects exactly these.
 */}}
@@ -445,28 +488,88 @@ default.
 {{- end }}
 
 {{/*
+One supervisor.pool limit as a whole number of at least 1, and at most max
+when given. A missing value (for example after `helm upgrade --reuse-values`
+from a release that predates it) means the default. Takes a dict of root,
+key, default, and optionally max.
+*/}}
+{{- define "openshell.supervisorPoolLimit" -}}
+{{- $pool := get (.root.Values.supervisor | default dict) "pool" | default dict -}}
+{{- if not (kindIs "map" $pool) -}}
+{{- fail "supervisor.pool must be a map" -}}
+{{- end -}}
+{{- $value := get $pool .key -}}
+{{- if or (not (hasKey $pool .key)) (kindIs "invalid" $value) -}}
+{{- .default -}}
+{{- else -}}
+{{- $limit := include "openshell.wholeNumber" $value -}}
+{{- if hasKey . "max" -}}
+{{- if or (eq $limit "") (lt (int64 $limit) 1) (gt (int64 $limit) (int64 .max)) -}}
+{{- fail (printf "supervisor.pool.%s must be an integer between 1 and %d" .key (int .max)) -}}
+{{- end -}}
+{{- else if or (eq $limit "") (lt (int64 $limit) 1) -}}
+{{- fail (printf "supervisor.pool.%s must be an integer of at least 1" .key) -}}
+{{- end -}}
+{{- $limit -}}
+{{- end -}}
+{{- end }}
+
+{{/* Most sandboxes one supervisor runs (supervisor.pool.maxInstancesPerMember). */}}
+{{- define "openshell.supervisorMaxInstancesPerMember" -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxInstancesPerMember" "max" 1024 "default" 128) -}}
+{{- end }}
+
+{{/* Most supervisors one gateway replica serves (supervisor.pool.maxMembersPerGateway). */}}
+{{- define "openshell.supervisorMaxMembersPerGateway" -}}
+{{- include "openshell.supervisorPoolLimit" (dict "root" . "key" "maxMembersPerGateway" "default" 32) -}}
+{{- end }}
+
+{{/*
+Refuse more supervisors than the fewest gateway replicas can serve:
+supervisor.replicas, or supervisor.autoscaling.maxReplicas, must not exceed
+the gateway replica count * supervisor.pool.maxMembersPerGateway.
+*/}}
+{{- define "openshell.validateSupervisorMembers" -}}
+{{- $members := int64 (include "openshell.supervisorMaxMembersPerGateway" .) -}}
+{{- $gateways := int64 (include "openshell.minReplicas" .) -}}
+{{- $served := mul $gateways $members -}}
+{{- $source := "supervisor.replicas" -}}
+{{- $supervisors := 0 -}}
+{{- if eq (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
+{{- $source = "supervisor.autoscaling.maxReplicas" -}}
+{{- $supervisors = int64 (get .Values.supervisor.autoscaling "maxReplicas") -}}
+{{- else -}}
+{{- $supervisors = int64 (include "openshell.supervisorReplicas" .) -}}
+{{- end -}}
+{{- if gt $supervisors $served -}}
+{{- fail (printf "%s (%d) exceeds %s (%d) * supervisor.pool.maxMembersPerGateway (%d) = %d; add gateway replicas or raise maxMembersPerGateway" $source $supervisors (include "openshell.minReplicasSource" .) $gateways $members $served) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 The gateway's [openshell.gateway.supervisor_pool] tuning table as YAML, or
 nothing. The shared supervisor always runs as a high-availability pool that
-the gateway coordinates; the chart owns the table only to set the recovery
-deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default).
-It never depends on supervisor.replicas, so scaling never changes the gateway
-configuration. Renders nothing without the gateway topology. Validates the
-supervisor values whenever the topology is selected, and refuses a
-hand-written table in either TOML form.
+the gateway coordinates; the chart owns the table to set the recovery
+deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default)
+and the pool limits (supervisor.pool). It never depends on
+supervisor.replicas, so scaling never changes the gateway configuration.
+Renders nothing without the gateway topology. Validates the supervisor values
+whenever the topology is selected, and refuses a hand-written table in either
+TOML form.
 */}}
 {{- define "openshell.supervisorPoolConfig" -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
-{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas, supervisor.pool, and supervisor.recoveryTimeoutSeconds" -}}
 {{- end -}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
-{{- $_ := include "openshell.supervisorReplicas" . -}}
-{{- end -}}
+{{- include "openshell.validateSupervisorMembers" . -}}
+{{- $table := dict "max_instances_per_member" (int64 (include "openshell.supervisorMaxInstancesPerMember" .)) "max_members_per_gateway" (int64 (include "openshell.supervisorMaxMembersPerGateway" .)) -}}
 {{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
 {{- if $recoveryTimeout -}}
-{{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
+{{- $_ := set $table "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
 {{- end -}}
+{{- toYaml $table -}}
 {{- end -}}
 {{- end }}
 
@@ -576,6 +679,26 @@ Booleans are rejected because they would otherwise convert to 1 or 0.
 {{- end }}
 
 {{/*
+Whether the dedicated metrics listener is enabled. Missing legacy values
+default to enabled; an explicit false must not be replaced by that default.
+*/}}
+{{- define "openshell.metricsEnabled" -}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $metrics "enabled" -}}
+{{- if not (kindIs "bool" $metrics.enabled) -}}
+{{- fail "metrics.enabled must be a boolean" -}}
+{{- end -}}
+{{- $enabled = $metrics.enabled -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end }}
+
+{{- define "openshell.listenHost" -}}
+{{- if contains ":" . -}}[{{ . }}]{{- else -}}{{ . }}{{- end -}}
+{{- end }}
+
+{{/*
 Validate a non-empty, user-provided Kubernetes Secret name. Secret data never
 passes through Helm values into gateway.toml; only this reference is rendered.
 */}}
@@ -621,7 +744,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- $legacySupervisor := .Values.supervisor.image | default dict -}}
 {{- $legacySupervisorImage := include "openshell.supervisorImage" . -}}
-{{- $defaultSupervisorImage := printf "ghcr.io/nvidia/openshell/supervisor:%s" .Chart.AppVersion -}}
+{{- $defaultSupervisorImage := printf "quay.io/ai-openshell/supervisor:%s" .Chart.AppVersion -}}
 {{- if and (ne $legacySupervisorImage $defaultSupervisorImage) (not (hasKey $kubernetes "supervisor_image")) -}}
 {{- $_ := set $kubernetes "supervisor_image" $legacySupervisorImage -}}
 {{- end -}}
@@ -631,6 +754,13 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- $legacyRuntime := .Values.supervisor.sandboxRuntime | default dict -}}
 {{- $runtimeConfig := get $kubernetes "sandbox_runtime" | default dict -}}
+{{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $runtimeConfig = deepCopy (get $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime") -}}
+{{- end -}}
+{{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml -}}
+{{- if $appDeployment -}}
+{{- $_ := set $runtimeConfig "app_listener" $appDeployment -}}
+{{- end -}}
 {{- if and (ne (int (get $legacyRuntime "boundaryPort" | default 5500)) 5500) (not (hasKey $runtimeConfig "boundary_port")) -}}
 {{- $_ := set $runtimeConfig "boundary_port" (int (get $legacyRuntime "boundaryPort")) -}}
 {{- end -}}
@@ -711,6 +841,7 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- $metricsEnabled := include "openshell.metricsEnabled" . -}}
 {{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- if hasKey $kubernetes "supervisor_topology" -}}
 {{- $topology := get $kubernetes "supervisor_topology" -}}
@@ -724,8 +855,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
 {{- fail "supervisor_topology requires the kubernetes compute driver" -}}
 {{- end -}}
-{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
-{{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") -}}
+{{- fail "supervisor_topology=gateway does not support upstream proxy settings" -}}
 {{- end -}}
 {{- if .Values.server.disableTls -}}
 {{- fail "supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS" -}}
@@ -733,6 +864,16 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
 {{- end -}}
+{{- end -}}
+{{- $broker := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_broker" | default dict -}}
+{{- if and (eq (get $kubernetes "supervisor_topology" | default "") "gateway") (get $kubernetes "provider_spiffe_workload_api_socket_path") (empty $broker) -}}
+{{- fail "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor" -}}
+{{- end -}}
+{{- if $broker -}}
+{{- if ne (get $kubernetes "supervisor_topology" | default "") "gateway" -}}
+{{- fail "spiffe_broker requires supervisor_topology=gateway" -}}
+{{- end -}}
+{{- include "openshell.validateSpiffeBroker" (dict "broker" $broker) -}}
 {{- end -}}
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
@@ -768,6 +909,33 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
+{{- end -}}
+{{- $servicePortValue := toString .Values.service.port -}}
+{{- $healthPortValue := toString .Values.service.healthPort -}}
+{{- $metricsPortValue := toString .Values.service.metricsPort -}}
+{{- if not (regexMatch `^-?[0-9]+$` $servicePortValue) -}}
+{{- fail "service.port must be an integer." -}}
+{{- end -}}
+{{- if not (regexMatch `^-?[0-9]+$` $healthPortValue) -}}
+{{- fail "service.healthPort must be an integer." -}}
+{{- end -}}
+{{- $servicePort := int $servicePortValue -}}
+{{- $healthPort := int $healthPortValue -}}
+{{- $metricsPort := int $metricsPortValue -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail "service.port must be between 1 and 65535." -}}
+{{- end -}}
+{{- if or (lt $healthPort 1) (gt $healthPort 65535) -}}
+{{- fail "service.healthPort must be between 1 and 65535 because gateway probes require it." -}}
+{{- end -}}
+{{- if eq $servicePort $healthPort -}}
+{{- fail "service.port and service.healthPort must be different." -}}
+{{- end -}}
+{{- if or (not (regexMatch `^[0-9]+$` $metricsPortValue)) (lt $metricsPort 1) (gt $metricsPort 65535) -}}
+{{- fail "service.metricsPort must be an integer between 1 and 65535; to disable metrics, set metrics.enabled=false and keep a valid service.metricsPort (default 9090)" -}}
+{{- end -}}
+{{- if and $metricsEnabled (or (eq $metricsPort $servicePort) (eq $metricsPort $healthPort)) -}}
+{{- fail "service.metricsPort must differ from service.port and service.healthPort when metrics.enabled=true" -}}
 {{- end -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) -}}
 {{- if ne $workloadKind "statefulset" -}}
@@ -807,3 +975,28 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
 {{- end -}}
 {{- end }}
+
+{{/* Common app settings are separate from driver-owned TLS/Service details. */}}
+{{- define "openshell.appListenerConfig" -}}
+{{- $config := .Values.gatewayConfig | default dict -}}
+{{- $supervisor := get $config "openshell.supervisor" | default dict -}}
+{{- $app := get $supervisor "app_listener" | default dict -}}
+{{- if hasKey $config "openshell.supervisor.app_listener" -}}
+{{- $app = get $config "openshell.supervisor.app_listener" -}}
+{{- end -}}
+{{- toYaml $app -}}
+{{- end -}}
+
+{{- define "openshell.appListenerDeployment" -}}
+{{- $config := .Values.gatewayConfig | default dict -}}
+{{- $kube := get $config "openshell.drivers.kubernetes" | default dict -}}
+{{- $runtime := get $kube "sandbox_runtime" | default dict -}}
+{{- if hasKey $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $runtime = get $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- end -}}
+{{- $app := get $runtime "app_listener" | default dict -}}
+{{- if hasKey $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
+{{- $app = get $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
+{{- end -}}
+{{- toYaml $app -}}
+{{- end -}}

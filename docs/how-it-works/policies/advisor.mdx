@@ -121,6 +121,7 @@ agent's reason, and the results of the risk checks:
 openshell rule get <sandbox-name> --status pending
 ```
 
+A transport-level endpoint (`L4` or `tcp`) sets no HTTP method or path filter of its own.
 Approve a proposal when its rule grants only the access you intend. Use the ID
 from the proposal's `Chunk` line:
 
@@ -222,7 +223,7 @@ the task needs:
 
 ```json
 {
-  "intent_summary": "Allow gh to update documentation in NVIDIA/OpenShell.",
+  "intent_summary": "Allow gh to update documentation in ai-openshell/openshell.",
   "operations": [
     {
       "addRule": {
@@ -239,7 +240,7 @@ the task needs:
                 {
                   "allow": {
                     "method": "PUT",
-                    "path": "/repos/NVIDIA/OpenShell/contents/docs/**"
+                    "path": "/repos/ai-openshell/openshell/contents/docs/**"
                   }
                 }
               ]

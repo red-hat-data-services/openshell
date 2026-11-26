@@ -146,10 +146,13 @@ tramp
 # =============================================================================
 
 # Local agent state and configuration
+/docs/superpowers/
 .codex/
 .pi/
-.claude/settings.local.json
-.claude/worktrees/
+# Track only the link Claude Code needs to find `.agents/skills`.
+.claude/*
+!.claude/skills
+.opencode/
 
 # =============================================================================
 # OS
@@ -252,3 +255,4 @@ scripts/lint-mermaid/node_modules/
 
 # Local triage-duty reports, checkpoint, actions, and inbox
 /.agents/triage-duty/
+.opencode-memory.md

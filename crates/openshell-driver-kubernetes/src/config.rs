@@ -118,6 +118,7 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
+    pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
@@ -127,12 +128,32 @@ impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            app_listener: KubernetesAppListenerConfig::default(),
         }
     }
 }
 
+/// Driver-owned TLS deployment inputs. Common listener settings
+/// are injected by the gateway so there is only one port/domain source.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesAppListenerConfig {
+    pub tls_secret_name: String,
+    #[serde(skip)]
+    pub common: openshell_core::app_listener::AppListenerConfig,
+}
+
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.app_listener.common.validate()?;
+        if self.app_listener.common.enabled {
+            if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
+                return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
+            }
+            if [self.boundary_port, 5501].contains(&self.app_listener.common.port) {
+                return Err("supervisor.app_listener.port conflicts with a supervisor runtime or health port".into());
+            }
+        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -325,6 +346,17 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Cross-pod sandbox/supervisor settings.
     pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
+    /// Bound on how long a crash-interrupted, fail-closed sandbox runtime
+    /// bootstrap may remain stranded before the driver reclaims it, in seconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default.
+    pub runtime_bootstrap_grace_seconds: u64,
+    /// Supervisor attach/policy-discover request timeout, in seconds.
+    /// When set, the driver copies the value into the supervisor pod
+    /// environment (`OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`) so slow VM-backed
+    /// runtimes have time to boot the remote boundary before the supervisor
+    /// gives up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_attach_request_timeout_seconds: Option<u64>,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -363,19 +395,17 @@ pub struct KubernetesComputeConfig {
     /// Only meaningful with `https_proxy` set; the bundle must exist and
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
+    /// AAAA handling for the supervisor's mediated policy DNS (`auto`,
+    /// `enabled` or `disabled`). Unset means the supervisor default, `auto`.
+    pub policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) of the cluster network. The supervisor
+    /// classifies addresses inside them by their embedded IPv4 address.
+    pub nat64_prefixes: Vec<String>,
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// OTLP exports passed to supervisor pods. The gateway supplies them
+    /// from `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-    /// OTLP/gRPC collector that supervisors relay workload traces to. The
-    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_otlp_agent_endpoint: Option<String>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -396,6 +426,10 @@ pub struct KubernetesComputeConfig {
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
+    /// Kubernetes `runtimeClassName` for dedicated supervisor pods. Set only
+    /// by the gateway administrator; sandbox creators cannot change it, and
+    /// it never inherits the workload class. Empty (default) = omit the field.
+    pub supervisor_runtime_class_name: String,
     /// Pod annotation keys that sandbox templates may set. Each entry is an
     /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
     /// Empty (default) rejects every caller-supplied pod annotation.
@@ -496,6 +530,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
+            runtime_bootstrap_grace_seconds: 300,
+            sandbox_attach_request_timeout_seconds: None,
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -503,10 +539,10 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            policy_dns_ipv6_egress: None,
+            nat64_prefixes: Vec::new(),
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
-            supervisor_ocsf_export: None,
-            supervisor_otlp_agent_endpoint: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -515,6 +551,7 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
+            supervisor_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,
@@ -528,6 +565,7 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        self.validate_bootstrap_windows()?;
         self.validate_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
@@ -535,7 +573,26 @@ impl KubernetesComputeConfig {
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
-        self.validate_allowed_pod_labels()
+        self.validate_allowed_pod_labels()?;
+        self.ipv6_egress_config().validate()
+    }
+
+    fn validate_bootstrap_windows(&self) -> Result<(), String> {
+        for (name, value) in [
+            (
+                "runtime_bootstrap_grace_seconds",
+                Some(self.runtime_bootstrap_grace_seconds),
+            ),
+            (
+                "sandbox_attach_request_timeout_seconds",
+                self.sandbox_attach_request_timeout_seconds,
+            ),
+        ] {
+            if value.is_some_and(|value| !(1..=86_400).contains(&value)) {
+                return Err(format!("{name} must be between 1 and 86400 seconds"));
+            }
+        }
+        Ok(())
     }
 
     /// The shared supervisor serves only sandbox instances it can isolate: it
@@ -557,8 +614,10 @@ impl KubernetesComputeConfig {
                     "supervisor_topology=gateway requires shared_supervisor".to_string()
                 })?;
                 shared.validate()?;
-                if self.provider_spiffe_enabled() {
-                    return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
+                if self.sandbox_runtime.app_listener.common.enabled
+                    && self.sandbox_runtime.app_listener.common.port == shared.runtime_port
+                {
+                    return Err("supervisor.app_listener.port conflicts with shared_supervisor.runtime_port".into());
                 }
                 if self.https_proxy.is_some()
                     || self.proxy_auth_secret_name.is_some()
@@ -592,6 +651,15 @@ impl KubernetesComputeConfig {
     #[must_use]
     pub fn pod_label_allowed(&self, key: &str) -> bool {
         pod_metadata_key_allowed(&self.allowed_pod_labels, key)
+    }
+
+    /// Supervisor IPv6 egress settings in their shared form.
+    #[must_use]
+    pub fn ipv6_egress_config(&self) -> openshell_core::SupervisorIpv6EgressConfig {
+        openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
+        }
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -1119,6 +1187,25 @@ mod tests {
     use std::collections::BTreeMap as HashMap;
 
     #[test]
+    fn app_endpoint_configuration_has_one_port_source_and_explicit_enablement() {
+        let mut config = KubernetesSandboxRuntimeConfig::default();
+        config.app_listener.tls_secret_name = "app-tls".into();
+        assert!(!config.app_listener.common.enabled);
+        assert!(config.validate().is_ok());
+        config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            base_url: Some("https://services.example.com".into()),
+            enabled: true,
+            port: 9443,
+        };
+        assert!(config.validate().is_ok());
+        config.app_listener.common.port = config.boundary_port;
+        assert!(config.validate().is_err());
+        config.app_listener.common.port = 9443;
+        config.app_listener.tls_secret_name.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
         let shared = || SharedSupervisorConfig {
             service_name: "openshell-supervisor".to_string(),
@@ -1206,6 +1293,43 @@ mod tests {
         ] {
             let input = format!("{field} = \"sometimes\"");
             assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn bootstrap_grace_defaults_and_parses_from_toml() {
+        assert_eq!(
+            KubernetesComputeConfig::default().runtime_bootstrap_grace_seconds,
+            300
+        );
+        assert!(
+            KubernetesComputeConfig::default()
+                .sandbox_attach_request_timeout_seconds
+                .is_none()
+        );
+        let config: KubernetesComputeConfig = toml::from_str(
+            "runtime_bootstrap_grace_seconds = 900\nsandbox_attach_request_timeout_seconds = 900\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime_bootstrap_grace_seconds, 900);
+        assert_eq!(config.sandbox_attach_request_timeout_seconds, Some(900));
+        assert!(config.validate_configuration().is_ok());
+        let partial: KubernetesComputeConfig = toml::from_str("namespace = 'custom'").unwrap();
+        assert_eq!(partial.runtime_bootstrap_grace_seconds, 300);
+        for field in [
+            "runtime_bootstrap_grace_seconds",
+            "sandbox_attach_request_timeout_seconds",
+        ] {
+            for value in [0, 86_401] {
+                let config: KubernetesComputeConfig =
+                    toml::from_str(&format!("{field} = {value}")).unwrap();
+                assert!(config.validate_configuration().unwrap_err().contains(field));
+            }
+            for value in [1, 86_400] {
+                let config: KubernetesComputeConfig =
+                    toml::from_str(&format!("{field} = {value}")).unwrap();
+                assert!(config.validate_configuration().is_ok());
+            }
         }
     }
 
@@ -1395,6 +1519,17 @@ mod tests {
     #[test]
     fn default_runtime_class_name_is_empty() {
         let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.default_runtime_class_name.is_empty());
+        assert!(cfg.supervisor_runtime_class_name.is_empty());
+    }
+
+    #[test]
+    fn serde_override_supervisor_runtime_class_name() {
+        let json = serde_json::json!({
+            "supervisor_runtime_class_name": "kata-supervisor"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_runtime_class_name, "kata-supervisor");
         assert!(cfg.default_runtime_class_name.is_empty());
     }
 
@@ -1640,6 +1775,32 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn toml_deserializes_and_validates_ipv6_egress_settings() {
+        let cfg: KubernetesComputeConfig = toml::from_str(
+            r#"
+                policy_dns_ipv6_egress = "enabled"
+                nat64_prefixes = ["64:ff9b:1::/96"]
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.ipv6_egress_config().supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "64:ff9b:1::/96"
+            ]
+        );
+        assert!(cfg.ipv6_egress_config().validate().is_ok());
+        let bad = KubernetesComputeConfig {
+            nat64_prefixes: vec!["64:ff9b:1::/100".to_string()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(bad.validate_configuration().is_err());
     }
 
     #[test]

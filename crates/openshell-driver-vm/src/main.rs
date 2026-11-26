@@ -6,6 +6,7 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::SupervisorOtlpArgs;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -97,21 +98,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
-
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
-    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
-    otlp_ocsf_endpoint: Option<String>,
-
-    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
-    #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
-    otlp_ocsf_schema_version: Option<String>,
-
-    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
-    /// to. Absent keeps the agent trace relay off.
-    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
-    otlp_agent_endpoint: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -124,6 +112,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
+
+    #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_EXTRACTION_MAX_BYTES")]
+    bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
 
     #[arg(
         long,
@@ -189,6 +180,19 @@ struct Args {
     /// server certificates re-signed by a TLS-intercepting proxy.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE")]
     upstream_proxy_ca_bundle: Option<PathBuf>,
+
+    /// AAAA handling for the host supervisors' mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_VM_POLICY_DNS_IPV6_EGRESS")]
+    policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefix (RFC 6052 CIDR) of the host network. Repeatable.
+    #[arg(
+        long = "nat64-prefix",
+        env = "OPENSHELL_VM_NAT64_PREFIXES",
+        value_delimiter = ','
+    )]
+    nat64_prefixes: Vec<String>,
 
     /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
     #[arg(
@@ -308,17 +312,18 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_vm::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
-    if args.otlp_ocsf_schema_version.is_some() {
-        tracing::warn!(
-            "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
-        );
-    }
+    args.otlp.warn_deprecated();
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -334,23 +339,20 @@ async fn main() -> Result<()> {
         );
     }
 
+    let supervisor_otlp = args.otlp.supervisor_otlp();
     let driver = VmDriver::new(VmDriverConfig {
         allow_driver_config: args.admission_config_json.allow_driver_config,
         resource_admission: args.admission_config_json.resource_admission.clone(),
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
-        supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+        supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
-        supervisor_ocsf_export: args
-            .otlp_ocsf_endpoint
-            .clone()
-            .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
+        bootstrap_extraction_max_bytes: args.bootstrap_extraction_max_bytes,
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
@@ -371,6 +373,10 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
         },
         proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        ipv6_egress: openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
+            nat64_prefixes: args.nat64_prefixes.clone(),
+        },
         provider_spiffe_workload_api_tcp_endpoint: args
             .provider_spiffe_workload_api_tcp_endpoint
             .clone(),
@@ -838,6 +844,29 @@ mod tests {
         assert_eq!(
             args.upstream_proxy_ca_bundle.as_deref(),
             Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn ipv6_egress_flags_parse_with_supervisor_names() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--policy-dns-ipv6-egress",
+            "enabled",
+            "--nat64-prefix",
+            "64:ff9b:1::/96",
+            "--nat64-prefix",
+            "2001:db8:64::/96",
+        ]);
+        assert_eq!(
+            args.policy_dns_ipv6_egress,
+            Some(openshell_core::PolicyDnsIpv6Egress::Enabled)
+        );
+        assert_eq!(args.nat64_prefixes, ["64:ff9b:1::/96", "2001:db8:64::/96"]);
+        assert!(
+            Args::parse_from(["openshell-driver-vm"])
+                .nat64_prefixes
+                .is_empty()
         );
     }
 

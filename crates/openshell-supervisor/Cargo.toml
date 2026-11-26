@@ -15,6 +15,8 @@ name = "openshell-supervisor"
 path = "src/main.rs"
 
 [dependencies]
+openshell-policy-cedar-runtime = { path = "../openshell-policy-cedar-runtime", optional = true }
+openshell-policy-runtime-interface = { path = "../openshell-policy-runtime-interface" }
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "trace-context"] }
 openshell-extension-core = { path = "../openshell-extension-core" }
@@ -29,6 +31,8 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
+async-trait = "0.1"
+axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
@@ -61,19 +65,22 @@ uuid = { workspace = true }
 
 [features]
 default = ["telemetry", "bundled-ca-roots"]
+# Opt-in bundle for experimental features; stable builds leave it off.
+experimental = [
+    "dep:openshell-policy-cedar-runtime",
+    "openshell-supervisor-network/experimental",
+]
 system-ca-roots = ["telemetry"]
 defaults-without-telemetry = ["bundled-ca-roots"]
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 bytes = { workspace = true }
-http = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = "0.3"

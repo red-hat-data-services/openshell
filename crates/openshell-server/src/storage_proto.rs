@@ -13,12 +13,28 @@
     rust_2018_idioms
 )]
 
-include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+pub(crate) mod v1 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+}
+pub use v1::{
+    DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation, StoredDraftChunk,
+    StoredPolicyRevision, StoredProviderProfile, StoredRefreshMaterialDeletion,
+};
+
+mod v2 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v2.rs"));
+}
+pub(crate) use v2::StoredProviderCredentialRefreshState;
 
 mod sandbox_image {
     include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
 }
 pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
+mod workspace_secret {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.secret.v1.rs"));
+}
+pub(crate) use workspace_secret::{StoredSecretRefreshUse, StoredWorkspaceSecret};
 
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
@@ -70,25 +86,25 @@ impl ObjectWorkspace for StoredProviderProfile {
     }
 }
 
-impl ObjectId for StoredProviderCredentialRefreshStateV2 {
+impl ObjectId for StoredProviderCredentialRefreshState {
     fn object_id(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
-impl ObjectName for StoredProviderCredentialRefreshStateV2 {
+impl ObjectName for StoredProviderCredentialRefreshState {
     fn object_name(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
-impl ObjectLabels for StoredProviderCredentialRefreshStateV2 {
+impl ObjectLabels for StoredProviderCredentialRefreshState {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
 }
 
-impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl SetResourceVersion for StoredProviderCredentialRefreshState {
     fn set_resource_version(&mut self, version: u64) {
         if let Some(meta) = self.metadata.as_mut() {
             meta.resource_version = version;
@@ -96,13 +112,55 @@ impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
-impl GetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl GetResourceVersion for StoredProviderCredentialRefreshState {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }
 }
 
-impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
+impl ObjectWorkspace for StoredProviderCredentialRefreshState {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+impl ObjectId for StoredWorkspaceSecret {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredWorkspaceSecret {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredWorkspaceSecret {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredWorkspaceSecret {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredWorkspaceSecret {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredWorkspaceSecret {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }
@@ -123,6 +181,9 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Existing values and fields
+    // retain their meaning; the set of shared type names is unchanged.
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
@@ -161,6 +222,14 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Cedar policies add the explicitly present CedarPolicy message and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode no Cedar message and remain YAML policies.
+    // Cedar endpoint settings add the repeated endpoint_settings field to
+    // SandboxPolicy in both closures. Existing rows decode it empty, so stored
+    // Cedar policies keep their current behavior.
+    // SupervisorHello and GetSandboxConfigRequest negotiate Cedar support with
+    // public-only capability fields; durable schemas remain unchanged.
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     // Suspend/resume adds two public request messages without durable request
@@ -177,12 +246,19 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
+    // public-only messages alongside main's public APIs; durable schemas
+    // and the public/durable overlap remain unchanged.
+    // The service backend HTTP version is part of both schemas. Legacy
+    // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "3c1c932ec40e0c29a8c844f84d936178c19aec8f233ae0fcb2f7980dc13a70a0";
+    // The storage.v2 refresh root adds retired handles and the first mint's
+    // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -241,9 +317,10 @@ mod tests {
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
         ".openshell.storage.v1.StoredConfigUpdateOperation",
-        ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
+        ".openshell.storage.v2.StoredProviderCredentialRefreshState",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.secret.v1.StoredWorkspaceSecret",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -596,8 +673,10 @@ mod tests {
                 }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
-                        | ("openshell.inference.v1", "Inference")
+                    (
+                        "openshell.v1",
+                        "OpenShell" | "SandboxUpdates" | "ServiceDiscovery"
+                    ) | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -652,7 +731,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            121 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -662,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            91 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -672,7 +751,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            88 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -723,9 +802,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (334, 31),
-                (100, 22),
-                (86, 22),
+                (369, 32),
+                (104, 23),
+                (88, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -736,7 +815,9 @@ mod tests {
 
     #[test]
     fn service_endpoint_without_authorization_mode_decodes_as_strip() {
-        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+        use openshell_core::proto::{
+            ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
+        };
 
         let endpoint = ServiceEndpoint::decode(
             legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
@@ -755,6 +836,10 @@ mod tests {
         assert_eq!(
             crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
             ServiceAuthorizationMode::Strip
+        );
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Unspecified
         );
     }
 
@@ -837,7 +922,7 @@ mod tests {
 
     #[test]
     fn pre_move_storage_payloads_decode_after_package_relocation() {
-        let refresh = StoredProviderCredentialRefreshState::decode(
+        let refresh = v1::StoredProviderCredentialRefreshState::decode(
             legacy_bytes(V0_0_116_REFRESH_STATE).as_slice(),
         )
         .expect("legacy refresh state must decode");
@@ -1001,7 +1086,7 @@ mod tests {
         }
 
         let refresh = current_store
-            .get_message::<StoredProviderCredentialRefreshStateV2>("legacy-id")
+            .get_message::<StoredProviderCredentialRefreshState>("legacy-id")
             .await
             .expect("decode refresh fixture")
             .expect("refresh fixture must remain present");

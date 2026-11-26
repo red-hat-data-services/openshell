@@ -13,7 +13,7 @@ mod registry_cache_tests;
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
-use crate::layer_applier::apply_layer_dir_to_rootfs;
+use crate::layer_applier::BootstrapExtractionBudget;
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
@@ -32,7 +32,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
-use flate2::read::{GzDecoder, MultiGzDecoder};
+use flate2::read::MultiGzDecoder;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -69,9 +69,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
-};
+use openshell_core::proto_struct::{deserialize_optional_non_empty_string_list, from_struct};
 use openshell_core::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
 };
@@ -116,6 +114,7 @@ const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
+const DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
@@ -192,8 +191,7 @@ impl VmSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid vm driver_config: {err}"))
+        from_struct(config).map_err(|err| format!("invalid vm driver_config: {err}"))
     }
 }
 
@@ -348,24 +346,19 @@ pub struct VmDriverConfig {
     #[serde(default)]
     pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-    /// OTLP/gRPC collector that supervisors relay workload traces to. The
-    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_otlp_agent_endpoint: Option<String>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
     /// Gateway name passed to supervisors for their telemetry.
     pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
     pub bootstrap_image: String,
+    /// Per-image byte limit for host extraction of registry bootstrap layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
     pub log_level: String,
     pub krun_log_level: u32,
     pub vcpus: u8,
@@ -392,6 +385,9 @@ pub struct VmDriverConfig {
     /// Corporate forward proxy settings delivered to the host supervisor.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes for host control.
+    #[serde(flatten)]
+    pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
     /// Gateway-host PEM CA bundle staged into the guest overlay for the
     /// corporate proxy and TLS-intercepted server certificates.
     pub proxy_ca_bundle: Option<PathBuf>,
@@ -433,17 +429,16 @@ impl std::fmt::Debug for VmDriverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
-            .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
-            .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
-            .field(
-                "supervisor_otlp_agent_endpoint",
-                &self.supervisor_otlp_agent_endpoint,
-            )
+            .field("supervisor_otlp", &self.supervisor_otlp)
             .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
             .field("bootstrap_image", &self.bootstrap_image)
+            .field(
+                "bootstrap_extraction_max_bytes",
+                &self.bootstrap_extraction_max_bytes,
+            )
             .field("log_level", &self.log_level)
             .field("krun_log_level", &self.krun_log_level)
             .field("vcpus", &self.vcpus)
@@ -485,6 +480,7 @@ impl std::fmt::Debug for VmDriverConfig {
                 "proxy_ca_bundle_configured",
                 &self.proxy_ca_bundle.is_some(),
             )
+            .field("ipv6_egress", &self.ipv6_egress)
             .field(
                 "provider_spiffe_workload_api_tcp_endpoint_configured",
                 &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
@@ -508,9 +504,7 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
-            supervisor_ocsf_export: None,
-            supervisor_otlp_agent_endpoint: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
@@ -519,6 +513,7 @@ impl Default for VmDriverConfig {
             launcher_bin: None,
             default_image: String::new(),
             bootstrap_image: String::new(),
+            bootstrap_extraction_max_bytes: None,
             log_level: "info".to_string(),
             krun_log_level: 1,
             vcpus: DEFAULT_VCPUS,
@@ -532,6 +527,7 @@ impl Default for VmDriverConfig {
             additional_ca_certificate_count: None,
             additional_ca_snapshot: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
@@ -560,6 +556,7 @@ impl VmDriverConfig {
 
     pub fn validate_runtime_security_config(&self) -> Result<(), String> {
         self.upstream_proxy.validate()?;
+        self.ipv6_egress.validate()?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err("proxy_ca_bundle must not be empty when set".to_string());
@@ -1459,6 +1456,7 @@ impl VmDriver {
             .arg("/sandbox")
             .args(upstream_proxy_args)
             .args(network_trust_args)
+            .args(self.config.ipv6_egress.supervisor_args())
             .env(
                 openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
                 DRIVER_ADMITTED_BACKEND,
@@ -1495,20 +1493,7 @@ impl VmDriver {
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
             );
-        if let Some(endpoint) = &self.config.supervisor_otlp_endpoint {
-            command
-                .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
-                .envs(openshell_otel::current_trace_context_environment());
-        }
-        if let Some(export) = &self.config.supervisor_ocsf_export {
-            command.envs(export.environment());
-        }
-        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
-            command.env(openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT, endpoint);
-        }
-        if let Some(name) = &self.config.supervisor_gateway_name {
-            command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
-        }
+        command.envs(supervisor_otlp_environment(&self.config));
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -4888,12 +4873,9 @@ impl VmDriver {
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
             .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
 
         if tokio::fs::metadata(&staging_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&staging_dir)
+            remove_bootstrap_staging(&staging_dir)
                 .await
                 .map_err(|err| {
                     Status::internal(format!(
@@ -4929,7 +4911,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: pull_registry_image_rootfs failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(err);
         }
         info!(
@@ -4976,7 +4958,7 @@ impl VmDriver {
                 error = %err,
                 "vm driver: rootfs preparation failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
@@ -5004,14 +4986,20 @@ impl VmDriver {
                 error = %err,
                 "vm driver: rootfs image build failed"
             );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = remove_bootstrap_staging(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
-        self.publish_prepared_image(&prepared_image, &image_path)
-            .await?;
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        Ok(())
+        let published = async {
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
+            self.publish_prepared_image(&prepared_image, &image_path)
+                .await
+        }
+        .await;
+        let _ = remove_bootstrap_staging(&staging_dir).await;
+        published
     }
 
     /// Watch the launcher child process and surface errors as driver
@@ -5229,6 +5217,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(openshell_core::color::stderr_ansi())
         .with_env_filter(request.config.log_level.clone())
         .try_init()
         .map_err(|error| format!("initialize image preparation logging: {error}"))?;
@@ -6272,8 +6261,12 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
 
         let total_layers = manifest.layers.len();
-        let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
-        let mut layers = futures::stream::iter(manifest.layers.iter().cloned().enumerate())
+        let total_bytes = manifest
+            .layers
+            .iter()
+            .map(|layer| layer.size.max(0))
+            .fold(0, i64::saturating_add);
+        let mut layers = futures::stream::iter(manifest.layers.into_iter().enumerate())
             .map(|(index, layer)| async move {
                 self.publish_registry_layer_progress(
                     sandbox_id,
@@ -6298,9 +6291,35 @@ impl VmDriver {
             .await?;
         layers.sort_by_key(|layer| layer.index);
 
-        for layer in &layers {
-            apply_registry_layer_blob(image_ref, rootfs, layer).await?;
-        }
+        // The blobs are verified. One writer owns the budget and each staged
+        // tree stays immutable while its files are copied into the rootfs.
+        let limit = self.config.bootstrap_extraction_max_bytes.map_or(
+            DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES,
+            std::num::NonZeroU64::get,
+        );
+        let layer_root = staging_dir.join("layers/root");
+        let rootfs = rootfs.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut budget = BootstrapExtractionBudget::new(limit);
+            for layer in layers {
+                extract_layer_blob_to_dir(
+                    &layer.blob_path,
+                    &layer.media_type,
+                    &layer_root,
+                    &mut budget,
+                )
+                .and_then(|()| budget.apply_layer(&layer_root, &rootfs))
+                .map_err(|err| format!("layer '{}': {err}", layer.digest))?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|err| Status::internal(format!("bootstrap layer extraction panicked: {err}")))?
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to extract vm bootstrap image '{image_ref}': {err}"
+            ))
+        })?;
 
         remove_registry_layer_staging(staging_dir).await?;
 
@@ -6363,7 +6382,8 @@ impl VmDriver {
 struct DownloadedRegistryLayer {
     index: usize,
     digest: String,
-    layer_root: PathBuf,
+    blob_path: PathBuf,
+    media_type: String,
 }
 
 async fn download_registry_layer_blob(
@@ -6378,9 +6398,6 @@ async fn download_registry_layer_blob(
     let blob_path = staging_dir
         .join("layers")
         .join(format!("{index:02}-{digest_component}.blob"));
-    let layer_root = staging_dir
-        .join("layers")
-        .join(format!("{index:02}-{digest_component}.root"));
 
     let mut file = pull_registry_blob_file(
         "download image layer",
@@ -6417,56 +6434,27 @@ async fn download_registry_layer_blob(
         ))
     })?;
 
-    let blob_path_for_unpack = blob_path.clone();
-    let layer_root_for_unpack = layer_root.clone();
-    let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to extract layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
-    })?;
-
     Ok(DownloadedRegistryLayer {
         index,
         digest: layer.digest,
-        layer_root,
-    })
-}
-
-async fn apply_registry_layer_blob(
-    image_ref: &str,
-    rootfs: &Path,
-    layer: &DownloadedRegistryLayer,
-) -> Result<(), Status> {
-    let layer_root_for_unpack = layer.layer_root.clone();
-    let rootfs_for_unpack = rootfs.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        apply_layer_dir_to_rootfs(&layer_root_for_unpack, &rootfs_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer application panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to apply layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
+        blob_path,
+        media_type: layer.media_type,
     })
 }
 
 async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
     let layers_dir = staging_dir.join("layers");
-    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
+    remove_bootstrap_staging(&layers_dir).await.map_err(|err| {
         Status::internal(format!(
             "remove registry layer staging dir '{}' failed: {err}",
             layers_dir.display()
         ))
     })
+}
+
+async fn remove_bootstrap_staging(dir: &Path) -> std::io::Result<()> {
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || preparation::remove_staging_tree(&dir)).await?
 }
 
 async fn download_registry_descriptor_blob_file(
@@ -6669,30 +6657,24 @@ fn extract_layer_blob_to_dir(
     blob_path: &Path,
     media_type: &str,
     dest: &Path,
+    budget: &mut BootstrapExtractionBudget,
 ) -> Result<(), String> {
     if dest.exists() {
-        fs::remove_dir_all(dest).map_err(|err| format!("remove {}: {err}", dest.display()))?;
+        preparation::remove_staging_tree(dest)
+            .map_err(|err| format!("remove {}: {err}", dest.display()))?;
     }
-    fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", dest.display()))?;
-
     let file =
         fs::File::open(blob_path).map_err(|err| format!("open {}: {err}", blob_path.display()))?;
     match layer_compression_from_media_type(media_type)? {
-        LayerCompression::None => extract_tar_reader_to_dir(file, dest),
-        LayerCompression::Gzip => extract_tar_reader_to_dir(GzDecoder::new(file), dest),
+        LayerCompression::None => budget.unpack_tar(file, dest),
+        LayerCompression::Gzip => budget.unpack_tar(MultiGzDecoder::new(file), dest),
         LayerCompression::Zstd => {
             let decoder = zstd::stream::read::Decoder::new(file)
                 .map_err(|err| format!("decompress {}: {err}", blob_path.display()))?;
-            extract_tar_reader_to_dir(decoder, dest)
+            budget.unpack_tar(decoder, dest)
         }
     }
-}
-
-fn extract_tar_reader_to_dir(reader: impl Read, dest: &Path) -> Result<(), String> {
-    let mut archive = tar::Archive::new(reader);
-    archive
-        .unpack(dest)
-        .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
+    .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
 }
 
 // `media_type` is an OCI media type string (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`),
@@ -8100,6 +8082,20 @@ fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
 
 fn isolate_host_control_environment(command: &mut Command) {
     command.env_clear();
+}
+
+/// Environment that lets the supervisor export spans, joining the current
+/// trace, OCSF events, and relayed workload traces, identifying the gateway
+/// that launched it.
+fn supervisor_otlp_environment(config: &VmDriverConfig) -> Vec<(&'static str, String)> {
+    let mut environment = config.supervisor_otlp.environment();
+    if config.supervisor_otlp.traces.is_some() {
+        environment.extend(openshell_otel::current_trace_context_environment());
+    }
+    if let Some(name) = &config.supervisor_gateway_name {
+        environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+    }
+    environment
 }
 
 #[tracing::instrument(
@@ -10712,6 +10708,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_state_dirs_stay_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("sandboxes").join("sandbox-123");
+        create_private_dir_all(&dir).await.unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
@@ -11256,7 +11266,13 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -12077,6 +12093,11 @@ mod tests {
         assert!(err.contains("unknown/unknown"));
     }
 
+    fn apply_layer_dir_to_rootfs(layer: &Path, rootfs: &Path) -> Result<(), String> {
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .apply_layer(layer, rootfs)
+    }
+
     #[test]
     fn apply_layer_dir_to_rootfs_honors_whiteouts() {
         let base = unique_temp_dir();
@@ -12286,10 +12307,14 @@ mod tests {
         let mut lower_tar = tar::Builder::new(Vec::new());
         append_test_tar_symlink(&mut lower_tar, "escape", &outside);
         let lower_tar = lower_tar.into_inner().expect("finish lower tar");
-        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(lower_tar), &lower)
+            .unwrap();
 
         let upper_tar = tar_bytes_with_file("escape/payload", b"escaped");
-        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(upper_tar), &upper)
+            .unwrap();
 
         apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
         let error = apply_layer_dir_to_rootfs(&upper, &rootfs)
@@ -12321,12 +12346,16 @@ mod tests {
         append_test_tar_file(&mut lower_tar, "usr/bin/bash", b"bash");
         append_test_tar_symlink(&mut lower_tar, "bin", Path::new("usr/bin"));
         let lower_tar = lower_tar.into_inner().expect("finish lower tar");
-        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(lower_tar), &lower)
+            .unwrap();
 
         // The tar contains no explicit `bin/` entry. Extraction necessarily
         // materializes it as an implicit parent for `bin/tool`.
         let upper_tar = tar_bytes_with_file("bin/tool", b"tool");
-        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+        BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES)
+            .unpack_tar(std::io::Cursor::new(upper_tar), &upper)
+            .unwrap();
 
         apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
         apply_layer_dir_to_rootfs(&upper, &rootfs).unwrap();
@@ -12347,6 +12376,183 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_extraction_bounds_decoded_tar_through_eof_for_each_compression() {
+        let mut tar = tar_bytes_with_file("tool", b"contents");
+        tar.resize(8192, 0);
+        let tail = b"after the tar end marker";
+        let decoded_bytes = (tar.len() + tail.len()) as u64;
+        let gzip = [gzip_bytes(&tar), gzip_bytes(tail)].concat();
+        let zstd = [
+            zstd::encode_all(&tar[..], 0).unwrap(),
+            zstd::encode_all(&tail[..], 0).unwrap(),
+        ]
+        .concat();
+        for (media, bytes) in [
+            (
+                "application/vnd.oci.image.layer.v1.tar",
+                [&tar[..], tail].concat(),
+            ),
+            ("application/vnd.oci.image.layer.v1.tar+gzip", gzip),
+            ("application/vnd.oci.image.layer.v1.tar+zstd", zstd),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let blob = temp.path().join("blob");
+            fs::write(&blob, bytes).unwrap();
+            for limit in [decoded_bytes + 1, decoded_bytes, decoded_bytes - 1] {
+                let dest = temp.path().join(limit.to_string());
+                let result = extract_layer_blob_to_dir(
+                    &blob,
+                    media,
+                    &dest,
+                    &mut BootstrapExtractionBudget::new(limit),
+                );
+                if limit < decoded_bytes {
+                    assert!(result.unwrap_err().contains("decoded layer tars"));
+                } else {
+                    result.unwrap();
+                    assert_eq!(fs::read(dest.join("tool")).unwrap(), b"contents");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_extraction_counts_decoded_tar_across_layers() {
+        let mut tar = tar_bytes_with_file("tool", b"small");
+        tar.resize(8192, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let mut budget = BootstrapExtractionBudget::new(2 * tar.len() as u64 - 1);
+        budget
+            .unpack_tar(tar.as_slice(), &temp.path().join("lower"))
+            .unwrap();
+        let error = budget
+            .unpack_tar(tar.as_slice(), &temp.path().join("upper"))
+            .unwrap_err();
+        assert!(error.to_string().contains("decoded layer tars"), "{error}");
+    }
+
+    #[test]
+    fn bootstrap_extraction_global_pax_header_only_spends_decoded_bytes() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        let comment = b"13 comment=x\n";
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_mode(0o644);
+        header.set_size(comment.len() as u64);
+        builder
+            .append_data(&mut header, "pax", &comment[..])
+            .unwrap();
+        append_test_tar_file(&mut builder, "payload", &[1; 8192]);
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut budget = BootstrapExtractionBudget::new(2 * 8192);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert_eq!(fs::read(root.join("payload")).unwrap(), [1; 8192]);
+        assert!(!root.join("pax").exists());
+    }
+
+    #[test]
+    fn bootstrap_extraction_bounds_path_entries_before_creating_parents() {
+        let tar = tar_bytes_with_file("a/b/c/empty", b"");
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("layer");
+        let root = temp.path().join("root");
+        let mut too_small = BootstrapExtractionBudget::new(4 * 4096 - 1);
+        let err = too_small.unpack_tar(&tar[..], &stage).unwrap_err();
+        assert!(err.to_string().contains("filesystem output"), "{err}");
+        assert!(!stage.join("a").exists());
+
+        let mut budget = BootstrapExtractionBudget::new(8 * 4096);
+        budget.unpack_tar(&tar[..], &stage).unwrap();
+        budget.apply_layer(&stage, &root).unwrap();
+        assert!(root.join("a/b/c/empty").is_file());
+    }
+
+    #[test]
+    fn bootstrap_extraction_checks_sparse_logical_size_before_creating_file() {
+        for logical_size in [1024 * 1024, u64::MAX] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_size(1);
+            header.set_mode(0o644);
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(logical_size);
+            gnu.sparse[0].set_offset(logical_size - 1);
+            gnu.sparse[0].set_length(1);
+            builder
+                .append_data(&mut header, "sparse", &b"x"[..])
+                .unwrap();
+            let tar = builder.into_inner().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let dest = temp.path();
+            let error = BootstrapExtractionBudget::new(1024 * 1024 - 1)
+                .unpack_tar(&tar[..], dest)
+                .unwrap_err();
+            assert!(error.to_string().contains("filesystem output"), "{error}");
+            assert!(!dest.join("sparse").exists());
+            if logical_size == 1024 * 1024 {
+                BootstrapExtractionBudget::new(logical_size)
+                    .unpack_tar(&tar[..], dest)
+                    .unwrap();
+                assert_eq!(
+                    fs::metadata(dest.join("sparse")).unwrap().len(),
+                    logical_size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_extraction_checks_pax_size_before_creating_file() {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("size", &b"8192"[..])])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "file", &[7; 8192][..])
+            .unwrap();
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let error = BootstrapExtractionBudget::new(8191)
+            .unpack_tar(tar.as_slice(), temp.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("filesystem output"), "{error}");
+        assert!(!temp.path().join("file").exists());
+    }
+
+    #[test]
+    fn bootstrap_extraction_reserves_each_hard_link_copy_before_replacement() {
+        let mut builder = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut builder, "a", &[3; 4096]);
+        for name in ["b", "c"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            builder.append_link(&mut header, name, "a").unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("layer");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("c"), b"old").unwrap();
+        // Three staged entries and three merged copies each consume one block.
+        let mut budget = BootstrapExtractionBudget::new(6 * 4096 - 1);
+        budget.unpack_tar(&tar[..], &staged).unwrap();
+        let error = budget.apply_layer(&staged, &root).unwrap_err();
+        assert!(error.contains("filesystem output"), "{error}");
+        assert_eq!(fs::read(root.join("b")).unwrap(), [3; 4096]);
+        assert_eq!(fs::read(root.join("c")).unwrap(), b"old");
+    }
+
+    #[test]
     fn extracts_zstd_compressed_oci_layer() {
         let temp = tempfile::tempdir().unwrap();
         let archive = tar_bytes_with_file("bin/tool", b"tool contents");
@@ -12359,6 +12565,7 @@ mod tests {
             &blob,
             "application/vnd.oci.image.layer.v1.tar+zstd",
             &extracted,
+            &mut BootstrapExtractionBudget::new(DEFAULT_BOOTSTRAP_EXTRACTION_MAX_BYTES),
         )
         .unwrap();
 
@@ -12702,6 +12909,75 @@ mod tests {
         assert_eq!(
             absolute_state_dir(&absolute).expect("preserve absolute state dir"),
             absolute
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_environment_carries_only_configured_signals() {
+        use openshell_core::sandbox_env::{
+            GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT,
+            OTLP_OCSF_ENDPOINT, OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
+        };
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol,
+            })
+        };
+
+        let mut config = VmDriverConfig::default();
+        assert!(supervisor_otlp_environment(&config).is_empty());
+
+        config.supervisor_otlp.traces = export("http://127.0.0.1:4317", OtlpProtocol::Grpc);
+        let environment = supervisor_otlp_environment(&config);
+        assert_eq!(
+            environment[0],
+            (OTLP_ENDPOINT, "http://127.0.0.1:4317".to_string())
+        );
+        assert!(environment.iter().all(|(name, _)| *name != OTLP_PROTOCOL));
+
+        config.supervisor_otlp.traces = export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config)[1],
+            (OTLP_PROTOCOL, "http/protobuf".to_string())
+        );
+
+        config.supervisor_otlp.traces = None;
+        config.supervisor_otlp.ocsf = export("http://siem:4317", OtlpProtocol::Grpc);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),]
+        );
+
+        config.supervisor_otlp.ocsf = export("http://siem:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+
+        config.supervisor_otlp.ocsf = None;
+        config.supervisor_otlp.agent = export("http://agents:4317", OtlpProtocol::Grpc);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [(OTLP_AGENT_ENDPOINT, "http://agents:4317".to_string())]
+        );
+
+        config.supervisor_otlp.agent = export("http://agents:4318", OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            supervisor_otlp_environment(&config),
+            [
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+
+        config.supervisor_gateway_name = Some("prod-west".to_string());
+        assert_eq!(
+            supervisor_otlp_environment(&config).last(),
+            Some(&(GATEWAY_NAME, "prod-west".to_string()))
         );
     }
 
@@ -13345,13 +13621,17 @@ while :; do sleep 0.05; done"#,
     const TEST_STAGING_LIMIT: u64 = 10 * 1024 * 1024;
 
     /// Build an uncompressed tar holding a single file.
-    fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
+    pub(super) fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         append_test_tar_file(&mut builder, name, contents);
         builder.into_inner().expect("finish tar")
     }
 
-    fn append_test_tar_file(builder: &mut tar::Builder<Vec<u8>>, name: &str, contents: &[u8]) {
+    pub(super) fn append_test_tar_file(
+        builder: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        contents: &[u8],
+    ) {
         let mut header = tar::Header::new_gnu();
         header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
         header.set_mode(0o644);
@@ -13373,7 +13653,7 @@ while :; do sleep 0.05; done"#,
             .expect("append symlink entry");
     }
 
-    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    pub(super) fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).expect("gzip payload");
         encoder.finish().expect("finish gzip")
@@ -13835,6 +14115,33 @@ while :; do sleep 0.05; done"#,
                 && rendered.contains("proxy_auth_file_configured: true"),
             "presence of each must still be visible for debugging: {rendered}"
         );
+    }
+
+    #[test]
+    fn ipv6_egress_settings_parse_validate_and_render_supervisor_args() {
+        let mut value = serde_json::to_value(proxy_config(None, None, None)).unwrap();
+        value["policy_dns_ipv6_egress"] = "enabled".into();
+        value["nat64_prefixes"] = serde_json::json!(["2001:db8:64::/96"]);
+        let config: VmDriverConfig =
+            serde_json::from_value(value).expect("VM driver config parses flattened keys");
+        config.validate_runtime_security_config().unwrap();
+        assert_eq!(
+            config.ipv6_egress.supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "2001:db8:64::/96"
+            ]
+        );
+        let invalid = VmDriverConfig {
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig {
+                nat64_prefixes: vec!["2001:db8::/33".to_string()],
+                ..Default::default()
+            },
+            ..proxy_config(None, None, None)
+        };
+        assert!(invalid.validate_runtime_security_config().is_err());
     }
 
     #[test]

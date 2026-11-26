@@ -11,7 +11,7 @@
 set -e
 
 APP_NAME="openshell"
-REPO="NVIDIA/OpenShell"
+REPO="ai-openshell/openshell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
 RELEASE_ASSET_DIR=""
@@ -45,10 +45,10 @@ usage() {
 install.sh - Install OpenShell
 
 USAGE:
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh -o install.sh
+    curl -fsSL https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh -o install.sh
     sh install.sh
 
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh
 
 OPTIONS:
     --help       Print this help message
@@ -324,7 +324,7 @@ After cleanup, rerun this installer or follow the installation guide:
 
 If you have already backed up and cleaned up the old runtime, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
@@ -377,7 +377,7 @@ installation before continuing. For package and service instructions, see:
 
 If you have already backed up and cleaned up the non-snap installation, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
@@ -792,24 +792,18 @@ find_rpm_asset() {
   _package="$3"
 
   case "$_package" in
-    openshell)
-      _dev_name="openshell-dev-${_arch}.rpm"
-      _fallback_re="^openshell-[0-9].*\\.${_arch}\\.rpm$"
-      ;;
-    openshell-gateway)
-      _dev_name="openshell-gateway-dev-${_arch}.rpm"
-      _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
-      ;;
-    openshell-prover)
-      _dev_name="openshell-prover-dev-${_arch}.rpm"
-      _fallback_re="^openshell-prover-[0-9].*\\.${_arch}\\.rpm$"
-      ;;
+    openshell|openshell-gateway|openshell-prover) ;;
     *)
       error "unknown RPM package selector: ${_package}"
       ;;
   esac
 
-  awk -v dev_name="$_dev_name" -v fallback_re="$_fallback_re" '
+  # Build the regex inside awk: -v values have their escapes processed.
+  awk -v package="$_package" -v arch="$_arch" '
+    BEGIN {
+      dev_name = package "-dev-" arch ".rpm"
+      fallback_re = "^" package "-[0-9].*\\." arch "\\.rpm$"
+    }
     {
       name = $2
       sub("^\\*", "", name)

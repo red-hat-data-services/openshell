@@ -16,7 +16,7 @@ use openshell_core::proto::{
     ProviderReadinessReason, SandboxConfigurationAdmission,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
-use openshell_supervisor_network::opa::PolicyGenerationGuard;
+use openshell_supervisor_network::policy_types::PolicyGenerationGuard;
 use openshell_supervisor_process::skills;
 use openshell_supervisor_process::supervisor_session::{
     ConfigApplyRequest, config_admission, config_apply_failure, sandbox_config_revision,
@@ -247,7 +247,7 @@ impl ConfigRuntime {
 
         if reloads_gateway_policy && !result.configuration_admitted {
             let disposition = apply_policy_validation_failure(
-                &ctx.opa_engine,
+                &ctx.engine,
                 result.policy_validation_failure_mode,
                 self.has_last_valid_policy,
                 result.version,
@@ -331,7 +331,7 @@ impl ConfigRuntime {
         // as one generation below.
         if !reloads_gateway_policy {
             reconcile_middleware_registry(
-                &ctx.opa_engine,
+                &ctx.engine,
                 &ctx.middleware_connector,
                 MiddlewareRegistryReconciliation {
                     desired_services: &result.supervisor_middleware_services,
@@ -374,7 +374,7 @@ impl ConfigRuntime {
                 let mode = result.policy_validation_failure_mode;
                 if mode != rejected.configured_mode {
                     let disposition = apply_policy_validation_failure(
-                        &ctx.opa_engine,
+                        &ctx.engine,
                         mode,
                         self.has_last_valid_policy,
                         rejected.version,
@@ -431,7 +431,7 @@ impl ConfigRuntime {
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
+                &ctx.engine,
                 result.policy.as_ref(),
                 pid,
                 MiddlewareReloadContext {
@@ -571,7 +571,7 @@ impl ConfigRuntime {
                     if self.last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
                         let failure_mode = result.policy_validation_failure_mode;
                         match apply_gateway_runtime_reload_failure(
-                            &ctx.opa_engine,
+                            &ctx.engine,
                             failure,
                             failure_mode,
                             self.has_last_valid_policy,
@@ -797,6 +797,7 @@ impl ConfigRuntime {
         reason: ProviderReadinessReason,
         revision: u64,
     ) {
+        let before = ctx.provider_credentials.installed_credential_versions();
         ctx.provider_readiness.credentials_failed(identity, reason);
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
             .severity(SeverityId::High)
@@ -806,6 +807,7 @@ impl ConfigRuntime {
             .build());
         ctx.provider_credentials
             .revoke_static_provider_environment(revision);
+        publish_credential_change(ctx, &before);
         endpoint_status::reset(
             ctx.endpoint_observation_tx.as_ref(),
             self.endpoint_policy.as_ref(),
@@ -831,6 +833,7 @@ impl ConfigRuntime {
             .build());
         ctx.provider_readiness
             .credentials_failed(identity, ProviderReadinessReason::CredentialInstallFailed);
+        let before = ctx.provider_credentials.installed_credential_versions();
         let revision = provider.provider_env_revision;
         // Repeat the rejected binding validation on the live state to
         // revoke static material and retain the fetched dynamic grants.
@@ -845,6 +848,7 @@ impl ConfigRuntime {
                 provider.non_secret_environment_keys,
                 provider.stable_placeholder_environment_keys,
             );
+        publish_credential_change(ctx, &before);
         endpoint_status::reset(
             ctx.endpoint_observation_tx.as_ref(),
             self.endpoint_policy.as_ref(),
@@ -904,6 +908,9 @@ impl ConfigRuntime {
         let requested_revision = sandbox_config_revision(&snapshot);
         let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
         let provider = if !snapshot.configuration_admitted {
+            if let Some(routes) = &ctx.app_routes {
+                routes.suspend();
+            }
             if !self.reloads_gateway_policy {
                 return DeliveredResult {
                     outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood,
@@ -938,6 +945,9 @@ impl ConfigRuntime {
             {
                 Ok(prepared) => Some(prepared),
                 Err(failure) => {
+                    if let Some(routes) = &ctx.app_routes {
+                        routes.suspend();
+                    }
                     // Static credentials were revoked, so this configuration
                     // is not applied until its environment installs.
                     let outcome = if self.applied_revision.is_some() {
@@ -968,6 +978,9 @@ impl ConfigRuntime {
                 outcome,
                 policy_status,
             }) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.install(&snapshot);
+                }
                 self.stream.rejected_sandbox = None;
                 let _ = ctx.workspace_tx.send(snapshot.workspace.clone());
                 let outcome = if !self.reloads_gateway_policy {
@@ -987,6 +1000,9 @@ impl ConfigRuntime {
                 };
             }
             Err(error) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.suspend();
+                }
                 // Polling ends its loop on this error; session delivery
                 // reports it instead, so record it here.
                 ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -1013,11 +1029,14 @@ impl ConfigRuntime {
             }
         };
 
+        if let Some(routes) = &ctx.app_routes {
+            routes.suspend();
+        }
         // The previous revision is retained only while its policy is enforced.
         let retained_revision = self
             .applied_revision
             .clone()
-            .filter(|_| ctx.opa_engine.fail_closed_reason().is_none());
+            .filter(|_| ctx.engine.fail_closed_reason().is_none());
         let outcome = match retained_revision.as_ref() {
             // The requested configuration is still the enforced one, so only
             // its runtime upgrade failed.
@@ -1166,6 +1185,30 @@ pub async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     run_policy_poll_loop_with_client(ctx, client).await
 }
 
+/// Provider credentials may have changed outside a policy reload. If any did
+/// since `before`, publish a generation of the unchanged policy, so open
+/// connections re-check the credentials they sent and those that sent a
+/// changed one close. A revocation that finds nothing left to revoke, as when
+/// a failed refresh repeats on every poll, publishes nothing.
+fn publish_credential_change(
+    ctx: &PolicyPollLoopContext,
+    before: &openshell_core::provider_credentials::InstalledCredentialVersions,
+) {
+    if ctx
+        .provider_credentials
+        .installed_credential_versions()
+        .same_credentials(before)
+    {
+        return;
+    }
+    if let Err(error) = ctx.engine.publish_credential_change() {
+        warn!(
+            error = %error,
+            "Provider credentials changed but open connections were not notified"
+        );
+    }
+}
+
 async fn report_runtime_configuration(
     ctx: &PolicyPollLoopContext,
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
@@ -1214,6 +1257,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     client: C,
 ) -> Result<()> {
     let mut config_apply_rx = ctx.config_apply_rx.take();
+    let _app_configuration = ctx
+        .app_routes
+        .clone()
+        .map(crate::app_listener::Routes::configuration_guard);
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
         client.clone(),
@@ -1245,10 +1292,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let mut pending_result = None;
     // Bind startup evidence before awaiting the gateway. A generation changed
     // during that request no longer proves which policy startup installed.
-    let initial_generation = ctx
-        .opa_engine
-        .generation_guard(ctx.opa_engine.current_generation())
-        .ok();
+    let initial_generation = ctx.engine.configuration_generation_guard().ok();
 
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. A mismatched result is
@@ -1299,6 +1343,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         ctx.provider_credentials.snapshot().revision,
                     )
                     .await;
+                    if let Some(routes) = &ctx.app_routes {
+                        routes.install(&result);
+                    }
                     runtime.middleware_services = result.supervisor_middleware_services;
                     runtime.extension_authentication_enabled =
                         result.extension_authentication_enabled;
@@ -1348,7 +1395,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
     }
 
-    let interval = Duration::from_secs(ctx.interval_secs);
+    // Accepted configurations must renew app routes before their freshness
+    // lease expires, including when a gateway uses polling instead of push.
+    let interval = if ctx.app_routes.is_some() {
+        Duration::from_secs(ctx.interval_secs).min(Duration::from_secs(5))
+    } else {
+        Duration::from_secs(ctx.interval_secs)
+    };
     loop {
         if let Some(updates) = config_push_updates.as_ref() {
             config_push_enabled = *updates.borrow();
@@ -1357,6 +1410,14 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             // The session's bootstrap supersedes a polled result that was
             // not reconciled yet.
             pending_result = None;
+            // A quiet push stream still has authenticated session freshness.
+            // Renew only installed, unexpired routes. Poll mode renews by
+            // successfully applying a complete configuration instead.
+            if ctx.supervisor_session_id.borrow().is_some()
+                && let Some(routes) = &ctx.app_routes
+            {
+                routes.renew();
+            }
             let delay = next_poll_delay(&ctx.extension_credentials, interval);
             tokio::select! {
                 changed = async {
@@ -1419,9 +1480,25 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             }
         };
 
-        let reconciled = runtime
+        let reconciled = match runtime
             .reconcile(&ctx, &client, &result, ProviderSource::Fetch)
-            .await?;
+            .await
+        {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.suspend();
+                }
+                return Err(error);
+            }
+        };
+        if let Some(routes) = &ctx.app_routes {
+            if matches!(reconciled.outcome, ReconcileOutcome::Rejected(_)) {
+                routes.suspend();
+            } else {
+                routes.install(&result);
+            }
+        }
         if let Some(status) = reconciled.policy_status {
             enqueue_policy_status(&status_sender, status);
         }
@@ -1953,6 +2030,9 @@ mod tests {
             state
                 .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "Authorization".into(),
+                ))
                 .resolve_placeholder(reference),
             Some("initial"),
         );
@@ -2024,6 +2104,9 @@ mod tests {
             state
                 .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "Authorization".into(),
+                ))
                 .resolve_placeholder(reference),
             Some("initial"),
         );
@@ -2576,7 +2659,14 @@ mod tests {
                     let resolved = state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .and_then(|resolver| {
-                            resolver.resolve_placeholder(&reference).map(str::to_owned)
+                            resolver
+                                .with_request_location(
+                                    openshell_core::secrets::RequestCredentialLocation::Header(
+                                        "Authorization".into(),
+                                    ),
+                                )
+                                .resolve_placeholder(&reference)
+                                .map(str::to_owned)
                         });
                     let observed = tracker.observation(&state);
                     if state.revision() == revision
@@ -2598,6 +2688,11 @@ mod tests {
                         state
                             .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                             .unwrap()
+                            .with_request_location(
+                                openshell_core::secrets::RequestCredentialLocation::Header(
+                                    "Authorization".into(),
+                                )
+                            )
                             .resolve_placeholder(old_reference),
                         Some("initial")
                     );
@@ -2670,7 +2765,14 @@ mod tests {
                     let resolved = state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .and_then(|resolver| {
-                            resolver.resolve_placeholder(&reference).map(str::to_owned)
+                            resolver
+                                .with_request_location(
+                                    openshell_core::secrets::RequestCredentialLocation::Header(
+                                        "Authorization".into(),
+                                    ),
+                                )
+                                .resolve_placeholder(&reference)
+                                .map(str::to_owned)
                         });
                     let observed = tracker.observation(&state);
                     if state.revision() == revision
@@ -2697,7 +2799,7 @@ mod tests {
     }
 
     fn policy_poll_test_context(
-        opa_engine: Arc<OpaEngine>,
+        engine: impl Into<PolicyEngine>,
         loaded_policy_origin: LoadedPolicyOrigin,
         middleware_connector: MiddlewareConnector,
     ) -> PolicyPollLoopContext {
@@ -2722,10 +2824,11 @@ mod tests {
             );
         }
         PolicyPollLoopContext {
+            app_routes: None,
             gateway: test_gateway(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
-            opa_engine,
+            engine: engine.into(),
             loaded_policy_origin,
             vm_identity: None,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
@@ -3262,7 +3365,7 @@ mod tests {
             }];
         let engine =
             Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&PolicyEngine::from(Arc::clone(&engine)))
             .await
             .expect("install built-in middleware registry");
         let ctx = policy_poll_test_context(
@@ -3460,6 +3563,45 @@ mod tests {
         handle.abort();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn app_listener_caps_polling_interval_without_changing_disabled_behavior() {
+        for listener_enabled in [false, true] {
+            let initial = settings_poll_result(
+                Some(proto_policy_fixture()),
+                1,
+                openshell_core::proto::PolicySource::Sandbox,
+            );
+            let (mut ctx, _config_apply_tx, push_tx) = push_session_poll_loop(&initial);
+            push_tx.send_replace(false);
+            ctx.interval_secs = 60;
+            ctx.app_routes = listener_enabled.then(app_listener::Routes::default);
+            let (client, polls, mut reports) = scripted_policy_gateway();
+            let poll_calls = Arc::clone(&client.poll_calls);
+            for _ in 0..16 {
+                polls.send(initial.clone()).unwrap();
+            }
+            let task = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+            expect_policy_report(&mut reports, 1).await;
+            for step in 1..=13 {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                // Let the poll reconcile its ready scripted response and
+                // register the next sleep before advancing virtual time.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                let expected = 1 + if listener_enabled { step } else { step / 12 };
+                assert_eq!(
+                    poll_calls.load(Ordering::SeqCst),
+                    expected,
+                    "listener enabled={listener_enabled}, elapsed={}s",
+                    step * 5
+                );
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     #[tokio::test]
     async fn pushed_policy_status_is_reported_only_in_results() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
@@ -3540,7 +3682,7 @@ mod tests {
         let (mut ctx, config_apply_tx, _push_tx) = push_session_poll_loop(&initial);
         let (session_tx, session_rx) = tokio::sync::watch::channel(Some("session-1".to_string()));
         ctx.supervisor_session_id = session_rx;
-        let engine = Arc::clone(&ctx.opa_engine);
+        let engine = ctx.engine.clone();
         let (client, polls, mut reports) = scripted_policy_gateway();
         let poll_calls = Arc::clone(&client.poll_calls);
         polls.send(initial.clone()).unwrap();
@@ -3604,6 +3746,93 @@ mod tests {
         handle.abort();
     }
 
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn stream_provider_rotation_rebinds_cedar_configuration_generation() {
+        use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(
+            Some(cedar_proto_policy(CEDAR_RELOAD_POLICY)),
+            1,
+            PolicySource::Sandbox,
+        );
+        let mut desired = initial.clone();
+        desired.config_revision = 200;
+        desired.provider_env_revision = 19;
+        desired.provider_attachment_epoch = "epoch-19".to_string();
+        let cedar = cedar_engine();
+        let engine = PolicyEngine::from(Arc::clone(&cedar));
+        let initial_guard = engine.configuration_generation_guard().unwrap();
+        let initial_generation = cedar.current_generation();
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+
+        let applied = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
+
+        assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
+        assert!(initial_guard.is_stale());
+        assert_eq!(cedar.current_generation(), initial_generation);
+        let observed = ctx
+            .provider_readiness
+            .observation(&ctx.provider_credentials);
+        assert!(observed.credentials_installed);
+        assert!(observed.policy_active);
+        assert_eq!(observed.provider_env_revision, 19);
+        assert_eq!(observed.config_revision, 200);
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn stream_format_switch_quarantines_cedar_and_restoration_recovers() {
+        use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(
+            Some(cedar_proto_policy(CEDAR_RELOAD_POLICY)),
+            1,
+            PolicySource::Sandbox,
+        );
+        let mut rejected =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        let cedar = cedar_engine();
+        let ctx = policy_poll_test_context(
+            PolicyEngine::from(Arc::clone(&cedar)),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
+        assert!(cedar.fail_closed_reason().is_some());
+        assert!(result.policy_load.is_some_and(|status| !status.loaded));
+
+        let mut restored = initial.clone();
+        restored.config_revision = 300;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &restored).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
+        assert!(cedar.fail_closed_reason().is_none());
+        assert!(
+            ctx.provider_readiness
+                .observation(&ctx.provider_credentials)
+                .policy_active
+        );
+    }
+
     #[tokio::test]
     async fn stream_provider_rotation_rebinds_policy_generation() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
@@ -3632,7 +3861,7 @@ mod tests {
         assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
         // As with polling, the credentials install with a fresh generation of
         // the unchanged policy, and readiness binds to that generation.
-        assert!(ctx.opa_engine.current_generation() > initial_generation);
+        assert!(ctx.engine.current_generation() > initial_generation);
         let observed = ctx
             .provider_readiness
             .observation(&ctx.provider_credentials);
@@ -3900,7 +4129,7 @@ mod tests {
         let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
 
         assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
-        let rejected_generation = ctx.opa_engine.current_generation();
+        let rejected_generation = ctx.engine.current_generation();
         assert!(rejected_generation > initial_generation);
 
         let duplicate = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
@@ -3909,7 +4138,7 @@ mod tests {
             (duplicate.outcome, duplicate.failure, duplicate.admission),
             (result.outcome, result.failure, result.admission)
         );
-        assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
+        assert_eq!(ctx.engine.current_generation(), rejected_generation);
     }
 
     #[tokio::test]
@@ -4083,5 +4312,142 @@ mod tests {
         assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
         assert!(runtime.middleware_services.is_empty());
         assert!(ctx.extension_credentials.get("removed-guard").is_none());
+    }
+
+    /// Revoking provider credentials publishes a policy generation,
+    /// so open connections wake and re-check the credentials they sent. Covers
+    /// each revocation path: an unavailable environment, bindings that fail
+    /// validation, and a snapshot for another revision. Successful installs
+    /// publish one too; see `stream_provider_rotation_rebinds_policy_generation`.
+    #[tokio::test]
+    async fn provider_credential_revocation_publishes_a_policy_generation() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        for (revision, snapshot_revision, readiness_reason, classification, expected_code) in [
+            (
+                2,
+                2,
+                ProviderReadinessReason::UnsupportedSupervisor,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_unavailable",
+            ),
+            (
+                3,
+                3,
+                ProviderReadinessReason::Unspecified,
+                openshell_core::proto::ProviderEnvironmentValueClassification::Unspecified,
+                "invalid_provider_environment",
+            ),
+            (
+                4,
+                5,
+                ProviderReadinessReason::Unspecified,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_mismatch",
+            ),
+        ] {
+            ctx.provider_credentials = initial_provider_credentials(
+                static_provider_environment(1, Some("initial")),
+                &ctx.provider_readiness,
+            );
+            let mut desired = initial.clone();
+            desired.provider_env_revision = revision;
+            let mut snapshot = provider_snapshot_for(&desired, "REGION", "west");
+            snapshot.provider_env_revision = snapshot_revision;
+            snapshot.readiness_reason = readiness_reason.into();
+            snapshot.values[0].classification = classification.into();
+            let before = ctx.engine.current_generation();
+
+            let result = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+                .await;
+
+            assert_eq!(
+                result.outcome,
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            );
+            assert_eq!(result.failure.as_ref().unwrap().code, expected_code);
+            assert!(
+                ctx.provider_credentials.resolver().is_none(),
+                "{expected_code}: static credentials must be revoked"
+            );
+            assert!(
+                ctx.engine.current_generation() > before,
+                "{expected_code}: revocation must publish a generation"
+            );
+        }
+    }
+
+    /// A revocation that finds no credential left to revoke, as
+    /// when the same failed provider refresh repeats on every poll, publishes
+    /// no generation, so open connections are not re-checked each time.
+    #[tokio::test]
+    async fn repeated_provider_credential_revocation_publishes_no_further_generation() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.provider_credentials = initial_provider_credentials(
+            static_provider_environment(1, Some("initial")),
+            &ctx.provider_readiness,
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        let unavailable = |revision| {
+            let mut desired = initial.clone();
+            desired.provider_env_revision = revision;
+            let mut snapshot = provider_snapshot_for(&desired, "REGION", "west");
+            snapshot.readiness_reason = ProviderReadinessReason::UnsupportedSupervisor.into();
+            (desired, snapshot)
+        };
+        let (desired, snapshot) = unavailable(2);
+        let first = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+            .await;
+        assert_eq!(
+            first.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert!(ctx.provider_credentials.resolver().is_none());
+        let after_first = ctx.engine.current_generation();
+
+        for revision in [3, 4] {
+            let (desired, snapshot) = unavailable(revision);
+            let result = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+                .await;
+
+            assert_eq!(
+                result.outcome,
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            );
+            assert_eq!(
+                result.failure.as_ref().unwrap().code,
+                "provider_environment_unavailable"
+            );
+            assert_eq!(ctx.engine.current_generation(), after_first);
+        }
     }
 }

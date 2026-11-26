@@ -14,6 +14,10 @@ Monitor GitHub Actions workflow runs using the `gh` CLI.
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
+## SDK migration failures
+
+`TypeScript SDK Freeze` rejects additions and modifications under `sdk/typescript/` in pull requests, except the re-export stub's files. Move those changes to [ai-openshell/sdk-typescript](https://github.com/ai-openshell/sdk-typescript). Core proto changes need no regenerated TypeScript bindings. Deletions are allowed for removal. The job skips merge groups, matching `Python SDK Freeze`.
+
 ## Quick Status Check
 
 List recent workflow runs for the current branch:
@@ -123,31 +127,52 @@ JSON output for scripting:
 gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId, status: .status, branch: .headBranch, url: .url}'
 ```
 
+## E2E and dev release concurrency
+
+`Release Dev` finishes its active run and replaces pending runs when new commits arrive. Other callers retain E2E cancellation. Inspect job annotations for cancellation reasons.
+
 ## View Job Logs
 
-For tmachine Kubernetes conformance failures, inspect the `e2e-results-conformance-sandbox-ubuntu-k3s-*` artifact. Its `diagnostics/` holds the K3s report with Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The k3s installers check reconciliation after guest boot with a temporary scheduling-gated Sandbox probe, so a failed probe fails provisioning before any test runs. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+For Branch Checks `Reviewer Roster` failures, the log lists non-collaborators in
+`REVIEWERS.md`. Remove those entries or arrange repository access before rerunning.
+Lookup errors fail the check rather than treating missing results as eligibility.
+
+For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
+`results/app-listener/cni-setup/` evidence. It includes node and Calico pod
+descriptions, events, and current/previous container logs. A CNI rollout timeout
+occurs before the listener tests run; use these diagnostics to distinguish image
+pulls, init failures, and readiness failures.
+
+For tmachine Kubernetes conformance failures, inspect the `e2e-results-conformance-conformance-ubuntu-k3s-*` artifact. Its `diagnostics/` holds the K3s report with Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The k3s installers check reconciliation after guest boot with a temporary scheduling-gated Sandbox probe, so a failed probe fails provisioning before any test runs. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
 
 For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
 
-`Pre-release` temporarily omits Codex Security from its `Security Scan` job.
-`Release` uses the passing prerelease qualification result. Other scanners and
-qualification gates still run. Use the standalone
-`Codex Security Release Qualification` workflow for manual investigation.
+`Pre-release` runs Codex Security as a separate advisory qualification job.
+It scans the exact prerelease tag against the previous stable release. Findings
+and scanner execution failures do not affect qualification or publication;
+failed steps and warnings remain visible. `Release` uses the passing prerelease
+qualification result. Codex Security has no schedule or manual trigger.
 
-For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
-scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
-the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+For Codex Security `0.8.3`, exit code 2 means an execution or required-output
+failure. Deferred investigations no longer cause that exit code. Check the
+execution diagnostics in the job summary and the
+`codex-security-diagnostics-<run>-<attempt>` artifact on
 scan failure. It contains fixed status values, aggregate coverage counts, and
 disk space before, after, and the minimum sampled every five seconds. Missing
 coverage or manifest documents indicate no readable final report was available;
-deferred items or surfaces needing follow-up can explain partial coverage.
+deferred items or surfaces needing follow-up describe coverage limitations.
+Current reports omit the legacy completeness field, so the diagnostic's
+`coverage` value is `unknown`; use `scan_status` and the exit code for execution.
 Sampling cannot rule out a disk spike between samples.
 
 Artifacts and logs in this public repository are public. Never upload the raw
 scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
 logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
 The public diagnostic intentionally omits them; detailed review needs an
-approved private destination. Helpers must come from the workflow revision,
+approved private destination. Setting the repository variable
+`CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY` enables bounded scanner logging and
+encrypted report retention. Only ciphertext is uploaded; the private key stays
+local. See `CI.md` for decryption. Helpers must come from the workflow revision,
 not from the candidate under scan.
 
 `setup-nix` retries development-shell preparation once when `prepare-shell`

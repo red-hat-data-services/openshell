@@ -141,7 +141,13 @@ pub struct BackendDescriptor {
 }
 
 /// Exact non-root identity selected before the immutable workload is created.
+///
+/// Validation and normalization run in [`ResolvedWorkloadIdentity::new`] and
+/// again when a value is decoded from a serialized descriptor: deserialization
+/// routes through the same constructor, so an invalid identity fails to decode
+/// instead of bypassing the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawResolvedWorkloadIdentity")]
 pub struct ResolvedWorkloadIdentity {
     /// Effective and real user ID used by sandbox and all workload children.
     pub uid: u32,
@@ -184,6 +190,32 @@ impl ResolvedWorkloadIdentity {
             source,
             resource_digest,
         })
+    }
+}
+
+/// Unvalidated wire shape of [`ResolvedWorkloadIdentity`], existing only so
+/// serde decoding can route through [`ResolvedWorkloadIdentity::new`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResolvedWorkloadIdentity {
+    uid: u32,
+    gid: u32,
+    supplementary_gids: Vec<u32>,
+    source: String,
+    resource_digest: String,
+}
+
+impl TryFrom<RawResolvedWorkloadIdentity> for ResolvedWorkloadIdentity {
+    type Error = BackendError;
+
+    fn try_from(raw: RawResolvedWorkloadIdentity) -> Result<Self, Self::Error> {
+        Self::new(
+            raw.uid,
+            raw.gid,
+            raw.supplementary_gids,
+            raw.source,
+            raw.resource_digest,
+        )
     }
 }
 
@@ -447,6 +479,22 @@ pub struct BinaryIdentity {
     /// Absolute script/interpreter paths drawn from the process cmdlines.
     /// Diagnostic context; never authorizes.
     pub cmdline_paths: Vec<PathBuf>,
+    /// Process that owns the connection. Audit context; never authorizes.
+    /// `None` when the backend cannot observe it.
+    #[serde(default)]
+    pub process: Option<ProcessInstance>,
+}
+
+/// One process in the workload's PID namespace. A PID can be reused after the
+/// process exits; the start time tells the two processes apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInstance {
+    /// Thread-group ID.
+    pub pid: u32,
+    /// Parent's thread-group ID.
+    pub parent_pid: u32,
+    /// Start time in milliseconds since the Unix epoch.
+    pub start_time_ms: i64,
 }
 
 /// A SHA-256 digest, kept typed so the identity field is not coupled to its
@@ -583,6 +631,7 @@ pub struct PendingTcpOpen {
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
     /// Original external destination captured by the backend before mediation.
+    /// The supervisor may canonicalize IPv4-mapped IPv6 addresses before routing.
     pub destination: SocketAddr,
     /// Native socket evidence, when the backend mediates a kernel socket.
     /// Guests without native sockets supply authoritative executable identity

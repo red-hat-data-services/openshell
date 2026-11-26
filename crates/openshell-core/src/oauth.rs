@@ -15,7 +15,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::token_grant_failure::{
-    REQUEST_ID_HEADER, TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    REQUEST_ID_HEADER, TOKEN_SERVICE_REQUEST_TIMEOUT, TokenGrantFailure, TokenGrantFailureKind,
+    TokenGrantStage,
 };
 
 pub const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
@@ -24,6 +25,9 @@ pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_tok
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
+pub const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
+pub const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 
 /// HTTP client that authenticates HTTPS endpoints and never redirects assertions.
 ///
@@ -54,8 +58,8 @@ impl TokenGrantClient {
         // idempotent for this caller and never relaxes peer authentication.
         openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(30))
+            .timeout(TOKEN_SERVICE_REQUEST_TIMEOUT)
+            .connect_timeout(TOKEN_SERVICE_REQUEST_TIMEOUT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
     }
@@ -263,6 +267,28 @@ pub fn effective_token_type(token_type: &str) -> &str {
     }
 }
 
+/// Cache lifetime for a granted access token.
+///
+/// A configured override is used exactly, including zero to disable caching.
+/// Otherwise the response lifetime (capped, or a default when omitted) is
+/// shortened by a fixed expiry skew, with a one-second floor.
+pub fn token_cache_ttl(cache_ttl_override: Option<Duration>, expires_in: i64) -> Duration {
+    if let Some(cache_ttl_override) = cache_ttl_override {
+        return cache_ttl_override;
+    }
+
+    let ttl = if expires_in > 0 {
+        expires_in.min(MAX_TOKEN_EXPIRES_IN_SECONDS)
+    } else {
+        DEFAULT_TOKEN_CACHE_TTL_SECONDS
+    };
+
+    Duration::from_secs(
+        u64::try_from(ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1))
+            .unwrap_or(u64::MAX),
+    )
+}
+
 /// Validate the configured endpoint before acquiring any workload credentials.
 ///
 /// HTTPS is accepted; plain HTTP is limited to loopback and Kubernetes service
@@ -272,7 +298,7 @@ pub fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, To
         TokenGrantFailureKind::Configuration,
         TokenGrantStage::Configuration,
     );
-    let url = reqwest::Url::parse(token_endpoint).map_err(|_| invalid)?;
+    let url = crate::token_endpoint::parse_auth_url(token_endpoint).map_err(|_| invalid)?;
     if token_endpoint_transport_allowed(&url) {
         return Ok(url);
     }
@@ -972,6 +998,17 @@ mod tests {
         ] {
             parse_token_endpoint_url(endpoint).expect("should be allowed");
         }
+    }
+
+    #[test]
+    fn token_grants_require_an_explicitly_encoded_caret_endpoint() {
+        assert!(parse_token_endpoint_url("https://auth.example.com/a^b").is_err());
+        assert_eq!(
+            parse_token_endpoint_url("https://auth.example.com/a%5Eb")
+                .unwrap()
+                .path(),
+            "/a%5Eb"
+        );
     }
 
     #[test]

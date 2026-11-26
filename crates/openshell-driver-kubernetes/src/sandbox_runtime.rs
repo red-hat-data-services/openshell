@@ -322,6 +322,16 @@ pub fn shared_control_policy(
     policy
 }
 
+/// Set the dedicated supervisor Pod's `runtimeClassName`. An empty class
+/// leaves it unset.
+#[must_use]
+pub fn with_runtime_class(mut pod: Pod, class: &str) -> Pod {
+    if let Some(spec) = pod.spec.as_mut().filter(|_| !class.is_empty()) {
+        spec.runtime_class_name = Some(class.to_string());
+    }
+    pod
+}
+
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn supervisor_pod(
     namespace: &str,
@@ -346,6 +356,7 @@ pub fn supervisor_pod(
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
+    ipv6_egress_args: &[String],
     provider_spiffe_socket_path: Option<&str>,
     // Name and expected full digest of a gateway-normalized destination trust
     // generation. The ConfigMap is mounted only in this dedicated control Pod;
@@ -353,6 +364,7 @@ pub fn supervisor_pod(
     network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    attach_request_timeout_seconds: Option<u64>,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -394,6 +406,12 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
+    if let Some(timeout_seconds) = attach_request_timeout_seconds {
+        environment.push(env_var(
+            "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+            &timeout_seconds.to_string(),
+        ));
+    }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
         environment.push(env_var(
             openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -507,6 +525,7 @@ pub fn supervisor_pod(
             ADDITIONAL_CA_KEY,
         ));
     }
+    command.extend(ipv6_egress_args.iter().cloned());
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
         let mount_path = auth_path
@@ -1041,10 +1060,12 @@ mod tests {
             false,
             false,
             false,
+            &[],
             None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }
@@ -1075,6 +1096,25 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_runtime_class_is_set_only_when_configured() {
+        let pod = Pod {
+            spec: Some(PodSpec::default()),
+            ..Default::default()
+        };
+        let class = |pod: Pod, name: &str| {
+            with_runtime_class(pod, name)
+                .spec
+                .unwrap()
+                .runtime_class_name
+        };
+        assert_eq!(class(pod.clone(), ""), None);
+        assert_eq!(
+            class(pod, "kata-supervisor").as_deref(),
+            Some("kata-supervisor")
+        );
+    }
+
+    #[test]
     fn supervisor_pod_carries_tracing_environment() {
         const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let client_tls = SupervisorClientTls::Disabled;
@@ -1101,6 +1141,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
             None,
             None,
             owner(),
@@ -1111,6 +1152,7 @@ mod tests {
                 ),
                 ("TRACEPARENT", TRACEPARENT.to_string()),
             ],
+            None,
         )
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
@@ -1125,6 +1167,57 @@ mod tests {
             "http://collector:4317"
         );
         assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
+    }
+
+    #[test]
+    fn supervisor_pod_sets_attach_request_timeout_only_when_configured() {
+        let env = |timeout: Option<u64>| {
+            supervisor_pod(
+                "sandbox",
+                &SandboxRuntimeNames::new("pair"),
+                "pair",
+                "demo",
+                "gateway",
+                "supervisor:latest",
+                None,
+                "sandbox-sa",
+                1000,
+                1000,
+                &[],
+                "https://gateway:8080",
+                SupervisorClientTls::Disabled,
+                "{}",
+                "info",
+                600,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                &[],
+                None,
+                None,
+                owner(),
+                &[],
+                timeout,
+            )
+            .unwrap()
+            .spec
+            .expect("Pod spec")
+            .containers[0]
+                .env
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(!env(None).contains_key("OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"));
+        assert_eq!(
+            env(Some(900))["OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"],
+            "900"
+        );
     }
 
     #[test]
@@ -1228,10 +1321,12 @@ mod tests {
             false,
             false,
             false,
+            &[],
             None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1371,84 +1466,106 @@ mod tests {
 
     #[test]
     fn destination_trust_is_mounted_only_into_the_dedicated_supervisor_pod() {
-        let names = SandboxRuntimeNames::new("pair");
-        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let pod = supervisor_pod(
-            "sandbox",
-            &names,
-            "pair",
-            "demo",
-            "gateway",
-            "supervisor:latest",
-            None,
-            "sandbox-sa",
-            1000,
-            1000,
-            &[],
-            "https://gateway:8080",
-            SupervisorClientTls::Disabled,
-            "{}",
-            "info",
-            600,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-            Some(("openshell-additional-ca-gateway-generation", digest)),
-            owner(),
-            &[],
-        )
-        .expect("render supervisor Pod with destination trust");
-        let spec = pod.spec.expect("Pod spec");
-        let container = &spec.containers[0];
-        assert!(container.command.as_deref().is_some_and(|command| {
-            command
-                .windows(2)
-                .any(|args| args == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH])
-        }));
-        assert_eq!(
-            container
-                .volume_mounts
+        for enabled in [false, true] {
+            let names = SandboxRuntimeNames::new("pair");
+            let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            let pod = supervisor_pod(
+                "sandbox",
+                &names,
+                "pair",
+                "demo",
+                "gateway",
+                "supervisor:latest",
+                None,
+                "sandbox-sa",
+                1000,
+                1000,
+                &[],
+                "https://gateway:8080",
+                SupervisorClientTls::Disabled,
+                "{}",
+                "info",
+                600,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                &[],
+                None,
+                Some(("openshell-additional-ca-gateway-generation", digest)),
+                owner(),
+                &[],
+                None,
+            )
+            .expect("render supervisor Pod with destination trust");
+            let pod = crate::app_listener::configure_supervisor_pod(
+                pod,
+                &crate::config::KubernetesAppListenerConfig {
+                    tls_secret_name: "app-tls-secret".into(),
+                    common: openshell_core::app_listener::AppListenerConfig {
+                        enabled,
+                        ..Default::default()
+                    },
+                },
+            );
+            let spec = pod.spec.expect("Pod spec");
+            assert_eq!(
+                spec.volumes
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.name == "app-tls"),
+                enabled
+            );
+            let container = &spec.containers[0];
+            assert!(container.command.as_deref().is_some_and(|command| {
+                command
+                    .windows(2)
+                    .any(|args| args == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH])
+            }));
+            assert_eq!(
+                container
+                    .volume_mounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|mount| mount.name == ADDITIONAL_CA_VOLUME_NAME)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                &[&VolumeMount {
+                    name: ADDITIONAL_CA_VOLUME_NAME.to_string(),
+                    mount_path: ADDITIONAL_CA_MOUNT_PATH.to_string(),
+                    read_only: Some(true),
+                    sub_path: Some(ADDITIONAL_CA_KEY.to_string()),
+                    ..Default::default()
+                }]
+            );
+            let volume = spec
+                .volumes
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
-                .filter(|mount| mount.name == ADDITIONAL_CA_VOLUME_NAME)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            &[&VolumeMount {
-                name: ADDITIONAL_CA_VOLUME_NAME.to_string(),
-                mount_path: ADDITIONAL_CA_MOUNT_PATH.to_string(),
-                read_only: Some(true),
-                sub_path: Some(ADDITIONAL_CA_KEY.to_string()),
-                ..Default::default()
-            }]
-        );
-        let volume = spec
-            .volumes
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|volume| volume.name == ADDITIONAL_CA_VOLUME_NAME)
-            .expect("destination trust ConfigMap volume");
-        assert_eq!(
-            volume
-                .config_map
-                .as_ref()
-                .map(|source| source.name.as_str()),
-            Some("openshell-additional-ca-gateway-generation")
-        );
-        assert_eq!(
-            volume
-                .config_map
-                .as_ref()
-                .and_then(|source| source.items.as_deref())
-                .and_then(|items| items.first())
-                .map(|item| (item.key.as_str(), item.path.as_str())),
-            Some((ADDITIONAL_CA_KEY, ADDITIONAL_CA_KEY))
-        );
+                .find(|volume| volume.name == ADDITIONAL_CA_VOLUME_NAME)
+                .expect("destination trust ConfigMap volume");
+            assert_eq!(
+                volume
+                    .config_map
+                    .as_ref()
+                    .map(|source| source.name.as_str()),
+                Some("openshell-additional-ca-gateway-generation")
+            );
+            assert_eq!(
+                volume
+                    .config_map
+                    .as_ref()
+                    .and_then(|source| source.items.as_deref())
+                    .and_then(|items| items.first())
+                    .map(|item| (item.key.as_str(), item.path.as_str())),
+                Some((ADDITIONAL_CA_KEY, ADDITIONAL_CA_KEY))
+            );
+        }
     }
 
     #[test]
@@ -1569,12 +1686,70 @@ mod tests {
             false,
             false,
             staged,
+            &[],
             None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
+    }
+
+    #[test]
+    fn supervisor_pod_passes_ipv6_egress_arguments() {
+        let args = openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: Some(openshell_core::PolicyDnsIpv6Egress::Disabled),
+            nat64_prefixes: vec!["2001:db8:64::/96".to_string()],
+        }
+        .supervisor_args();
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Secret("client-tls"),
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &args,
+            None,
+            None,
+            owner(),
+            &[],
+            None,
+        )
+        .expect("render supervisor Pod");
+        let command = pod.spec.as_ref().expect("Pod spec").containers[0]
+            .command
+            .as_ref()
+            .expect("supervisor command");
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--policy-dns-ipv6-egress", "disabled"]),
+            "{command:?}"
+        );
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--nat64-prefix", "2001:db8:64::/96"]),
+            "{command:?}"
+        );
     }
 
     #[test]

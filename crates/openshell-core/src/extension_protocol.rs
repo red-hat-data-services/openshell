@@ -12,6 +12,24 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 
+/// Policy format implemented by a peer's registered Cedar backend.
+pub const POLICY_CEDAR_V1: &str = "openshell.policy.cedar.v1";
+
+/// Whether a peer advertises the required versioned capability.
+#[must_use]
+pub fn has_capability(capabilities: &[String], required: &str) -> bool {
+    capabilities.iter().any(|capability| capability == required)
+}
+
+/// Construct an optional capability advertisement.
+#[must_use]
+pub fn capabilities_if(capability: &str, enabled: bool) -> Vec<String> {
+    enabled
+        .then(|| capability.to_string())
+        .into_iter()
+        .collect()
+}
+
 /// Capability for compute drivers that require gateway-minted launch credentials.
 ///
 /// Drivers require this capability when every launch needs a
@@ -28,6 +46,14 @@ pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 /// Optional stopped-state workload configuration updates retaining the resource and storage.
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
+
+/// Capability for supervisor middleware that implements HTTP hooks.
+///
+/// A service selects HTTP hooks for all of its HTTP bindings by
+/// listing this capability in `required_capabilities`. Peers that predate
+/// HTTP hooks do not support it, so they reject the service at
+/// `Describe` instead of calling the deprecated legacy HTTP hooks.
+pub const SUPERVISOR_MIDDLEWARE_HTTP_HOOKS: &str = "openshell.supervisor-middleware.http-hooks";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -129,10 +155,16 @@ pub enum NegotiationError {
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let contract = family.contract_capability();
     let mut supported_capabilities = vec![contract.clone()];
-    if family == ExtensionFamily::Compute {
-        supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
-        supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
-        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+    match family {
+        ExtensionFamily::Compute => {
+            supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+            supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+            supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+        }
+        ExtensionFamily::SupervisorMiddleware => {
+            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
+        }
+        ExtensionFamily::Credentials | ExtensionFamily::GatewayInterceptor => {}
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
@@ -174,6 +206,27 @@ fn expected_contract(gateway: &PeerMetadata) -> String {
         "protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} and capability {}",
         gateway.required_capabilities.join(", ")
     )
+}
+
+/// Extension metadata for supervisor middleware that implements HTTP hooks.
+///
+/// It supports and requires [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`], so peers
+/// without HTTP hooks reject the service at `Describe`.
+#[must_use]
+pub fn http_hooks_middleware_metadata(
+    implementation_name: impl Into<String>,
+    implementation_version: impl Into<String>,
+) -> PeerMetadata {
+    let mut metadata = extension_metadata(
+        ExtensionFamily::SupervisorMiddleware,
+        implementation_name,
+        implementation_version,
+        [SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string()],
+    );
+    metadata
+        .required_capabilities
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
+    metadata
 }
 
 pub fn negotiate(
@@ -513,6 +566,47 @@ mod tests {
     }
 
     #[test]
+    fn http_hooks_middleware_requires_a_peer_with_http_hooks() {
+        let middleware = http_hooks_middleware_metadata("example/guard", "test");
+        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        let negotiated = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &gateway,
+            Some(middleware.clone()),
+        )
+        .expect("a peer with HTTP hooks accepts the service");
+        assert!(
+            negotiated
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
+        );
+
+        // A peer that predates HTTP hooks advertises only the
+        // contract capability.
+        let mut older = gateway;
+        older
+            .supported_capabilities
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_HOOKS);
+        let error = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &older,
+            Some(middleware),
+        )
+        .expect_err("a peer without HTTP hooks rejects the service");
+        assert!(matches!(
+            error,
+            NegotiationError::MissingGatewayCapabilities { .. }
+        ));
+        assert!(
+            error.to_string().contains(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn both_peers_require_capabilities_from_the_other() {
         let (mut gateway, mut extension) = compatible();
         gateway
@@ -591,6 +685,25 @@ mod tests {
                 Some(gateway),
             ),
             Err(NegotiationError::IncompatibleProtocol { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod policy_capability_tests {
+    use super::{POLICY_CEDAR_V1, has_capability};
+
+    #[test]
+    fn capabilities_require_the_exact_versioned_contract() {
+        let unrelated = vec![
+            "openshell.policy.ui.v1".to_string(),
+            "openshell.policy.cedar.v2".to_string(),
+        ];
+        assert!(!has_capability(&unrelated, POLICY_CEDAR_V1));
+        assert!(!has_capability(&[], POLICY_CEDAR_V1));
+        assert!(has_capability(
+            &[POLICY_CEDAR_V1.to_string()],
+            POLICY_CEDAR_V1
         ));
     }
 }

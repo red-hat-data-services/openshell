@@ -8,7 +8,7 @@ application default; an optional system-OpenSSL backend supports explicit contex
 selection by embedders. The facade preserves TLS algorithms, Ed25519 gateway
 JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
 The OpenSSL implementation builds on the standalone proof of concept following
-[the generic backend refactor](https://github.com/NVIDIA/OpenShell/pull/3351).
+[the generic backend refactor](https://github.com/ai-openshell/openshell/pull/3351).
 Application-wide OpenSSL selection and downstream FIPS qualification remain
 separate work; enabling this backend is not a FIPS build or compliance claim.
 
@@ -242,6 +242,7 @@ not a whole-application crypto coverage claim:
 | Remaining use | Current scope and follow-up |
 | --- | --- |
 | Reqwest clients (OIDC/JWKS, token exchange, provider refresh, Vault, token grants, telemetry) | These use Rustls's process-default provider after ensuring one exists; they do not necessarily honor an explicitly selected `CryptoContext`. The OpenSSL follow-up must supply compatible preconfigured TLS or another supported transport integration and test actual provider use. |
+| OTLP gRPC export TLS (`openshell-otel`, the supervisor's agent trace relay) | Tonic's `ClientTlsConfig` verifies collectors and signs for client certificates with Rustls's process-default provider, as other first-party tonic clients do. OTLP/HTTP export builds its configuration through `openshell_crypto::tls::try_client_builder`. The OpenSSL follow-up must move the gRPC path to a preconfigured connector before claiming selected-backend coverage. |
 | Kubernetes client TLS (`kube-client` 0.99) | The AWS-LC-enabled client attempts to install AWS-LC as the Rustls process default. It does not consult `CryptoContext`; the OpenSSL follow-up must adapt this transport before claiming selected-backend coverage. |
 | Outer-fence evidence digest (`openshell-isolation-interface::contract`) | The digest binds generation and native enforcement evidence using `sha2` through `Sha256Digest::compute`. This security-relevant hash remains outside facade dispatch and must be migrated with failure propagation before claiming exclusive backend ownership. |
 | VM image/archive digest verification and cached supervisor validation (`openshell-driver-vm`) | Security-relevant artifact integrity remains outside this runtime credential migration. Moving it requires covering the streaming readers, embedded-artifact cache, and build-time digest generation together; it must be addressed before claiming exclusive backend ownership. |
@@ -249,6 +250,7 @@ not a whole-application crypto coverage claim:
 | DNS policy contract fingerprints (`openshell-supervisor-network::policy_dns`) | These bind cached DNS state to policy and are security-relevant. They remain outside this migration; migrating the cache identity API and its failure handling is required for exclusive backend ownership. |
 | Credential-storage names (`credentials`, Kubernetes Secrets, Vault) | Deterministic namespace derivation, not encryption or proof of authorization. These retain their current hashing implementation and stored names; backend coverage is not asserted for them. |
 | Provider-refresh advisory-lock keys | Deterministic database lock selection for coordinating refreshes, not authentication or encryption. These remain outside the selected-backend contract. |
+| Service-routing hostname labels (`openshell-core::app_listener`) | Deterministic public DNS naming, not authentication or proof of authorization. The existing truncated SHA-256/base32 encoding remains unchanged and uses `sha2`; gateway and application paths share the implementation. |
 | Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
 | Destination-trust generation labels (`openshell-server` network trust, Podman operator staging, Kubernetes ConfigMap naming, VM staged-snapshot checks) | Deterministic identity derivation for naming and generation equality, not encryption or proof of authorization. Trust decisions use the gateway's normalization, immutable staging, exact-byte validation, and TLS verification rather than these digests. These retain `sha2` directly. |

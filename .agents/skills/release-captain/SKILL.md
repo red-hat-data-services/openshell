@@ -41,11 +41,19 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 - `Release` (`release.yml`) is dispatched by hand with the stable version. It
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
+- Stable releases publish public schemas to `buf.build/openshell/core` with
+  the release tag as the label; prereleases skip Buf publication. The Buf
+  repository must exist and Actions must have a `BUF_TOKEN` secret with write
+  access. A failed Buf push fails the release run; follow Recovery before
+  rerunning the failed publication job.
+- Pre-release and stable builds leave the `experimental` feature disabled. Release
+  Dev enables it through `experimental: true`. Normal workspace builds, lint,
+  and tests enable `experimental` without separate CI lanes for development features.
 
 ## Setup
 
 ```shell
-export GH_REPO=NVIDIA/OpenShell
+export GH_REPO=ai-openshell/openshell
 git fetch origin main --tags --force
 PREV=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 git tag -l 'v*' --sort=-v:refname | grep -E -- '-pre\.[0-9]+$' | head -5
@@ -66,7 +74,7 @@ Preview the candidate `Release` would promote, read-only:
 VERSION=vX.Y.Z
 wt=$(mktemp -d)
 git worktree add -q --detach "$wt" origin/main
-(cd "$wt" && GITHUB_REPOSITORY=NVIDIA/OpenShell uv run -q --no-project python tasks/scripts/select-release-candidate.py "$VERSION" --branch main | jq .)
+(cd "$wt" && GITHUB_REPOSITORY=ai-openshell/openshell uv run -q --no-project python tasks/scripts/select-release-candidate.py "$VERSION" --branch main | jq .)
 git worktree remove --force "$wt"
 ```
 
@@ -83,8 +91,10 @@ git worktree remove --force "$wt"
 
    If the next version has no `-pre.1`, start the train (Tuesday step 6).
 
-2. **Triage the compatibility review** for the candidate's run. It's advisory,
-   and a green job doesn't mean it found no breaks:
+2. **Triage the compatibility review** when enabled for the candidate's run.
+   Both Codex review jobs are temporarily skipped pending fixes; skip this step
+   while they are disabled. When enabled, the review is advisory, and a green
+   job doesn't mean it found no breaks:
 
    ```shell
    ATTEMPT=$(gh run view "$RUN" --json attempt --jq .attempt)
@@ -164,8 +174,7 @@ git worktree remove --force "$wt"
    ```
 
 4. **Watch and verify.** Check that `Select Qualified Prerelease` names the
-   approved candidate, the GitHub Release has assets, no job failed, and the
-   wheel reached PyPI:
+   approved candidate, the GitHub Release has assets and no job failed:
 
    ```shell
    gh run watch <run-id> --exit-status
@@ -176,7 +185,7 @@ git worktree remove --force "$wt"
    to the release notes rather than repeating them:
 
    ```text
-   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/NVIDIA/OpenShell/releases/tag/vX.Y.Z
+   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/ai-openshell/openshell/releases/tag/vX.Y.Z
 
    It shipped from vX.Y.Z-pre.N (<commit>). I'll be starting the <next version>-pre.* jobs shortly for next week.
 

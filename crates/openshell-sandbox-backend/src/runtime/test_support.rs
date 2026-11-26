@@ -596,7 +596,7 @@ async fn relay_io(
         }
         writer.shutdown().await
     };
-    let read = async {
+    let read = async move {
         let mut b = vec![0; 16384];
         loop {
             let n = reader.read(&mut b).await?;
@@ -613,7 +613,12 @@ async fn relay_io(
         }
         Ok::<_, std::io::Error>(())
     };
-    let _ = tokio::join!(write, read);
+    tokio::pin!(read);
+    tokio::select! {
+        // Backend EOF ends the response even while the request remains open.
+        _ = &mut read => {},
+        _ = write => { let _ = read.await; },
+    }
 }
 
 struct TestTlsIo(BoundaryDuplexStream);
@@ -680,7 +685,7 @@ impl super::BoundaryTransportConnector for Connector {
         _: &w::SandboxRuntimeDescriptor,
     ) -> Result<BoundaryDuplexStream, BackendError> {
         Ok(Box::new(
-            openshell_core::net::connect_tcp_nodelay_best_effort(&[self.address])
+            openshell_core::net::connect_tcp_nodelay_best_effort(self.address)
                 .await
                 .map_err(|e| BackendError::Unavailable(e.to_string()))?,
         ))

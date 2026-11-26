@@ -8,25 +8,24 @@
 
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
 use crate::l7::{EnforcementMode, L7RequestInfo};
-use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::policy_engine::TunnelPolicyEngine;
+use crate::policy_types::PolicyGenerationGuard;
+use crate::telemetry::egress_emit;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
-    ocsf_emit,
 };
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
-pub const MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES: usize = 32;
-pub const MAX_QUEUED_WEBSOCKET_ASSEMBLIES: usize = MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES * 2;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -39,61 +38,10 @@ const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
+const CREDENTIAL_PLACEMENT_MISMATCH: &str = "websocket credential placement mismatch";
 const CREDENTIAL_ENDPOINT_MISMATCH: &str = "websocket credential endpoint mismatch";
 
-#[derive(Clone, Debug)]
-pub struct WebSocketAssemblyBudget {
-    active: Arc<Semaphore>,
-    waiters: Arc<Semaphore>,
-}
-
-impl Default for WebSocketAssemblyBudget {
-    fn default() -> Self {
-        Self::new(
-            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES,
-            MAX_QUEUED_WEBSOCKET_ASSEMBLIES,
-        )
-    }
-}
-
-impl WebSocketAssemblyBudget {
-    pub fn new(active: usize, waiters: usize) -> Self {
-        Self {
-            active: Arc::new(Semaphore::new(active)),
-            waiters: Arc::new(Semaphore::new(waiters)),
-        }
-    }
-
-    pub async fn reserve(&self) -> Result<WebSocketAssemblyAdmissionOutcome> {
-        if let Ok(active) = Arc::clone(&self.active).try_acquire_owned() {
-            return Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
-                WebSocketAssemblyAdmission { _active: active },
-            ));
-        }
-        let Ok(waiter) = Arc::clone(&self.waiters).try_acquire_owned() else {
-            return Ok(WebSocketAssemblyAdmissionOutcome::QueueExhausted);
-        };
-        let active = Arc::clone(&self.active)
-            .acquire_owned()
-            .await
-            .map_err(|_| miette!("websocket assembly admission semaphore closed"))?;
-        drop(waiter);
-        Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
-            WebSocketAssemblyAdmission { _active: active },
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct WebSocketAssemblyAdmission {
-    _active: OwnedSemaphorePermit,
-}
-
-#[derive(Debug)]
-pub enum WebSocketAssemblyAdmissionOutcome {
-    Admitted(WebSocketAssemblyAdmission),
-    QueueExhausted,
-}
+pub use openshell_policy_runtime_interface::l7::websocket::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketTerminationCause {
@@ -582,7 +530,27 @@ where
     }
     if let Err(termination) = &result {
         let error = termination.error.to_string();
-        if error.contains(CREDENTIAL_ENDPOINT_MISMATCH) {
+        if error.contains(CREDENTIAL_PLACEMENT_MISMATCH) {
+            egress_emit!(
+                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(host, port))
+                    .firewall_rule(options.policy_name, "credential-binding")
+                    .message("WebSocket credential use denied: unauthorized request location")
+                    .status_detail("credential_placement_mismatch")
+                    .build()
+            );
+            egress_emit!(crate::l7::build_credential_placement_mismatch_finding(
+                options.policy_name,
+                host,
+                Some("websocket"),
+            ));
+            let _ = write_policy_violation_close(&mut client_write).await;
+        } else if error.contains(CREDENTIAL_ENDPOINT_MISMATCH) {
             emit_credential_endpoint_mismatch(host, port, options.policy_name);
             let _ = write_policy_violation_close(&mut client_write).await;
         } else if error.contains("credential") {
@@ -609,7 +577,7 @@ where
 }
 
 async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
-    let reason = b"credential endpoint mismatch";
+    let reason = b"credential use denied";
     let mut frame = Vec::with_capacity(reason.len() + 4);
     frame.push(0x80 | OPCODE_CLOSE);
     frame.push(u8::try_from(reason.len() + 2).expect("close reason fits one-byte length"));
@@ -620,7 +588,7 @@ async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> 
 }
 
 fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
@@ -635,7 +603,7 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
             .status_detail("credential_endpoint_mismatch")
             .build()
     );
-    ocsf_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
+    egress_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
         host,
         Some("websocket"),
@@ -1288,7 +1256,12 @@ where
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
             .map_err(|error| {
-                if error.is_endpoint_mismatch() {
+                if error.is_placement_mismatch() {
+                    terminate(
+                        WebSocketTerminationCause::PolicyDenial,
+                        miette!(CREDENTIAL_PLACEMENT_MISMATCH),
+                    )
+                } else if error.is_endpoint_mismatch() {
                     terminate(
                         WebSocketTerminationCause::PolicyDenial,
                         miette!(CREDENTIAL_ENDPOINT_MISMATCH),
@@ -1386,7 +1359,7 @@ fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, 
             "WebSocket credential traffic denied for {host}:{port}"
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
     crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
 }
 
@@ -2061,7 +2034,7 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
         .firewall_rule(policy_name, "l7-websocket")
         .message(rewrite_event_message(host, port, replacements))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn rewrite_event_message(host: &str, port: u16, replacements: usize) -> String {
@@ -2114,7 +2087,7 @@ fn emit_websocket_l7_event(
             request_info.action, request_info.target, summary
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn observe_termination(
@@ -2127,7 +2100,7 @@ fn observe_termination(
         emit_protocol_failure(host, port, policy_name, failure_class);
     }
     if termination.cause == WebSocketTerminationCause::CapacityExhausted {
-        ocsf_emit!(
+        egress_emit!(
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
@@ -2151,7 +2124,7 @@ fn emit_protocol_failure(
     policy_name: &str,
     failure_class: FrameFailureClass,
 ) {
-    ocsf_emit!(protocol_failure_event(
+    egress_emit!(protocol_failure_event(
         host,
         port,
         policy_name,
@@ -2191,7 +2164,8 @@ fn protocol_failure_message(host: &str, port: u16) -> String {
 mod tests {
     use super::*;
     use crate::l7::relay::L7EvalContext;
-    use crate::opa::{NetworkInput, OpaEngine};
+    use crate::opa::OpaEngine;
+    use crate::policy_types::NetworkInput;
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
@@ -2713,7 +2687,7 @@ network_policies:
             1,
             HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
             HashMap::new(),
-            HashMap::new(),
+            crate::test_support::header_placement_metadata(&["DISCORD_BOT_TOKEN"]),
             HashMap::from([(
                 "DISCORD_BOT_TOKEN".to_string(),
                 StaticCredentialBinding {
@@ -2815,7 +2789,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn guarded_websocket_uses_path_scoped_live_resolver() {
+    async fn guarded_websocket_rewrites_header_credentials_with_policy_opt_in() {
         let state = bound_websocket_provider_state();
         let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
         let input = masked_frame(true, OPCODE_TEXT, placeholder);
@@ -2847,7 +2821,68 @@ network_policies:
         .await;
         assert!(
             result.is_ok(),
-            "path-scoped live resolver must satisfy the credential guard: {result:?}"
+            "explicit WebSocket rewriting must permit header credentials: {result:?}"
+        );
+
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        assert_eq!(decode_masked_text_frame(&output), "real-token");
+    }
+
+    #[tokio::test]
+    async fn authorization_fallback_preserves_explicit_websocket_rewriting() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "DISCORD_BOT_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "gateway.example.test".into(),
+                        port: 443,
+                        path: "/socket".into(),
+                    }],
+                    credential_identity: "provider:DISCORD_BOT_TOKEN".into(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("legacy websocket fixture");
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let input = masked_frame(true, OPCODE_TEXT, placeholder);
+        let (mut client_write, mut relay_read) = tokio::io::duplex(4096);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: None,
+            generation_guard: None,
+            provider_credentials: Some(&state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+            deny_uninspected_credentials: true,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &mut options,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "Authorization fallback must preserve explicit WebSocket rewriting: {result:?}"
         );
 
         drop(relay_write);
@@ -2914,7 +2949,7 @@ network_policies:
             result
                 .as_ref()
                 .is_err_and(|error| error.error.to_string().contains("generation changed")),
-            "revoked credential generation must fail before the frame write: {result:?}"
+            "revoked generation must fail before the frame write: {result:?}"
         );
 
         drop(relay_write);
@@ -3793,6 +3828,7 @@ network_policies:
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "workspace".into(),
+                    originating_process: None,
                     scheme: scheme.into(),
                     host: "api.openai.com".into(),
                     port: if scheme == "wss" { 443 } else { 80 },
@@ -3866,6 +3902,7 @@ network_policies:
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "team-a".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4824,6 +4861,7 @@ network_policies:
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "workspace".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4975,6 +5013,7 @@ network_policies:
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "workspace".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5097,6 +5136,7 @@ network_policies:
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "workspace".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,

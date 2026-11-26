@@ -11,11 +11,13 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 mod config_inputs;
+mod discovery_inputs;
 mod endpoint_status;
 mod provisioning_clock;
 #[cfg(test)]
 mod token_grant_owners_tests;
 pub use config_inputs::{SandboxConfigInputs, load_sandbox_config_inputs};
+pub(super) use discovery_inputs::DiscoveryConfigInputs;
 pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::{
@@ -42,7 +44,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+use crate::storage_proto::StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
 use metrics::counter;
@@ -86,6 +88,7 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
 };
@@ -112,8 +115,8 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_caller_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    level_matches, require_gateway_cedar_support, source_matches, validate_and_canonicalize_policy,
+    validate_caller_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
 use super::{StoredSettingValue, StoredSettings};
@@ -130,7 +133,7 @@ const GLOBAL_SETTINGS_NAME: &str = "global";
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 const PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE: u32 = 1000;
 /// Reserved settings key used to store global policy payload.
-const POLICY_SETTING_KEY: &str = "policy";
+pub(super) const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Stable labels used when stored policy state fails validation.
@@ -1971,6 +1974,7 @@ async fn current_effective_policy_for_sandbox(
         .unwrap_or_default();
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         &provider_names,
     )
@@ -2084,6 +2088,7 @@ async fn apply_effective_policy_context(
 ) -> Result<ProtoSandboxPolicy, Status> {
     let provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         catalog,
         workspace,
         provider_names,
@@ -2150,43 +2155,19 @@ fn policy_static_credential_endpoint_bindings(
         return Ok(bindings);
     };
 
+    openshell_policy::validate_credential_bindings(policy)
+        .map_err(|violations| Status::invalid_argument(violations.join("; ")))?;
     for rule in policy.network_policies.values() {
         for endpoint in &rule.endpoints {
             let Some(binding) = endpoint.credential_binding.as_ref() else {
                 continue;
             };
-            let provider = binding.provider.trim();
-            if provider.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "credential_binding.provider is required for endpoint '{}'",
-                    endpoint.host
-                )));
-            }
-            if provider != binding.provider {
-                return Err(Status::invalid_argument(format!(
-                    "credential_binding.provider '{}' must not contain leading or trailing whitespace",
-                    binding.provider
-                )));
-            }
-            if endpoint.host.trim().is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "credential-bound endpoint for provider '{provider}' must define a host"
-                )));
-            }
+            let provider = binding.provider.as_str();
             let ports = if endpoint.ports.is_empty() {
                 vec![endpoint.port]
             } else {
                 endpoint.ports.clone()
             };
-            if ports
-                .iter()
-                .any(|port| *port == 0 || *port > u32::from(u16::MAX))
-            {
-                return Err(Status::invalid_argument(format!(
-                    "credential-bound endpoint '{}' for provider '{provider}' must define ports in range 1..=65535",
-                    endpoint.host
-                )));
-            }
             let provider_bindings = bindings.entry(provider.to_string()).or_default();
             for port in ports {
                 let candidate = StaticCredentialEndpointBinding {
@@ -2403,6 +2384,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
     }
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -2427,6 +2409,7 @@ async fn provider_policy_layers_for_sandbox(
         .await?;
     let layers = provider_policy_context_with_catalog(
         state.store.as_ref(),
+        &state.refresh,
         &catalog,
         workspace,
         provider_names,
@@ -2502,6 +2485,28 @@ fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<b
     Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
 
+/// Whether a scan over many sandboxes must skip `sandbox` because its policy is
+/// a Cedar policy and this gateway was built without Cedar support.
+///
+/// Such a sandbox already fails closed on every path that serves its policy,
+/// so it must not fail the scan for every other sandbox. A sandbox never
+/// switches policy formats, so its spec policy decides. Logs the skip.
+pub(super) fn skip_sandbox_with_unsupported_cedar_policy(sandbox: &Sandbox) -> bool {
+    let unsupported = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.as_ref())
+        .is_some_and(|policy| require_gateway_cedar_support(policy).is_err());
+    if unsupported {
+        warn!(
+            workspace = %sandbox.object_workspace(),
+            sandbox = %sandbox.object_name(),
+            "skipping sandbox with a Cedar policy this gateway was built without support for"
+        );
+    }
+    unsupported
+}
+
 async fn validate_provider_composition_for_existing_sandboxes(
     state: &ServerState,
 ) -> Result<(), Status> {
@@ -2524,7 +2529,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
                 .as_ref()
                 .map(|spec| spec.providers.as_slice())
                 .unwrap_or_default();
-            if provider_names.is_empty() {
+            if provider_names.is_empty() || skip_sandbox_with_unsupported_cedar_policy(&sandbox) {
                 continue;
             }
 
@@ -2545,6 +2550,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
             // sandbox already fails closed, so warn and validate the rest.
             let (records, missing) = super::provider::load_existing_provider_environment_records(
                 state.store.as_ref(),
+                &state.refresh,
                 &workspace,
                 provider_names,
             )
@@ -2887,7 +2893,33 @@ async fn handle_get_sandbox_config_inner(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+    let config = load_sandbox_config(state, &sandbox).await?;
+    if matches!(principal, Principal::Sandbox(_)) {
+        require_policy_capabilities(req.supported_capabilities, config.policy.as_ref())?;
+    }
+    Ok(Response::new(config))
+}
+
+const CEDAR_SUPPORT_REQUIRED: &str = "Cedar policy requires a supervisor with Cedar support";
+
+/// Refuses a Cedar policy to a supervisor that did not report Cedar support.
+///
+/// Callers must not answer with an empty compatibility configuration
+/// instead: an older supervisor might treat it as a usable YAML
+/// configuration. Pushed configuration delivers the refusal as a
+/// configuration that is not admitted.
+pub fn require_policy_capabilities(
+    supported_capabilities: Vec<String>,
+    policy: Option<&ProtoSandboxPolicy>,
+) -> Result<(), Status> {
+    if !openshell_core::extension_protocol::has_capability(
+        &supported_capabilities,
+        openshell_core::extension_protocol::POLICY_CEDAR_V1,
+    ) && policy.is_some_and(ProtoSandboxPolicy::is_cedar)
+    {
+        return Err(Status::unimplemented(CEDAR_SUPPORT_REQUIRED));
+    }
+    Ok(())
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -2918,19 +2950,35 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     state: &ServerState,
     inputs: &SandboxConfigInputs,
 ) -> Result<SandboxConfigSnapshot, Status> {
-    let sandbox = &inputs.sandbox;
+    build_sandbox_config_snapshot_with_sources(
+        state,
+        &inputs.sandbox,
+        &inputs.catalog,
+        &inputs.provider_records,
+        &inputs.global_settings,
+        inputs.latest_policy.as_ref(),
+        None,
+    )
+    .await
+}
+
+async fn build_sandbox_config_snapshot_with_sources(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    provider_profile_catalog: &EffectiveProviderProfileCatalog,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    global_settings: &StoredSettings,
+    latest: Option<&PolicyRecord>,
+    service_routes: Option<Vec<openshell_core::proto::SandboxServiceRoute>>,
+) -> Result<SandboxConfigSnapshot, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
-    let provider_profile_catalog = &inputs.catalog;
-    let provider_records = &inputs.provider_records;
-    let global_settings = &inputs.global_settings;
 
     let global_policy = decode_policy_from_global_settings(global_settings)?;
     let mut global_policy_version: u32 = 0;
 
     // Under a global override, only the sandbox version metadata is observed;
     // the dormant payload is neither decoded nor validated.
-    let latest = inputs.latest_policy.as_ref();
 
     let (mut policy, version, mut policy_hash, policy_source) =
         if let Some(global_policy) = global_policy {
@@ -3053,7 +3101,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let settings = merge_effective_settings(global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision_with_validation_mode(
+    let mut config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
@@ -3078,7 +3126,25 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
+    let service_routes = match service_routes {
+        Some(routes) => routes,
+        None => super::service::configured_app_routes(state, sandbox).await?,
+    };
+    // Include the allowlist in delivery identity so a service edit is not
+    // coalesced away as a duplicate policy/settings snapshot.
+    if !service_routes.is_empty() {
+        let mut bytes = config_revision.to_le_bytes().to_vec();
+        for route in &service_routes {
+            route
+                .encode_length_delimited(&mut bytes)
+                .expect("encode service route");
+        }
+        let hash = openshell_crypto::sha256(&bytes)
+            .map_err(|_| Status::internal("service configuration fingerprint failed"))?;
+        config_revision = u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"));
+    }
     Ok(SandboxConfigSnapshot {
+        service_routes,
         configuration_instance_id: sandbox
             .status
             .as_ref()
@@ -3113,6 +3179,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
 
 fn sandbox_config_response(snapshot: SandboxConfigSnapshot) -> GetSandboxConfigResponse {
     GetSandboxConfigResponse {
+        service_routes: snapshot.service_routes,
         policy: snapshot.policy,
         version: snapshot.version,
         policy_hash: snapshot.policy_hash,
@@ -3268,8 +3335,10 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<u64, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     compute_provider_env_revision_with_catalog_and_policy_bindings(
         store,
+        &refresh,
         catalog,
         workspace,
         provider_names,
@@ -3280,6 +3349,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -3303,9 +3373,12 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
-                let refresh_states =
-                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
-                        .await?;
+                let refresh_states: Vec<StoredProviderCredentialRefreshState> = refresh
+                    .list(Some(&record.id))
+                    .await?
+                    .iter()
+                    .map(Into::into)
+                    .collect();
                 hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
@@ -3492,8 +3565,9 @@ async fn profile_provider_policy_layers_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let refresh = crate::provider_refresh::runtime(&Arc::new(store.clone()), None, None);
     Ok(
-        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+        provider_policy_context_with_catalog(store, &refresh, catalog, workspace, provider_names)
             .await?
             .layers,
     )
@@ -3515,13 +3589,18 @@ struct ProviderPolicyContext {
 
 async fn provider_policy_context_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
-    let records =
-        super::provider::load_provider_environment_records(store, workspace, provider_names)
-            .await?;
+    let records = super::provider::load_provider_environment_records(
+        store,
+        refresh,
+        workspace,
+        provider_names,
+    )
+    .await?;
     Ok(provider_policy_context_from_records(catalog, &records))
 }
 
@@ -3647,7 +3726,11 @@ fn canonical_endpoint_path(path: &str) -> String {
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
             endpoint.token_grant_owner.clear();
@@ -3659,7 +3742,11 @@ fn stamp_provider_credentialed_endpoints(
     policy: &mut ProtoSandboxPolicy,
     scopes: &[CredentialedEndpointScope],
 ) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = scopes
                 .iter()
@@ -3774,6 +3861,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         .await?;
     let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -4026,6 +4114,18 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             .clear();
     }
 
+    // Add request metadata only after token-grant owner composition and all
+    // static value filtering, so it describes this exact atomic snapshot.
+    let static_request_metadata = super::provider::static_credential_request_metadata(
+        &sandbox_id,
+        provider_profile_catalog,
+        provider_records,
+        &provider_environment,
+    )?;
+    provider_environment
+        .dynamic_credentials
+        .extend(static_request_metadata);
+
     info!(
         sandbox_id = %sandbox_id,
         provider_count = provider_names.len(),
@@ -4267,6 +4367,14 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            // A global policy replaces every sandbox's policy, and a sandbox
+            // cannot switch formats after it starts, so a Cedar global policy
+            // would be rejected by every YAML sandbox.
+            if new_policy.is_cedar() {
+                return Err(Status::invalid_argument(
+                    "global policies must be YAML; Cedar policies can only be set per sandbox",
+                ));
+            }
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
@@ -4566,6 +4674,12 @@ async fn handle_update_config_inner(
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        // A sandbox cannot switch policy formats, so its baseline tells a
+        // Cedar sandbox apart before the operations are read. The merge
+        // checks the current revision again.
+        if let Some(baseline_policy) = &spec.policy {
+            require_mergeable_policy(baseline_policy)?;
+        }
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
         let merge_validation =
@@ -4657,6 +4771,7 @@ async fn handle_update_config_inner(
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
     clear_provider_credentialed_markers(&mut new_policy);
+    require_gateway_cedar_support(&new_policy)?;
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
         return Err(Status::failed_precondition(
@@ -5000,7 +5115,9 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
-    if message.contains("middleware") {
+    if error.code() == Code::Unimplemented && message == CEDAR_SUPPORT_REQUIRED {
+        "Effective policy is a Cedar policy, which this supervisor cannot enforce; run the sandbox with a supervisor built with Cedar support or set a YAML policy"
+    } else if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
         "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
@@ -5068,6 +5185,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         &state.store,
         &mut sandbox,
         current_time_ms(),
+        state.config.provisioning_repair_window_seconds * 1000,
     )
     .await
     .map_err(Status::internal)?;
@@ -5098,6 +5216,9 @@ pub(super) async fn handle_report_sandbox_configuration(
     }
     if reported == ConfigurationAdmissionState::Accepted {
         let mut config_request = Request::new(GetSandboxConfigRequest {
+            supported_capabilities: vec![
+                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+            ],
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
         });
@@ -5116,6 +5237,9 @@ pub(super) async fn handle_report_sandbox_configuration(
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
         let mut config_request = Request::new(GetSandboxConfigRequest {
+            supported_capabilities: vec![
+                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+            ],
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
         });
@@ -5161,11 +5285,19 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition("provisioning deadline expired"));
         }
-        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
-            .map_err(Status::internal)?;
+        crate::compute::provisioning_deadline::record_admission_start(
+            record,
+            now_ms,
+            state.config.provisioning_repair_window_seconds * 1000,
+        )
+        .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
-            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
-                .map_err(Status::internal)?;
+            crate::compute::provisioning_deadline::record_rejection(
+                record,
+                now_ms,
+                state.config.provisioning_repair_window_seconds * 1000,
+            )
+            .map_err(Status::internal)?;
         }
     }
     let updated = state
@@ -5408,6 +5540,35 @@ pub(super) async fn handle_get_sandbox_logs(
     Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
 }
 
+/// How often an open push stream re-reads its sandbox record to detect that
+/// the sandbox was deleted.
+///
+/// Batches flush every 500ms, so this costs roughly one primary-key read per
+/// stream per second, and only when a batch arrives.
+const LOG_STREAM_EXISTENCE_RECHECK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Mutable state for one `PushSandboxLogs` stream.
+#[derive(Debug, Default)]
+struct LogStreamState {
+    /// Sandbox id the first batch validated as belonging to the caller.
+    validated_sandbox_id: Option<String>,
+    /// When the sandbox record was last confirmed to exist.
+    last_existence_check: Option<std::time::Instant>,
+}
+
+impl LogStreamState {
+    /// True when the cached existence proof is stale enough to re-read.
+    fn should_recheck(&self, now: std::time::Instant) -> bool {
+        self.last_existence_check.is_none_or(|checked_at| {
+            now.duration_since(checked_at) >= LOG_STREAM_EXISTENCE_RECHECK_PERIOD
+        })
+    }
+
+    fn mark_checked(&mut self, now: std::time::Instant) {
+        self.last_existence_check = Some(now);
+    }
+}
+
 pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
@@ -5420,7 +5581,7 @@ pub(super) async fn handle_push_sandbox_logs(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let mut stream = request.into_inner();
-    let mut validated_sandbox_id = None;
+    let mut stream_state = LogStreamState::default();
 
     while let Some(batch) = stream
         .message()
@@ -5431,11 +5592,15 @@ pub(super) async fn handle_push_sandbox_logs(
             continue;
         }
 
-        ensure_log_stream_sandbox_scope(
+        // Auth first: a cross-sandbox push must keep the audited
+        // PermissionDenied rather than learn about existence.
+        ensure_log_stream_sandbox_scope(state, &principal, &batch.sandbox_id, &mut stream_state)
+            .await?;
+        ensure_log_stream_sandbox_exists(
             state,
-            &principal,
+            &mut stream_state,
             &batch.sandbox_id,
-            &mut validated_sandbox_id,
+            std::time::Instant::now(),
         )
         .await?;
 
@@ -5464,6 +5629,55 @@ pub(super) async fn handle_push_sandbox_logs(
     Ok(Response::new(PushSandboxLogsResponse {}))
 }
 
+/// End an open push stream once the sandbox behind it is gone.
+///
+/// A tombstone from [`crate::tracing_bus::TracingLogBus::close`] is checked on
+/// every batch and costs no store read. It ends the stream on the replica that
+/// ran delete cleanup. The store is re-read at most once per
+/// [`LOG_STREAM_EXISTENCE_RECHECK_PERIOD`], which ends a stream whose record
+/// disappears while the stream is still open, as a best effort on the other
+/// replicas. Freeing another replica's buffers is a separate concern (#5401);
+/// only the replica that removed the record arms a permanent tombstone.
+///
+/// Only a missing record ends the stream. A transient store failure is not
+/// proof of absence, so it keeps the stream open and the next cadence retries.
+///
+/// A missing sandbox row means the sandbox is gone. Several readers make that
+/// inference with their own error policy -- delete cleanup, this recheck, and
+/// the `WatchSandbox` producer in grpc/sandbox.rs -- so a change to deletion
+/// semantics (soft delete, migration windows, record recreation) must update
+/// every one of them.
+async fn ensure_log_stream_sandbox_exists(
+    state: &Arc<ServerState>,
+    stream_state: &mut LogStreamState,
+    sandbox_id: &str,
+    now: std::time::Instant,
+) -> Result<(), Status> {
+    if state.tracing_log_bus.is_closed(sandbox_id) {
+        return Err(Status::not_found("sandbox not found"));
+    }
+    if !stream_state.should_recheck(now) {
+        return Ok(());
+    }
+
+    match state.store.get(Sandbox::object_type(), sandbox_id).await {
+        Ok(Some(_)) => {
+            stream_state.mark_checked(now);
+            Ok(())
+        }
+        Ok(None) => Err(Status::not_found("sandbox not found")),
+        Err(error) => {
+            warn!(
+                sandbox_id,
+                %error,
+                "Sandbox existence recheck failed; keeping the log stream open"
+            );
+            stream_state.mark_checked(now);
+            Ok(())
+        }
+    }
+}
+
 fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status> {
     for (index, log) in logs.iter().enumerate() {
         if let Some(event_time) = log.event_time.as_ref() {
@@ -5475,16 +5689,21 @@ fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status
     Ok(())
 }
 
+/// Validate one batch's sandbox scope and, on the first batch, its existence.
+///
+/// On the first batch this reads the sandbox record and marks the
+/// existence-recheck clock, so the already-paid read also seeds the cadence
+/// instead of the caller issuing a second one on the next batch.
 async fn ensure_log_stream_sandbox_scope(
     state: &Arc<ServerState>,
     principal: &Principal,
     sandbox_id: &str,
-    validated_sandbox_id: &mut Option<String>,
+    stream_state: &mut LogStreamState,
 ) -> Result<(), Status> {
     // Guard every batch, so switching to another sandbox mid-stream is
     // recorded like any other cross-sandbox attempt.
     crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
-    if let Some(validated) = validated_sandbox_id.as_deref() {
+    if let Some(validated) = stream_state.validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
             return Err(Status::permission_denied(
                 "log stream sandbox_id changed after validation",
@@ -5499,7 +5718,8 @@ async fn ensure_log_stream_sandbox_scope(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    *validated_sandbox_id = Some(sandbox_id.to_string());
+    stream_state.validated_sandbox_id = Some(sandbox_id.to_string());
+    stream_state.mark_checked(std::time::Instant::now());
     Ok(())
 }
 
@@ -7425,6 +7645,18 @@ fn parse_proto_l7_target(
     Ok(target)
 }
 
+/// Rejects merge operations on a Cedar policy, which has no YAML rules to
+/// merge into.
+fn require_mergeable_policy(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if !policy.is_cedar() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(
+        "incremental policy updates are not available for Cedar policies; edit the Cedar \
+         policy and replace it with `openshell policy set`",
+    ))
+}
+
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
     for operation in operations {
         match operation {
@@ -7545,6 +7777,7 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
     let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
+        &state.refresh,
         workspace,
         provider_names,
     )
@@ -7650,6 +7883,8 @@ async fn apply_merge_operations_with_retry(
         } else {
             (baseline_policy.cloned().unwrap_or_default(), None)
         };
+        // Also covers a sandbox without a baseline policy.
+        require_mergeable_policy(&current_policy)?;
 
         clear_provider_credentialed_markers(&mut current_policy);
         if let Some(expected_hash) = expected_current_effective_hash {
@@ -8154,6 +8389,14 @@ fn validate_and_canonicalize_stored_policy(
     policy: ProtoSandboxPolicy,
     source: &'static str,
 ) -> Result<ProtoSandboxPolicy, Status> {
+    // A gateway built without Cedar serves no stored Cedar policy, including
+    // one a Cedar-enabled build of the gateway accepted.
+    require_gateway_cedar_support(&policy).map_err(|error| {
+        Status::failed_precondition(format!(
+            "stored policy source '{source}' is a Cedar policy: {}",
+            error.message()
+        ))
+    })?;
     openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
         Status::failed_precondition(format!(
             "stored policy source '{source}' is invalid: {error}"
@@ -8421,6 +8664,322 @@ mod tests {
     }
 
     #[test]
+    fn log_stream_state_rechecks_only_after_the_period() {
+        let mut stream_state = LogStreamState::default();
+        let now = std::time::Instant::now();
+        assert!(
+            stream_state.should_recheck(now),
+            "a stream that never read the record must check"
+        );
+
+        stream_state.mark_checked(now);
+        assert!(!stream_state.should_recheck(now));
+        let just_inside = now
+            + LOG_STREAM_EXISTENCE_RECHECK_PERIOD
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("the recheck period must be at least a millisecond");
+        assert!(!stream_state.should_recheck(just_inside));
+        assert!(stream_state.should_recheck(now + LOG_STREAM_EXISTENCE_RECHECK_PERIOD));
+    }
+
+    #[tokio::test]
+    async fn log_stream_tombstone_ends_stream_without_a_store_read() {
+        // The record is present, so only the tombstone can end the stream: a
+        // path that consulted the store first would report it alive.
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-tombstone";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-tombstone",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let now = std::time::Instant::now();
+        stream_state.mark_checked(now);
+        state.tracing_log_bus.close(sandbox_id);
+
+        let error = ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect_err("a tombstoned sandbox must end the stream on the next batch");
+
+        assert_eq!(error.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_ends_stream_when_the_record_is_gone() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-gone";
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+
+        let error = ensure_log_stream_sandbox_exists(
+            &state,
+            &mut stream_state,
+            sandbox_id,
+            checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD,
+        )
+        .await
+        .expect_err("a missing record must end the stream");
+
+        assert_eq!(error.code(), Code::NotFound);
+        assert!(
+            !state.tracing_log_bus.is_closed(sandbox_id),
+            "one absent sample must not arm a permanent tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_keeps_stream_when_the_record_still_exists() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-alive";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-alive",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+        let now = checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD;
+
+        ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect("a present record keeps the stream open");
+
+        assert!(!state.tracing_log_bus.is_closed(sandbox_id));
+        assert!(
+            !stream_state.should_recheck(now),
+            "the confirmed read restarts the cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_stream_recheck_survives_a_transient_store_failure() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-recheck-transient";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "recheck-transient",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut stream_state = LogStreamState::default();
+        let checked_at = std::time::Instant::now();
+        stream_state.mark_checked(checked_at);
+        let now = checked_at + LOG_STREAM_EXISTENCE_RECHECK_PERIOD;
+
+        // A failed read is not proof of absence: every later read fails too.
+        state.store.close().await;
+
+        ensure_log_stream_sandbox_exists(&state, &mut stream_state, sandbox_id, now)
+            .await
+            .expect("a store failure must not end the stream");
+        assert!(!state.tracing_log_bus.is_closed(sandbox_id));
+
+        ensure_log_stream_sandbox_exists(
+            &state,
+            &mut stream_state,
+            sandbox_id,
+            now + LOG_STREAM_EXISTENCE_RECHECK_PERIOD,
+        )
+        .await
+        .expect("the stream must survive to the next batch");
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_stream_ends_not_found_after_sandbox_delete() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-deleted";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-deleted",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let call =
+            tokio::spawn(async move { client.push_sandbox_logs(ReceiverStream::new(rx)).await });
+
+        let batch = |message: &str, millis: i64| PushSandboxLogsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            logs: vec![SandboxLogLine {
+                sandbox_id: sandbox_id.to_string(),
+                event_time: openshell_core::time::timestamp_from_millis(millis).ok(),
+                level: "INFO".to_string(),
+                target: "delete-test".to_string(),
+                message: message.to_string(),
+                source: "sandbox".to_string(),
+                fields: HashMap::new(),
+            }],
+        };
+
+        tx.send(batch("before delete", 1)).await.unwrap();
+        // Wait for the first batch to be ingested, so the second batch is the
+        // one that meets the tombstone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.tracing_log_bus.tail(sandbox_id, 10).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first batch must be ingested");
+
+        // What `cleanup_sandbox_state` does on the replica that serves the
+        // delete.
+        state.tracing_log_bus.close(sandbox_id);
+
+        tx.send(batch("after delete", 2)).await.unwrap();
+
+        let error = call
+            .await
+            .expect("client task must not panic")
+            .expect_err("a deleted sandbox must end its push stream");
+        assert_eq!(error.code(), Code::NotFound);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_probes_a_sandbox_record_once_per_validated_batch() {
+        use crate::otel_tracing::test_exporter;
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-seeded-recheck";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-seeded-recheck",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let call =
+            tokio::spawn(async move { client.push_sandbox_logs(ReceiverStream::new(rx)).await });
+
+        // Count the sandbox-record reads the handler makes. The first batch's
+        // scope check already fetched the record, so the recheck clock must be
+        // seeded from it: a second read in the same batch would double what
+        // every open stream pays at startup.
+        let traced = test_exporter::install_traced();
+
+        tx.send(PushSandboxLogsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            logs: vec![SandboxLogLine {
+                sandbox_id: sandbox_id.to_string(),
+                event_time: openshell_core::time::timestamp_from_millis(1).ok(),
+                level: "INFO".to_string(),
+                target: "seeded-recheck".to_string(),
+                message: "first batch".to_string(),
+                source: "sandbox".to_string(),
+                fields: HashMap::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.tracing_log_bus.tail(sandbox_id, 10).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first batch must be ingested");
+
+        let record_reads: Vec<_> = traced
+            .wait_for_spans(|spans| {
+                spans.iter().any(|span| {
+                    span.name == "store.get"
+                        && test_exporter::attribute(span, "object.id").as_deref()
+                            == Some(sandbox_id)
+                })
+            })
+            .await
+            .into_iter()
+            .filter(|span| {
+                span.name == "store.get"
+                    && test_exporter::attribute(span, "object.id").as_deref() == Some(sandbox_id)
+            })
+            .collect();
+        assert_eq!(
+            record_reads.len(),
+            1,
+            "a validated batch must read the sandbox record once, not twice: the \
+             scope check proves existence, so only the recheck-cadence seed prevents \
+             a duplicate read per open stream"
+        );
+
+        drop(tx);
+        call.await
+            .expect("client task must not panic")
+            .expect("closing the client stream ends the push cleanly");
+        server.abort();
+    }
+
+    #[test]
     fn sandbox_log_timestamp_validation_rejects_malformed_batches_atomically() {
         let logs = vec![
             SandboxLogLine {
@@ -8628,7 +9187,7 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800, 300_000);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
         state.store.put_message(&sandbox).await.unwrap();
         let instance_id = uuid::Uuid::new_v4().to_string();
@@ -8717,7 +9276,8 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(new_preparation_record(0, 1800, 300_000));
         state.store.put_message(&sandbox).await.unwrap();
         let error = handle_report_sandbox_configuration(
             &state,
@@ -8842,6 +9402,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9029,6 +9590,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9061,6 +9623,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9326,6 +9889,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -9374,6 +9938,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9438,6 +10003,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -9594,6 +10160,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9705,6 +10272,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -9774,6 +10342,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -11641,6 +12210,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "sb-b".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -11657,6 +12227,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "missing-sandbox".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -11695,6 +12266,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -11710,6 +12282,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -11927,6 +12500,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            ..Default::default()
         }));
         handle_get_sandbox_config(&state, req)
             .await
@@ -11942,15 +12516,15 @@ mod tests {
         }
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
-        let mut validated = None;
+        let mut stream_state = LogStreamState::default();
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _guard = capture.install();
 
-        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut stream_state)
             .await
             .expect("first frame should validate");
         assert!(capture.events().is_empty(), "own sandbox is not a denial");
-        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut stream_state)
             .await
             .expect_err("later frame must not switch sandbox ids");
 
@@ -11966,9 +12540,9 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
-        let mut validated = None;
+        let mut stream_state = LogStreamState::default();
 
-        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut stream_state)
             .await
             .expect_err("missing sandbox must not validate");
 
@@ -12163,6 +12737,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -12280,6 +12855,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -12305,6 +12881,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -12340,13 +12917,27 @@ mod tests {
             environment.provider_env_revision,
             second.provider_env_revision
         );
-        assert_eq!(environment.dynamic_credentials.len(), 2);
-        assert!(environment.dynamic_credentials.values().all(|credential| {
-            credential
-                .token_grant
-                .as_ref()
-                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
-        }));
+        let grants = environment
+            .dynamic_credentials
+            .values()
+            .filter_map(|credential| credential.token_grant.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(grants.len(), 2);
+        assert!(
+            grants
+                .iter()
+                .all(|grant| grant.token_endpoint.contains("revision-b"))
+        );
+        assert!(
+            environment
+                .dynamic_credentials
+                .iter()
+                .filter(|(key, _)| key.starts_with(
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ))
+                .all(|(_, credential)| credential.token_grant.is_none()
+                    && credential.token_grant_owners.is_empty())
+        );
 
         handle_submit_policy_analysis(
             &state,
@@ -12848,6 +13439,135 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn cedar_config_requires_supervisor_support_on_every_fetch() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy: Some(openshell_core::proto::CedarPolicy { source: "permit(principal, action == Sandbox::Action::\"NetworkConnect\", resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");".to_string() }),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-compat",
+                "cedar-compat",
+                policy,
+                vec![],
+            ))
+            .await
+            .unwrap();
+        for supported in [false, true, false] {
+            let result = handle_get_sandbox_config(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        name: "cedar-compat".to_string(),
+                        supported_capabilities: openshell_core::extension_protocol::capabilities_if(
+                            openshell_core::extension_protocol::POLICY_CEDAR_V1,
+                            supported,
+                        ),
+                        ..Default::default()
+                    }),
+                    "sb-cedar-compat",
+                ),
+            )
+            .await;
+            if supported {
+                assert!(
+                    !result
+                        .unwrap()
+                        .into_inner()
+                        .policy
+                        .unwrap()
+                        .cedar_source()
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+            }
+        }
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-yaml-compat",
+                "yaml-compat",
+                test_policy_with_rule("base", "api.example.com"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let legacy_yaml = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "yaml-compat".to_string(),
+                    supported_capabilities: Vec::new(),
+                    ..Default::default()
+                }),
+                "sb-yaml-compat",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(legacy_yaml.policy.unwrap().cedar_source().is_empty());
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                    .to_string(),
+            }),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-cedar-provider").await;
+
+        assert!(
+            effective_policy.network_policies.is_empty(),
+            "provider rules must not be composed into a Cedar policy"
+        );
+        let rule = effective_policy
+            .provider_credential_rules
+            .get("_provider_work_github")
+            .expect("provider rules travel in provider_credential_rules");
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_credentialed),
+            "credentialed endpoints must be stamped"
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
@@ -12911,6 +13631,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -13076,6 +13797,95 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn provider_attachment_credential_inspection_uses_latest_policy() {
+        for (creation_has_rule, updated_has_rule) in [
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, None),
+            (false, None),
+        ] {
+            let state = test_server_state().await;
+            state
+                .store
+                .put_message(&test_provider("work-github", "github"))
+                .await
+                .unwrap();
+            let policy = |has_rule| {
+                if has_rule {
+                    test_policy_with_rule("uninspected", "api.github.com")
+                } else {
+                    ProtoSandboxPolicy::default()
+                }
+            };
+            let creation_policy = policy(creation_has_rule);
+            let sandbox = test_sandbox(
+                "sb-attachment-inspection",
+                "attach-inspection",
+                creation_policy.clone(),
+                Vec::new(),
+            );
+            state.store.put_message(&sandbox).await.unwrap();
+
+            if let Some(has_rule) = updated_has_rule {
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: "attach-inspection".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy(has_rule)),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect("policy update without an attached provider must succeed");
+            }
+
+            let result = super::super::sandbox::handle_attach_sandbox_provider(
+                &state,
+                authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                    sandbox: "attach-inspection".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: "work-github".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let should_reject = updated_has_rule.unwrap_or(creation_has_rule);
+            if should_reject {
+                let error = result.expect_err("current uninspected rule must prevent attachment");
+                assert_eq!(error.code(), Code::FailedPrecondition);
+                assert!(error.message().contains("L4-only"));
+                assert!(error.message().contains("uninspected"));
+            } else {
+                assert!(
+                    result
+                        .expect("no current uninspected rule")
+                        .into_inner()
+                        .attached
+                );
+            }
+
+            let stored = state
+                .store
+                .get_message::<Sandbox>("sb-attachment-inspection")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec = stored.spec.unwrap();
+            assert_eq!(spec.policy, Some(creation_policy));
+            assert_eq!(
+                spec.providers,
+                if should_reject {
+                    Vec::<String>::new()
+                } else {
+                    vec!["work-github".to_string()]
+                }
+            );
+            state.store.close_for_test().await;
+        }
     }
 
     #[tokio::test]
@@ -13747,6 +14557,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -13890,6 +14701,9 @@ mod tests {
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
                     name: "invalid-legacy".to_string(),
+                    supported_capabilities: vec![
+                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                    ],
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
                 "sb-invalid-legacy",
@@ -14282,6 +15096,66 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                    .to_string(),
+            }),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-env",
+                "cedar-env",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-cedar-env".to_string(),
+                supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
+            })),
+        )
+        .await
+        .expect("provider environment must resolve for a Cedar sandbox")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        let binding = response
+            .static_credential_bindings
+            .get("GITHUB_TOKEN")
+            .expect("credential must stay bound to the provider's endpoints");
+        assert!(
+            binding
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
     #[tokio::test]
     async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
         let state = test_server_state().await;
@@ -14513,6 +15387,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -14638,6 +15513,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -14704,6 +15580,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -15306,6 +16183,7 @@ mod tests {
         let provider_names = vec!["replaceable".to_string()];
         let first_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -15364,6 +16242,7 @@ mod tests {
 
         let replacement_records = crate::grpc::provider::load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
             "default",
             &provider_names,
         )
@@ -15402,6 +16281,45 @@ mod tests {
                     })
                 }),
             "dynamic grants must change only after loading the replacement record"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_env_revision_ignores_unrelated_profile_import_and_delete() {
+        use crate::provider_profile_sources::stored_provider_profile;
+        use openshell_core::proto::ProviderProfile;
+
+        let store = test_store().await;
+        let mut provider = test_provider("work-github", "github");
+        provider.profile_workspace.clear();
+        store.put_message(&provider).await.unwrap();
+        let providers = ["work-github".to_string()];
+        let revision = || compute_provider_env_revision(&store, "default", &providers);
+        let before = revision().await.unwrap();
+
+        let mut unrelated = stored_provider_profile(ProviderProfile {
+            id: "unrelated".to_string(),
+            display_name: "Unrelated".to_string(),
+            ..Default::default()
+        });
+        unrelated.metadata.as_mut().unwrap().workspace = "default".to_string();
+        store.put_message(&unrelated).await.unwrap();
+        assert_eq!(
+            before,
+            revision().await.unwrap(),
+            "unrelated profile import"
+        );
+
+        assert!(
+            store
+                .delete(StoredProviderProfile::object_type(), unrelated.object_id())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            before,
+            revision().await.unwrap(),
+            "unrelated profile delete"
         );
     }
 
@@ -16010,6 +16928,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                ..Default::default()
             })),
         )
         .await
@@ -16205,7 +17124,7 @@ mod tests {
             chunks.push(chunk);
         }
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16221,7 +17140,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16341,7 +17260,7 @@ mod tests {
         .map(Option::unwrap)
         .collect::<Vec<_>>();
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16357,7 +17276,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16542,7 +17461,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -16556,7 +17475,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16573,7 +17492,7 @@ mod tests {
             "pending"
         );
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -16587,7 +17506,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16698,7 +17617,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16708,7 +17627,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16765,7 +17684,7 @@ mod tests {
             .await
             .unwrap();
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16775,7 +17694,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -21557,8 +22476,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-            assert_eq!(event["container"]["uid"], "sb-123");
-            assert!(event["container"].get("image").is_none());
+            assert_eq!(event["unmapped"]["sandbox_id"], "sb-123");
+            assert!(event.get("container").is_none());
+            assert!(event["device"].get("container").is_none());
+            assert_eq!(event["unmapped"]["sandbox_name"], "demo-sandbox");
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
         assert!(events[0]["unmapped"].get("auto").is_none());
@@ -21669,7 +22590,7 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
-        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["unmapped"]["sandbox_id"], "sb-reject-audit");
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
         assert_eq!(
             event["unmapped"]["rejection_reason"],
@@ -22656,6 +23577,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_cedar_policy() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(ProtoSandboxPolicy {
+                    version: 1,
+                    cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                        source: "permit(principal, \
+                        action == Sandbox::Action::\"NetworkConnect\", \
+                        resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                            .to_string(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a Cedar global policy must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Cedar"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_merge_operations_on_a_cedar_policy() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let cedar = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy: Some(openshell_core::proto::CedarPolicy {
+                source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                    .to_string(),
+            }),
+            ..Default::default()
+        };
+        let state = test_server_state().await;
+        // One sandbox whose baseline is Cedar, and one with no baseline whose
+        // current revision is Cedar.
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-merge",
+                "cedar-merge",
+                cedar.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let mut unbased =
+            test_sandbox("sb-cedar-revision", "cedar-revision", cedar.clone(), vec![]);
+        unbased.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&unbased).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "cedar-revision-1",
+                "sb-cedar-revision",
+                "default",
+                1,
+                &cedar.encode_to_vec(),
+                &deterministic_policy_hash(&cedar),
+            )
+            .await
+            .unwrap();
+
+        // Removing an absent rule would otherwise succeed without a change.
+        let remove_rule = PolicyMergeOperation {
+            operation: Some(policy_merge_operation::Operation::RemoveRule(
+                openshell_core::proto::RemoveNetworkRule {
+                    rule_name: "absent".to_string(),
+                },
+            )),
+        };
+        for (sandbox_id, sandbox) in [
+            ("sb-cedar-merge", "cedar-merge"),
+            ("sb-cedar-revision", "cedar-revision"),
+        ] {
+            let before = state.store.get_latest_policy(sandbox_id).await.unwrap();
+            let err = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    merge_operations: vec![remove_rule.clone()],
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("merging into a Cedar policy must be rejected");
+            assert_eq!(err.code(), Code::FailedPrecondition, "{sandbox}");
+            // A gateway without Cedar support refuses to read a stored Cedar
+            // revision before it reaches the merge.
+            assert!(
+                err.message().contains("openshell policy set")
+                    || (!cfg!(feature = "experimental")
+                        && sandbox == "cedar-revision"
+                        && err.message().contains("without Cedar policy support")),
+                "{sandbox}: {}",
+                err.message()
+            );
+            let after = state.store.get_latest_policy(sandbox_id).await.unwrap();
+            assert_eq!(
+                after.map(|record| record.version),
+                before.map(|record| record.version)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -22893,6 +23930,152 @@ mod tests {
 
         let settings = load_global_settings(state.store.as_ref()).await.unwrap();
         assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    /// A gateway built without Cedar serves no stored Cedar policy, and names
+    /// the stored policy it refused.
+    #[cfg(not(feature = "experimental"))]
+    #[test]
+    fn stored_cedar_policies_are_not_served_without_cedar_support() {
+        let status = validate_and_canonicalize_stored_policy(
+            crate::grpc::test_support::cedar_policy(),
+            STORED_POLICY_SOURCE_SPEC,
+        )
+        .expect_err("Cedar is unsupported");
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert!(
+            status.message().contains(STORED_POLICY_SOURCE_SPEC)
+                && status.message().contains("development build"),
+            "{status:?}"
+        );
+    }
+
+    /// A sandbox a Cedar-enabled gateway created fails closed on its own, so
+    /// it must not stop a gateway built without Cedar from starting or from
+    /// re-enabling provider composition, nor hide other sandboxes' errors.
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn provider_composition_checks_skip_a_cedar_sandbox_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                crate::grpc::test_support::cedar_policy(),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect("a stored Cedar sandbox must not block startup");
+        for request in [
+            UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global", "global.example.com")),
+                ..Default::default()
+            },
+            UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            },
+        ] {
+            handle_update_config(&state, with_user(Request::new(request)))
+                .await
+                .expect("a stored Cedar sandbox must not block global policy changes");
+        }
+
+        // Sorts after `cedar-provider`, so the Cedar sandbox is skipped first.
+        install_ambiguous_provider_binding(&state, "z-beside-cedar").await;
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("other sandboxes are still validated");
+        assert!(
+            error.message().contains("sandbox-z-beside-cedar"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn sandbox_policy_update_rejects_cedar_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-yaml",
+                "yaml",
+                test_policy_with_rule("base", "api.example.com"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "yaml".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(crate::grpc::test_support::cedar_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+    }
+
+    /// A user reading the config gets the reason; the sandbox's own supervisor
+    /// gets an unadmitted configuration with no policy, and fails closed.
+    #[cfg(not(feature = "experimental"))]
+    #[tokio::test]
+    async fn sandbox_config_is_not_served_for_a_stored_cedar_policy_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar",
+                "cedar",
+                crate::grpc::test_support::cedar_policy(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let request = || {
+            Request::new(GetSandboxConfigRequest {
+                name: "cedar".to_string(),
+                supported_capabilities: vec![
+                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                ],
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })
+        };
+
+        let error = handle_get_sandbox_config(&state, with_user(request()))
+            .await
+            .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), Code::FailedPrecondition, "{error:?}");
+        assert!(
+            error.message().contains(STORED_POLICY_SOURCE_SPEC)
+                && error.message().contains("without Cedar"),
+            "{error:?}"
+        );
+        let config = handle_get_sandbox_config(&state, with_sandbox(request(), "sb-cedar"))
+            .await
+            .expect("the supervisor receives an unadmitted configuration")
+            .into_inner();
+        assert!(!config.configuration_admitted, "{config:?}");
+        assert!(config.policy.is_none(), "{config:?}");
     }
 
     #[test]
@@ -23850,6 +25033,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-alpha",
         );
@@ -23863,6 +25047,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
+                ..Default::default()
             }),
             "sb-beta",
         );
@@ -25514,7 +26699,7 @@ mod tests {
             err.code()
         );
 
-        let err = handle_approve_all_draft_chunks(
+        let err = Box::pin(handle_approve_all_draft_chunks(
             &state,
             non_member_request(ApproveAllDraftChunksRequest {
                 sandbox: ("any").to_string(),
@@ -25523,7 +26708,7 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .unwrap_err();
         assert_eq!(
@@ -25647,6 +26832,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),
                 )),
+                ..Default::default()
             }),
         )
         .await

@@ -5,6 +5,9 @@ manifest plus prompt assets that the shared launcher turns into an OpenShell
 sandbox run. Agents do not own harness implementations. Harness-specific setup
 and execution live in `runtime/harnesses/<name>/`.
 
+Agent-specific bundles live in `.agents/agents/<name>/`; see the
+[agent layout](../../.agents/agents/README.md).
+
 ## Directory Layout
 
 ```text
@@ -47,7 +50,7 @@ sections:
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
   transient failure logging threshold.
 - `profile_paths`: ordered directories to scan for provider profile YAML files.
-- `settings`: gateway settings to apply before launch.
+- `settings`: sandbox-scoped settings to apply after the sandbox is created.
 - `providers`: provider instances to create or update, credential sources, and
   optional refresh configuration.
 - `skills`: files to inject into the sandbox payload.
@@ -82,20 +85,22 @@ Manifest paths support these prefixes:
 9. Query the gateway's compute driver, then build a temporary image context
    with its Docker or Podman image store. The image bakes the rendered payload
    into `/etc/openshell/agent-payload`.
-10. Apply manifest-declared gateway settings.
-11. Resolve provider profile IDs by scanning `profile_paths` in order.
-12. Import each provider profile into the gateway. If an active profile already
+10. Resolve provider profile IDs by scanning `profile_paths` in order.
+11. Import each provider profile into the gateway. If an active profile already
      exists, the launcher keeps going and uses it.
-13. Resolve provider credentials from host commands, JSON files, or literal
+12. Resolve provider credentials from host commands, JSON files, or literal
      manifest values.
-14. Create or update each provider instance and attach every selected provider
+13. Create or update each provider instance and attach every selected provider
      to the sandbox.
-15. Configure and rotate refresh-backed provider credentials when declared by
+14. Reuse or initialize refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from the resulting image reference, with the
+15. Run `openshell sandbox create` from the resulting image reference, with the
     runtime entrypoint persisted as the detached canonical main process.
-17. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
+16. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
     gateway to delete it after the canonical process exits.
+17. Apply manifest-declared settings to the new sandbox. The launcher never
+    changes gateway-global settings. A gateway-global value for the same key
+    takes precedence, and the launcher warns instead of overriding it.
 18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
 19. The runtime entrypoint starts
     `/etc/openshell/agent-payload/runtime/supervisor.sh`.
@@ -157,13 +162,12 @@ as each cycle can reconcile from that state.
 Use `--once` or `--watch` to override the manifest default. Use
 `--poll-interval <seconds>` to override the watch sleep interval.
 
-Refresh-backed providers are bootstrapped from manifest credential sources when
-no gateway refresh state exists. Later launches preserve gateway-owned refresh
-material and request a credential rotation first. If that rotation fails, the
-launcher treats the host credential source as a repair source, replaces the
-gateway refresh material, and retries rotation once. Use `--reset-refresh` to
-skip the preserve-first path and intentionally replace gateway refresh material
-from the host credential source before rotating.
+Refresh-backed providers are bootstrapped and rotated from manifest credential
+sources when no gateway refresh state exists. Later launches reuse gateway-owned
+refresh state without reading host refresh material or forcing rotation. Status,
+configuration, and rotation errors stop the launch; they never trigger automatic
+credential replacement. Use `--reset-refresh` to intentionally replace gateway
+refresh material from the host credential source and rotate once.
 
 Long-lived harnesses must not persist revision-scoped provider placeholders such
 as `openshell:resolve:env:v123_TOKEN` into files they reuse across refreshes.

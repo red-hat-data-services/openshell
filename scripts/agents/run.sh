@@ -34,7 +34,7 @@ usage() {
     cat <<'EOF'
 
 Options:
-  --agent NAME|PATH       Agent manifest directory or name under scripts/agents/
+  --agent NAME|PATH       Agent manifest directory or name under .agents/agents/
   --gateway NAME          Gateway name to use
   --name NAME             Sandbox name (DNS-1123 label, at most 19 characters)
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
@@ -189,7 +189,7 @@ case "$AGENT_ARG" in
         AGENT_DIR="$AGENT_ARG"
         ;;
     *)
-        AGENT_DIR="$SCRIPT_DIR/$AGENT_ARG"
+        AGENT_DIR="$ROOT_DIR/.agents/agents/$AGENT_ARG"
         ;;
 esac
 
@@ -492,6 +492,14 @@ configure_provider_refresh() {
     local credential_key="${!key_var}"
     local strategy="${!strategy_var}"
     local material_count="${!count_var}"
+    local status_output
+    if [[ "$RESET_REFRESH" != "1" ]]; then
+        status_output="$(openshell_cmd provider refresh status "$provider_name" --credential-key "$credential_key")" || return 1
+        if [[ "$status_output" != *"No refresh configuration found"* ]]; then
+            log "Reusing gateway refresh state for $provider_name/$credential_key. Use --reset-refresh to replace it from host auth."
+            return
+        fi
+    fi
     local args=(
         provider refresh configure "$provider_name"
         --credential-key "$credential_key"
@@ -523,25 +531,9 @@ configure_provider_refresh() {
         fi
     done
 
-    local status_output
-    local rotate_output
-    status_output="$(openshell_cmd provider refresh status "$provider_name" --credential-key "$credential_key" 2>&1 || true)"
-    if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
-        echo "Preserving existing gateway refresh state for $provider_name/$credential_key. Use --reset-refresh to replace it from host auth."
-    else
-        openshell_cmd "${args[@]}" >/dev/null
-        echo "Configured gateway refresh for $provider_name/$credential_key."
-    fi
-    if ! rotate_output="$(openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" 2>&1)"; then
-        if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
-            echo "Gateway refresh rotation failed; resetting $provider_name/$credential_key from host auth and retrying once." >&2
-            openshell_cmd "${args[@]}" >/dev/null
-            openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null
-        else
-            printf '%s\n' "$rotate_output" >&2
-            return 1
-        fi
-    fi
+    openshell_cmd "${args[@]}" >/dev/null || return 1
+    echo "Configured gateway refresh for $provider_name/$credential_key."
+    openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null || return 1
     echo "Rotated gateway refresh credential for $provider_name/$credential_key."
 }
 
@@ -735,13 +727,6 @@ if [[ "$BUILD_ONLY" == 1 ]]; then
     exit 0
 fi
 
-log "Configuring gateway settings."
-for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
-    key_var="SETTING_${setting_index}_KEY"
-    value_var="SETTING_${setting_index}_VALUE"
-    openshell_cmd settings set --global --key "${!key_var}" --value "${!value_var}" --yes >/dev/null
-done
-
 PROVIDER_ARGS=()
 for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); do
     name_var="PROVIDER_${provider_index}_NAME"
@@ -807,7 +792,7 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     fi
 
     if [[ "${!refresh_enabled_var}" == "true" ]]; then
-        log "Refreshing provider credential '$provider_name/${!refresh_key_var}'."
+        log "Preparing gateway refresh for '$provider_name/${!refresh_key_var}'."
         configure_provider_refresh "$provider_index"
     fi
     PROVIDER_ARGS+=(--provider "$provider_name")
@@ -864,3 +849,18 @@ run_agent_sandbox() {
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
 run_agent_sandbox
+
+# Scope manifest settings to this sandbox so launches never change gateway-wide
+# behavior for other users. The supervisor picks them up on its settings poll.
+# A failure leaves the gateway default (manual proposal approval) in effect, so
+# warn instead of tearing down the running sandbox.
+if ((SETTING_COUNT > 0)); then
+    log "Configuring sandbox settings."
+fi
+for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
+    key_var="SETTING_${setting_index}_KEY"
+    value_var="SETTING_${setting_index}_VALUE"
+    if ! openshell_cmd settings set "$SANDBOX_NAME" --key "${!key_var}" --value "${!value_var}" >/dev/null; then
+        log "warning: could not set '${!key_var}' on sandbox '$SANDBOX_NAME'; if the gateway manages it globally, the global value applies."
+    fi
+done

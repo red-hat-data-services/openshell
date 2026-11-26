@@ -22,8 +22,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/openshell-credential-issuer/` | Embedded credential issuer | Credential storage, built-in refresh execution/recovery/scheduling, typed secret owners, and existing driver transport |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
@@ -32,6 +32,11 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/openshell-policy-runtime-interface/` | Policy runtime interface | Engine-neutral decisions, request metadata, snapshots, and staged reload contracts |
+| `crates/openshell-policy-cedar/` | Cedar policy engine | Validation, Landlock/L7/DNS derivation, and evaluation for Cedar-authored sandbox policies; linked only with the gateway and supervisor `experimental` feature |
+| `crates/openshell-policy-cedar-schema/` | Cedar policy schema | Canonical Cedar schema and entity, action, and context names; linked only with the `experimental` feature |
+| `crates/openshell-policy-cedar-adapter/` | Cedar message adapter | Cedar analysis, filesystem grants, and endpoint inventory shared by gateway and runtime composition |
+| `crates/openshell-policy-cedar-runtime/` | Cedar runtime adapter | Implements the policy runtime contracts; selected by supervisor composition with the `experimental` feature |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -44,6 +49,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
+| `crates/openshell-spiffe/` | SPIFFE identity types | Dependency-light SPIFFE ID mapping, claim parsing, and the sandbox identity provider interface |
+| `crates/openshell-spire/` | SPIRE adapter | Gateway-owned SPIFFE Broker API client that issues and verifies stable sandbox JWT-SVIDs |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
 | `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
 | `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
@@ -52,8 +59,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| [`crates/openshell-driver-mxc/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | Native Windows ProcessContainer backend; see the Windows branch for the maintained implementation |
-| [`crates/openshell-mxc-boundary/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Dedicated Windows workload boundary paired with the host supervisor |
+| [`crates/openshell-driver-mxc/`](https://github.com/ai-openshell/openshell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | Native Windows ProcessContainer backend; see the Windows branch for the maintained implementation |
+| [`crates/openshell-mxc-boundary/`](https://github.com/ai-openshell/openshell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Dedicated Windows workload boundary paired with the host supervisor |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
@@ -61,8 +68,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
-| `python/openshell/` | Python SDK | Python bindings and CLI packaging |
-| `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
+| `python/openshell/` | Python SDK (frozen) | Moved to ai-openshell/sdk-python; kept until removal |
+| `sdk/typescript/` | TypeScript SDK stub (deprecated) | `@nvidia/openshell-sdk` re-exports `@ai-openshell/sdk` from ai-openshell/sdk-typescript |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
 | `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
@@ -71,7 +78,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
+| `.agents/agents/` | Agents | Agent runtimes; see [layout](.agents/agents/README.md) |
 
 ## Public API Conventions
 
@@ -153,6 +160,7 @@ ocsf_emit!(event);
 
 - `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
+- In `openshell-supervisor-network`, the inspected request scope automatically correlates all OCSF records at emission, including findings, and uses the request span without creating a denial-only span. Emit through `crate::telemetry::egress_emit!` or `crate::telemetry::emit_decision`; Clippy rejects direct `ocsf_emit!` calls there.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
@@ -169,6 +177,10 @@ ocsf_emit!(event);
   `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
   already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
   when dialing.
+- Clippy rejects raw `TcpStream::connect` (`clippy.toml`). Dial with
+  `openshell_core::net::connect_tcp_nodelay_best_effort`, or
+  `connect_std_tcp_nodelay_best_effort` on blocking threads. The lint does not
+  cover accepted sockets, so keep setting nodelay on those by hand.
 - This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
   behavior, not wire latency.
 - You should skip it for unix domain sockets (no Nagle). It's not critical for
@@ -183,6 +195,8 @@ Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-
 
 Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
 
+Create PRs with `gh pr create`, which enables "Allow edits by maintainers" by default; never pass `--no-maintainer-edit`. Review Readiness fails a ready PR from a personal fork when that setting is off. Fix a PR that lacks it with `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -F maintainer_can_modify=true`.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
@@ -191,22 +205,14 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
-## Go SDK (`sdk/go/`)
+## Go SDK
 
-- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
-- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
-- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
-- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
-- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
-- Tests use bufconn for in-process gRPC and testify for assertions.
+- The Go SDK lives in [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes, including dependency and security updates, there; proto changes here need no Go bindings.
 
-## TypeScript SDK (`sdk/typescript/`)
+## Python SDK (`python/openshell/`)
 
-- Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
-- Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
-- Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
-- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
-- The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
+- The Python SDK moved to [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), which publishes `openshell` to PyPI. Open SDK changes there.
+- `python/` and the SDK build script `tasks/scripts/generate_python_proto.py` are frozen until core removes them; Branch Checks fails PRs that change them. Put tests for core Python scripts next to the scripts, not under `python/`.
 
 ## Python
 

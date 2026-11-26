@@ -18,15 +18,15 @@
 # `deploy/konflux/e2e-odh/sync-generic-fetcher.py --update all` to refresh the
 # amd64 and arm64 checksums.
 # renovate: datasource=docker depName=quay.io/openshift-release-dev/ocp-release extractVersion=^(?<version>4\.\d+\.\d+)-x86_64$
-ARG OC_VERSION=4.22.21
+ARG OC_VERSION=4.22.22
 # renovate: datasource=github-releases depName=helm/helm extractVersion=^v(?<version>.+)$
 ARG HELM_VERSION=4.3.1
 # renovate: datasource=github-releases depName=nextest-rs/nextest extractVersion=^cargo-nextest-(?<version>.+)$
-ARG NEXTEST_VERSION=0.9.150
+ARG NEXTEST_VERSION=0.9.151
 # renovate: datasource=github-releases depName=astral-sh/uv
-ARG UV_VERSION=0.13.6
+ARG UV_VERSION=0.13.7
 
-FROM registry.redhat.io/rust-builder-image/rust-rhel9:1.99.1@sha256:afb5e1bea3e60edbb8473c3e34c23fefd9b32a8c0ba17ebfe95a0758448043b6 AS builder
+FROM registry.redhat.io/rust-builder-image/rust-rhel9:1.99.1@sha256:cf69dc550002a80c8af670bf9ca3068ed6c9ddc8d94fd99513b06ecaac297921 AS builder
 
 # The builder image runs as 1001 and already ships gcc, gcc-c++, make,
 # cmake, openssl-devel, git and tar. Install Python for the locked E2E test
@@ -53,6 +53,7 @@ COPY .cargo/ .cargo/
 COPY .config/ .config/
 COPY crates/ crates/
 COPY proto/ proto/
+COPY tests/policy-conformance/ tests/policy-conformance/
 COPY python/ python/
 COPY providers/ providers/
 COPY examples/ examples/
@@ -81,9 +82,9 @@ COPY odh/requirements.txt /tmp/requirements.txt
 RUN uv venv --python python3.11 /opt/odh-e2e-venv && \
     uv pip install --python /opt/odh-e2e-venv/bin/python --no-index --require-hashes \
         --find-links /cachi2/output/deps/pip -r /tmp/requirements.txt
-RUN /opt/odh-e2e-venv/bin/python tasks/scripts/generate_python_proto.py
+RUN PATH=/opt/odh-e2e-venv/bin:$PATH /opt/odh-e2e-venv/bin/python tasks/scripts/generate_python_proto.py
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8-1793580630@sha256:8f989cc9270da6abec0144c22846ed1e6e92e462dc7768ce0981c4ac1d574733
+FROM registry.access.redhat.com/ubi9/ubi:9.8-1794186345@sha256:87f66688da4e206d5a1877088626c542288a5ccd97898cf363b588d57817e6be
 
 ARG OC_VERSION
 ARG HELM_VERSION

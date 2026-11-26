@@ -81,6 +81,14 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+Creates retry while the gateway mutation lock is busy. The CLI retries for up
+to 60 seconds by default, backing off from the gateway's suggested delay to a
+10-second ceiling and making at most five create attempts, and prints its
+progress to stderr. Change the budget with `--create-retry-timeout SECONDS` or
+`OPENSHELL_CREATE_RETRY_TIMEOUT`, or pass `--no-create-retry` to fail on the
+first busy reply. Only a `MUTATION_LOCK_TIMEOUT` failure retries; every other
+failure stops the command.
+
 An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and reports the command's exit
 status after output drains. A failure to deliver output makes the CLI report a
@@ -149,6 +157,23 @@ the provider profile. Use `profile export` to inspect that boundary
 when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
+
+Usable credential placement is enforced automatically when both gateway and
+supervisor support it. `credential_placement_mismatch` means a placeholder is
+outside its declared header, query parameter, or path-template slot. Match the
+profile. Explicit body/WebSocket rewrite policies retain their documented
+behavior for ordinary credentials. Without placement metadata, a supporting
+supervisor permits only `Authorization` and those explicit rewrite policies;
+malformed metadata is rejected. For custom headers, query parameters, or path
+slots, update the imported profile with explicit placement and upgrade the
+gateway before the supervisor. Older gateways cannot forward placement metadata;
+older supervisors retain their previous behavior. Updating example YAML does not
+update an imported profile. Check provider readiness after changing placement and
+launch a new process if retained references were revoked. For path-based APIs
+that use one token across multiple methods, select `auth_style: path_subtree`
+and set `path_template` to the base path, such as `/bot{credential}`. This
+authorizes the base and its descendants at the bound endpoint. With
+`auth_style: path`, the template matches exactly, including literal stars.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
@@ -232,6 +257,31 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
+
+For GitHub App installations, check installed refresh help for
+`github-app-installation` and read the
+[provider profile documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#github-app-installation-tokens).
+Use explicit repository IDs and permissions, keep the app private key in secret
+refresh material, and check refresh status before attaching the provider. Token
+permissions do not grant API writes or Git push through a read-only sandbox policy.
+Use `--material-secret private_key=NAME` to reference a workspace secret; allow
+the concrete installation token endpoint when creating it. Updating that secret
+applies at the next refresh without reconfiguration. Inline key or scope
+replacement withdraws the old token from gateway delivery. After reconfiguring,
+rotate and restart processes holding the old workload handle.
+Use one refresh configuration for the GitHub App token credential. The logical
+name selects its configured environment alias; use status without a credential
+filter and exact-key deletion to clean up legacy alias conflicts. Clear any
+static sibling alias before configuring refresh. For `gh` on GitHub Enterprise
+Server, declare and configure `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`.
+
+Do not infer GitHub App installation access from `GITHUB_TOKEN` or `GH_TOKEN`.
+These aliases also carry personal access and OAuth tokens. Choose the provider
+profile for the user's authentication method: existing tokens use static provider
+setup, while App installations use `--runtime-credentials` followed by refresh
+configuration. A static installation token does not rotate automatically.
+
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only
@@ -313,11 +363,18 @@ Key flags:
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after main output and the exit result drain
+- `--create-retry-timeout SECONDS`: Keep retrying while the gateway mutation lock is busy for this many seconds (default 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`); at most five create attempts are made, with the delay backing off to 10 seconds. The budget bounds the waits between attempts; the attempt in flight when it runs out can still wait the gateway's 10-second lock budget before the final answer
+- `--no-create-retry`: Fail immediately instead of retrying a busy gateway mutation lock
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
 If the driver rejects foreground attachment during create validation, use `--detach`.
+
+A named create that hits `ALREADY_EXISTS` while the previous sandbox with that
+name is still being deleted or is still being created waits for cleanup and
+retries within the same budget. A live sandbox holding the name is reported
+immediately.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
@@ -570,16 +627,22 @@ complete the published
 [activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
 before enabling `enable_sandbox_updates`. Keep it false during a rolling
 upgrade and never enable it merely to bypass a failed compatibility check.
-After activation, image, command, and environment updates initially support only
-stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED` for those
-fields. Metadata-only updates also support stopped sandboxes on other drivers. Stop and
+After activation, stopped Kubernetes sandboxes support image, command, and
+environment updates. Docker supports image-only updates for workspaces created
+with the driver's opt-in `persist_workspace` setting: both images must be cached,
+the target must declare a numeric `USER UID:GID` matching the recorded non-root
+identity, and neither image may declare volumes. Existing Docker writable-layer
+workspaces are not migrated; command and environment updates remain unsupported.
+Other drivers return `UNIMPLEMENTED` for configuration fields. Metadata-only
+updates also support stopped sandboxes on other drivers. Stop and
 wait for `Stopped`, read the sandbox's current resource version through
 `GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
 selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
 success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
 clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
-curated SDK update method. The sandbox identity, Kubernetes
-custom resource, and persistent volume claim remain; the existing workspace is
+curated SDK update method. The sandbox identity and persistent workspace remain;
+Kubernetes retains its custom resource and PVC, while Docker replaces the stopped
+workload container and retains its owned `/sandbox` volume. The existing workspace is
 not reseeded and trusted runtime images do not change. Omitted update fields are
 unchanged; supplied lists and maps replace their user-owned values, including
 explicitly empty values. Template environment defaults still apply. System metadata
@@ -620,7 +683,7 @@ repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
 during this initial repair. A previously activated sandbox retains static-field
 restrictions while restart admission is pending or rejected.
-Before the gateway's 300-second repair window expires, successful validation
+Before the gateway's configured repair window expires (300 seconds by default), successful validation
 completes startup in place. Effective stored configuration changes and their
 first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
@@ -656,6 +719,10 @@ Create sandbox with initial policy
         ▼                          │
   Verify reload succeeded ─────────┘
 ```
+
+Validate an authored policy offline with `openshell policy lint policy.yaml`
+before creating or updating a sandbox. Gateway-dependent provider, middleware
+registration, image and driver checks are deferred until application.
 
 ### Step 1: Create sandbox with initial policy
 
@@ -925,7 +992,12 @@ openshell sandbox exec work-session -- <client-command>
 The application owns the native base URL, model, request shape, and timeout.
 Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
 
-For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+For an ordinary static provider update, wait for the update and launch a new
+client process to obtain the new reference. Readiness does not update an
+existing process's environment or guarantee that it uses the replacement value.
+See [Runtime Limitations](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles#runtime-limitations)
+for retained revision and stable-placeholder behavior. Acknowledged detach
+revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 
@@ -1008,13 +1080,16 @@ openshell sandbox create \
   --detach \
   -- ./start-server.sh
 
-# Expose and manage an HTTP service through the gateway.
+# Expose and manage a named HTTP service.
 openshell service expose my-app 8080 web \
   --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
+
+# Expose a service that listens for cleartext HTTP/2, such as native gRPC.
+openshell service expose my-app 50051 agent --backend-http-version 2
 ```
 
 Use `openshell service list --all-workspaces` for a Platform Admin view across
@@ -1024,6 +1099,8 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+An HTTP/2 backend requires the supervisor application listener. Clients use the
+application URL with HTTP/2 over TLS.
 
 Exposed services strip `Authorization` by default. Select
 `bearer-passthrough` only when the application inside the sandbox authenticates
@@ -1032,9 +1109,10 @@ one non-empty Bearer credential and forwards that value unchanged. It rejects
 duplicate, malformed, or non-Bearer authorization before contacting the
 application. The application remains responsible for validating the token, and
 the raw token reaches the sandbox process, so never log it. Service routes
-bypass control-plane RPC authorization, but they still use the gateway's
-existing listener, domain routing, and TLS configuration, including any client
-certificate requirement. See the published
+bypass control-plane RPC authorization. Gateway service URLs use the gateway's
+listener and TLS configuration, including any client certificate requirement.
+The supervisor application listener uses application or ingress authentication.
+See the published
 [sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for the complete security contract.
 
