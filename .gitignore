@@ -146,10 +146,13 @@ tramp
 # =============================================================================
 
 # Local agent state and configuration
+/docs/superpowers/
 .codex/
 .pi/
-.claude/settings.local.json
-.claude/worktrees/
+# Track only the link Claude Code needs to find `.agents/skills`.
+.claude/*
+!.claude/skills
+.opencode/
 
 # =============================================================================
 # OS
@@ -190,7 +193,7 @@ temp/
 e2e/gpu/images/.build/
 
 # Ansible Galaxy roles
-/tests/ansible/.roles/
+/tests/tmachine/ansible/.roles/
 
 # Secrets/credentials (should never be committed)
 *.pem
@@ -249,3 +252,7 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# Local triage-duty reports, checkpoint, actions, and inbox
+/.agents/triage-duty/
+.opencode-memory.md

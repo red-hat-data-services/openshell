@@ -43,6 +43,31 @@ render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
+# Disabling metrics must remove even a raw listener override. Re-enabling
+# with the same retained port must produce a loader-valid custom listener.
+render "${work_dir}/metrics-disabled.yaml" \
+  --set metrics.enabled=false \
+  --set service.metricsPort=19090 \
+  --set-string 'gatewayConfig.openshell\.gateway.metrics_bind_address=0.0.0.0:29090'
+extract_toml "${work_dir}/metrics-disabled.yaml" "${work_dir}/metrics-disabled.toml"
+preflight "${work_dir}/metrics-disabled.toml"
+if grep -Fq 'metrics_bind_address' "${work_dir}/metrics-disabled.toml"; then
+  echo "disabled metrics must not leave a runtime listener configured" >&2
+  exit 1
+fi
+render "${work_dir}/metrics-enabled.yaml" \
+  --set metrics.enabled=true --set service.metricsPort=19090
+extract_toml "${work_dir}/metrics-enabled.yaml" "${work_dir}/metrics-enabled.toml"
+preflight "${work_dir}/metrics-enabled.toml"
+grep -F 'metrics_bind_address = "0.0.0.0:19090"' "${work_dir}/metrics-enabled.toml" >/dev/null
+
+# Explicit app ingress must survive both template rendering and driver
+# preflight; child options cannot extend a sealed TOML inline table.
+render "${work_dir}/app-listener.yaml" \
+  --values "${chart}/ci/values-app-listener.yaml"
+extract_toml "${work_dir}/app-listener.yaml" "${work_dir}/app-listener.toml"
+preflight "${work_dir}/app-listener.toml"
+
 # Exercise all serializer shapes through a raw driver table and prove that
 # literal strings, TOML escaping, and null omission survive parsing.
 render "${work_dir}/shapes.yaml" --values "${fixture}"
@@ -108,6 +133,46 @@ for values in "${chart}"/ci/values-*.yaml; do
   render "${work_dir}/${name}.yaml" --values "${values}"
   extract_toml "${work_dir}/${name}.yaml" "${work_dir}/${name}.toml"
   preflight "${work_dir}/${name}.toml"
+done
+
+# Shared supervisor pool limits: the chart's range ends and the large-cluster
+# profile must pass the Rust loader, and the loader must refuse values the
+# chart would never render.
+supervisor_topology='gatewayConfig.openshell\.drivers\.kubernetes.supervisor_topology=gateway'
+for limits in "1 1" "128 32" "1024 500"; do
+  read -r instances members <<<"${limits}"
+  name="pool-${instances}-${members}"
+  render "${work_dir}/${name}.yaml" --set-string "${supervisor_topology}" \
+    --set supervisor.replicas=1 \
+    --set supervisor.pool.maxInstancesPerMember="${instances}" \
+    --set supervisor.pool.maxMembersPerGateway="${members}"
+  extract_toml "${work_dir}/${name}.yaml" "${work_dir}/${name}.toml"
+  preflight "${work_dir}/${name}.toml"
+  grep -Fx "max_instances_per_member = ${instances}" "${work_dir}/${name}.toml" >/dev/null
+  grep -Fx "max_members_per_gateway = ${members}" "${work_dir}/${name}.toml" >/dev/null
+done
+render "${work_dir}/scale-10k.yaml" \
+  --values "${chart}/values-scale-10k.yaml" --set server.externalDbSecret=parser-database
+extract_toml "${work_dir}/scale-10k.yaml" "${work_dir}/scale-10k.toml"
+preflight "${work_dir}/scale-10k.toml"
+pool_with() {
+  local line="$1"
+  grep -v "^${line%% =*} = " "${work_dir}/pool-128-32.toml" \
+    | awk -v line="${line}" '{ print } /^\[openshell\.gateway\.supervisor_pool\]$/ { print line }' \
+      >"${work_dir}/pool-edited.toml"
+}
+for valid in "max_instances_per_member = 64" "max_members_per_gateway = 8"; do
+  pool_with "${valid}"
+  preflight "${work_dir}/pool-edited.toml"
+done
+for invalid in "max_instances_per_member = 0" "max_instances_per_member = 1025" \
+  "max_members_per_gateway = 0"; do
+  pool_with "${invalid}"
+  if preflight "${work_dir}/pool-edited.toml" >"${work_dir}/pool-edited.err" 2>&1; then
+    echo "the gateway loader accepted ${invalid}" >&2
+    exit 1
+  fi
+  grep -F 'category=malformed' "${work_dir}/pool-edited.err" >/dev/null
 done
 
 echo "rendered gateway TOML passed Rust loader validation"

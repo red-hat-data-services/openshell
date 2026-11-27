@@ -15,7 +15,11 @@ The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft,
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
-Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
+Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, Release, and Pre-release image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
+
+Stable Release builds retain images and attestations in OCI archive artifacts.
+Publication copies every platform and attestation to GHCR with preserved digests,
+then runs the SBOM verification before updating `latest`.
 
 ## Prerequisites
 
@@ -27,14 +31,14 @@ Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SL
 BuildKit uses its default Syft scanner and attaches one SPDX document per platform. Read one without pulling the image:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest \
+docker buildx imagetools inspect quay.io/ai-openshell/gateway:latest \
   --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
 ```
 
 Validate the final attestation, requiring a Cargo package for an auditable image:
 
 ```bash
-tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --require-cargo
+tasks/scripts/verify-image-sbom.sh quay.io/ai-openshell/gateway:latest --require-cargo
 ```
 
 ## Inspecting an Auditable Image Binary

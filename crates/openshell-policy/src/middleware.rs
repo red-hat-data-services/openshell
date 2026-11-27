@@ -179,6 +179,26 @@ where
     Ok(violations)
 }
 
+/// Parse one middleware selector pattern. Selectors match hostnames on every
+/// port, so a `host:port` pattern would parse as a hostname that never matches
+/// and silently leave the entry unselected. The only pattern that may contain
+/// `:` is a complete IPv6 address without brackets, such as `2001:db8::1`.
+/// IPv6 globs are rejected: `cafe:*` cannot be told apart from a mistyped
+/// `host:port`.
+fn selector_pattern(pattern: &str) -> Result<HostPattern, String> {
+    if pattern.contains(':') && pattern.parse::<std::net::Ipv6Addr>().is_err() {
+        let reason = if pattern.starts_with('[') {
+            "write IPv6 addresses without brackets"
+        } else {
+            "':' is only allowed in a complete IPv6 address"
+        };
+        return Err(format!(
+            "{reason}; selectors match hosts on every port and cannot include one"
+        ));
+    }
+    HostPattern::new(pattern)
+}
+
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
     let mut violations = Vec::new();
     let mut orders = BTreeMap::new();
@@ -249,7 +269,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
         }
         let mut selector_valid = !selector.include.is_empty();
         for pattern in selector.include.iter().chain(&selector.exclude) {
-            if let Err(reason) = HostPattern::new(pattern) {
+            if let Err(reason) = selector_pattern(pattern) {
                 selector_valid = false;
                 violations.push(PolicyViolation::InvalidMiddlewareConfig {
                     name: name.clone(),
@@ -284,6 +304,22 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                         host: endpoint.host.clone(),
                     });
                 }
+            }
+        }
+        // A Cedar policy's `tls: skip` comes from its endpoint settings.
+        for setting in &policy.endpoint_settings {
+            let overlaps_tls_skip = requires_inspection
+                && setting.tls == NetworkTlsMode::Skip as i32
+                && compiled_selector.as_ref().is_some_and(|selector| {
+                    HostPattern::new(&setting.host)
+                        .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))
+                });
+            if overlaps_tls_skip {
+                violations.push(PolicyViolation::MiddlewareTlsSkipConflict {
+                    middleware_name: name.clone(),
+                    policy_name: "endpoint_settings".to_string(),
+                    host: setting.host.clone(),
+                });
             }
         }
     }

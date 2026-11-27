@@ -68,9 +68,54 @@ pub fn matches(pattern: &str, path: &str) -> bool {
     EndpointPathPattern::new(pattern).matches(path)
 }
 
+/// Rank an endpoint path pattern as the L7 relay ranks the patterns matching
+/// one request: the pattern with the most characters other than `*` is the
+/// most specific. The empty pattern ranks lowest.
+#[must_use]
+pub fn path_specificity(pattern: &str) -> usize {
+    pattern.chars().filter(|c| *c != '*').count()
+}
+
+/// Select the most specific matching endpoint, retaining the last match on ties.
+///
+/// Specificity counts non-asterisk characters in the endpoint's path selector.
+/// Callers filter candidates for protocol and connection eligibility first.
+#[must_use]
+pub fn select_most_specific<'a, T: 'a>(
+    endpoints: impl IntoIterator<Item = &'a T>,
+    path: &str,
+    selector: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    endpoints
+        .into_iter()
+        .filter(|endpoint| matches(selector(endpoint), path))
+        .max_by_key(|endpoint| path_specificity(selector(endpoint)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EndpointPathPattern, matches};
+    use super::{EndpointPathPattern, matches, select_most_specific};
+
+    #[test]
+    fn route_selection_preserves_specificity_and_ties() {
+        let endpoints = [
+            ("rest", ""),
+            ("graphql", "/unrelated/exact"),
+            ("json-rpc", "/services/**"),
+            ("mcp", "/services/tools/**"),
+            ("mcp-last", "/services/tools/**"),
+        ];
+        for (path, protocol) in [
+            ("/public", "rest"),
+            ("/services", "json-rpc"),
+            ("/services/tools/read", "mcp-last"),
+            ("/unrelated/exact", "graphql"),
+        ] {
+            let selected = select_most_specific(&endpoints, path, |endpoint| endpoint.1).unwrap();
+            assert_eq!(selected.0, protocol, "route {path}");
+        }
+        assert!(select_most_specific(&endpoints[1..], "/public", |endpoint| endpoint.1).is_none());
+    }
 
     #[test]
     fn matches_canonical_endpoint_patterns() {

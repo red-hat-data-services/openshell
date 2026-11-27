@@ -1,0 +1,228 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: supervisor gateway wiring
+templates:
+  - templates/certgen.yaml
+  - templates/peer-role.yaml
+  - templates/statefulset.yaml
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: accepts a cluster-scoped Broker peer prefix
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id_prefix: spiffe://example.org/spire/agent/k8s_psat/cluster
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true
+  - it: refuses ambiguous Broker peer policies
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/agent/node
+          server_spiffe_id_prefix: spiffe://example.org/agent
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix
+  - it: issues no extra PKI for the shared supervisor
+    template: templates/certgen.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: certgen
+        documentIndex: 3
+  - it: needs no hook for the shared supervisor when the gateway PKI is external
+    template: templates/certgen.yaml
+    set:
+      pkiInitJob:
+        enabled: false
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: lets the gateway read only the shared supervisor Service
+    template: templates/peer-role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+            resourceNames:
+              - openshell-supervisor
+            verbs:
+              - get
+        documentIndex: 0
+  - it: lets the gateway replace only the supervisor token in its Secret
+    template: templates/peer-role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - secrets
+            resourceNames:
+              - openshell-supervisor-token
+            verbs:
+              - get
+              - patch
+        documentIndex: 0
+  - it: grants no supervisor Secret access without the topology
+    template: templates/peer-role.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - secrets
+            resourceNames:
+              - openshell-supervisor-token
+            verbs:
+              - get
+              - patch
+        documentIndex: 0
+  - it: keeps the supervisor token Secret off the gateway
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: supervisor-token
+            secret:
+              secretName: openshell-supervisor-token
+  - it: rejects shared supervisor SPIFFE configuration without a broker
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - failedTemplate:
+          errorMessage: "shared supervisor SPIFFE grants require spiffe_broker; remove provider_spiffe_workload_api_socket_path from the shared supervisor"
+  - it: uses only the Workload API CSI mount for broker identity
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          endpoint: https://spire-broker.spire.svc:8443
+          server_spiffe_id: spiffe://example.org/spire/agent/node
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - notExists:
+          path: spec.template.spec.securityContext.supplementalGroups
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true
+  - it: injects the node address for node-local Broker transport
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          spiffe_id_prefix: spiffe://example.org/openshell
+          node_local_port: 8443
+          server_spiffe_id_prefix: spiffe://example.org/spire/agent/k8s_psat/cluster
+          workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+      - notExists:
+          path: spec.template.spec.volumes[*].hostPath
+  - it: rejects ambiguous Broker endpoint selection
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          endpoint: https://broker:8443
+          node_local_port: 8443
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker requires exactly one of endpoint and node_local_port
+  - it: rejects an invalid node-local Broker port
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          node_local_port: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker.node_local_port must be between 1 and 65535
+  - it: rejects a quoted node-local Broker port before gateway startup
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_broker:
+          node_local_port: "8443"
+    asserts:
+      - failedTemplate:
+          errorMessage: spiffe_broker.node_local_port must be between 1 and 65535

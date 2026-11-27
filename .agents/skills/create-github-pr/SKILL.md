@@ -13,9 +13,30 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- Every PR must close an existing issue, except automated dependency updates as described in `CONTRIBUTING.md`. Follow Branch Names in `CONTRIBUTING.md` for contributor branch names.
+- Every PR must close an existing issue, except automated dependency updates and build or flaky-test fixes from authors with write access, as described in `CONTRIBUTING.md`. Follow Branch Names in `CONTRIBUTING.md` for contributor branch names.
 
 ## Before Creating a PR
+
+### Verify Contributor Access and Issue Acceptance
+
+Before pushing or creating a PR (including a draft), verify the author's access
+to the target repository, not their fork. For the authenticated `gh` user:
+
+```bash
+gh repo view OWNER/REPO --json nameWithOwner,viewerPermission
+gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
+```
+
+Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
+`state:accepted`; keep the issue link. Do not add access or acceptance evidence
+to the PR description. Everyone else
+must link at least one target-repository issue and have `state:accepted` on each.
+Otherwise, preserve local work and report which issue needs acceptance. A direct
+request, roadmap placement, or other labels do not bypass this gate.
+
+When acting for another author, verify their permissions. Resolve failed lookups
+before proceeding; retry sandbox network failures outside the sandbox before
+reporting an authentication problem.
 
 ### Check Config Documentation
 
@@ -106,7 +127,7 @@ gh pr create --title "PR title" --body "PR description"
 
 ### Link to an Issue
 
-Every PR except an automated dependency update must close its own issue. Verify that the issue exists, remains open, and covers the PR scope. Automated dependency updates follow the exception in `CONTRIBUTING.md`. Use `Closes #<issue-number>` in the body so merge closes it:
+Every PR must close its own issue, except automated dependency updates and build or flaky-test fixes from authors with write access; both follow the exceptions in `CONTRIBUTING.md`. A PR without an issue describes the failure it fixes in the Related Issue section. Otherwise, verify that the issue exists, remains open, and covers the PR scope. Use `Closes #<issue-number>` in the body so merge closes it:
 
 ```bash
 gh pr create \
@@ -124,7 +145,7 @@ Closes #123
 - Return 400 instead of 500"
 ```
 
-If the work needs multiple PRs, create a separate closable issue for each PR. A higher-level tracking issue may link the component issues, but no PR should close that tracking issue until all its work is complete. Follow `SECURITY.md` for vulnerability disclosure. First-time external contributors must be vouched before their PRs are accepted; the vouch check may close unvouched PRs. Check the current vouch process before opening a PR for an external contributor.
+If the work needs multiple PRs, create a separate closable issue for each PR. A higher-level tracking issue may link the component issues, but no PR should close that tracking issue until all its work is complete. Follow `SECURITY.md` for vulnerability disclosure.
 
 ### Create as Draft
 
@@ -156,6 +177,9 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ## Changes
 <!-- Bullet list of key changes -->
 
+## Release Notes
+<!-- Optional: a few short, easy-to-read sentences about the user-facing change -->
+
 ## Testing
 <!-- What testing was done? -->
 - [ ] Checks appropriate to the affected code and behavior pass
@@ -168,6 +192,8 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ```
 
 Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
+Keep the Release Notes section concise, with only a few easy-to-read sentences.
+Leave it empty when the summary already captures the user-facing change.
 
 ## Example PR (Complete)
 
@@ -188,6 +214,10 @@ Closes #456
 - Added `page_size` and `page_token` fields to the sandbox list API call
 - Default page size is 100, max is 1,000
 - Structured responses include `next_page_token`
+
+## Release Notes
+
+Sandbox list results can now be paged through with `--page-size` and `--page-token`.
 
 ## Testing
 
@@ -216,15 +246,31 @@ EOF
 | `--head, -H`        | Source branch (default: current)           |
 | `--web`             | Open in browser after creation             |
 
+## Labels
+
+Apply exactly one `area:` label and any relevant `topic:` labels. Choose them from
+the `### area:*` and `### topic:*` headings in `REVIEWERS.md`, reading each
+section's description against the files you changed. Do not choose from
+`gh label list`: it contains legacy labels such as `area:gateway` that have no
+reviewer roster, so they request no reviewers.
+
 ## After Creating
 
 The command outputs the PR URL and number.
+
+Rerun `PR Issue Acceptance` after linked issue labels change; it does not refresh
+automatically on issue-label events.
 
 **Display the URL using markdown link syntax** so it's easily clickable:
 
 ```
 Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 ```
+
+Follow the shared [accepted-work definition](../../../CONTRIBUTING.md#accepted-work)
+and [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
+when applying classification labels. Review-readiness applies the acceptance label
+to qualifying PRs when they open; this does not replace existing PR requirements.
 
 ### Monitor Workflow Run (Optional)
 

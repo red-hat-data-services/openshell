@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -10,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files};
+use super::layer::{SETUP_DISKS, cached_layer, hash_file, hash_files, hash_inputs};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
@@ -19,18 +18,20 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
         return Ok(machine.base_image.clone());
     }
 
-    let hash = setup_hash(machine, environment)?;
+    let hash = setup_layer_key(machine, environment)?;
     cached_layer(
+        SETUP_DISKS,
         &machine.base_image,
         &hash,
         environment.setup.use_galaxy,
         &environment.setup.playbooks,
-        &BTreeMap::new(),
+        &environment.setup.inputs,
     )
     .await
 }
 
-fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
+/// The hash that names the environment's setup layer (`disks/setup/<hash>.qcow2`).
+pub fn setup_layer_key(machine: &Machine, environment: &Environment) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(SETUP_CACHE_VERSION);
     hash_file(&mut hasher, &machine.base_image)
@@ -39,5 +40,9 @@ fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
     hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &environment.setup.playbooks)
         .context("failed to hash setup playbooks")?;
+    // Skipped when empty so environments without inputs keep their cache keys.
+    if !environment.setup.inputs.is_empty() {
+        hash_inputs(&mut hasher, &environment.setup.inputs)?;
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }

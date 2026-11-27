@@ -24,18 +24,23 @@ use openshell_core::proto::{
 };
 use sha2::{Digest, Sha256};
 
-use openshell_core::grpc_client::{AuthedChannel, connect_channel_pub};
+use openshell_core::grpc_client::{
+    AuthedChannel, GatewayCredentials, GatewayEndpoint, connect_channel_pub,
+};
 
-/// Entry point for the `debug-rpc` subcommand. Returns the process exit
-/// code; `main` propagates it.
-pub async fn run(args: &[String]) -> Result<i32> {
+/// Entry point for the `debug-rpc` subcommand.
+///
+/// Returns the process exit code; `main` propagates it.
+/// `supported_capabilities` lists the compiled policy capabilities advertised
+/// when fetching configuration.
+pub async fn run(args: &[String], supported_capabilities: Vec<String>) -> Result<i32> {
     let cmd = args
         .first()
         .map(String::as_str)
         .ok_or_else(|| miette::miette!("{}", USAGE))?;
 
     match cmd {
-        "get-sandbox-config" => run_get_sandbox_config(&args[1..]).await,
+        "get-sandbox-config" => run_get_sandbox_config(&args[1..], supported_capabilities).await,
         "refresh" => run_refresh().await,
         "show-token" => run_show_token(),
         "show-principal" => run_show_principal(),
@@ -66,16 +71,21 @@ async fn open_client() -> Result<OpenShellClient<AuthedChannel>> {
     let endpoint = std::env::var(openshell_core::sandbox_env::ENDPOINT)
         .into_diagnostic()
         .wrap_err("OPENSHELL_ENDPOINT must be set")?;
-    let channel = connect_channel_pub(&endpoint).await?;
+    let credentials = GatewayCredentials::from_environment(&endpoint).await?;
+    let channel = connect_channel_pub(&GatewayEndpoint::new(endpoint, credentials)).await?;
     Ok(OpenShellClient::new(channel))
 }
 
-async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
+async fn run_get_sandbox_config(
+    args: &[String],
+    supported_capabilities: Vec<String>,
+) -> Result<i32> {
     let sandbox_name = parse_flag(args, "--sandbox")
         .ok_or_else(|| miette::miette!("get-sandbox-config: --sandbox <NAME> is required"))?;
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supported_capabilities,
             name: sandbox_name.to_string(),
             workspace_scope: None,
         })

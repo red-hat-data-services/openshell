@@ -33,7 +33,13 @@ pub mod datamodel {
 }
 
 pub mod sandbox {
+    pub mod backend {
+        pub use super::super::generated::openshell::sandbox::backend::v1;
+    }
     pub use super::generated::openshell::sandbox::v1;
+    pub mod protocol {
+        pub use super::super::generated::openshell::sandbox::protocol::v1;
+    }
 }
 
 pub mod compute {
@@ -76,12 +82,33 @@ pub mod gateway_interceptor {
     pub use super::generated::openshell::gateway_interceptor::v1;
 }
 
+/// Private gateway-to-shared-supervisor assignment protocol.
+pub mod supervisor_host {
+    pub use super::generated::openshell::supervisor::host::v1;
+}
+
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
 pub use middleware::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
+
+impl SandboxPolicy {
+    /// Returns whether the explicitly present Cedar message selects the Cedar engine.
+    #[must_use]
+    pub fn is_cedar(&self) -> bool {
+        self.cedar_policy.is_some()
+    }
+
+    /// The authored Cedar text. Format selection uses message presence.
+    #[must_use]
+    pub fn cedar_source(&self) -> &str {
+        self.cedar_policy
+            .as_ref()
+            .map_or("", |policy| policy.source.as_str())
+    }
+}
 
 /// Build a selector for one explicitly named workspace.
 pub fn workspace_selector(workspace: impl Into<String>) -> WorkspaceSelector {
@@ -106,6 +133,23 @@ mod tests {
     use prost::Message;
 
     use super::SandboxPolicy;
+
+    #[test]
+    fn empty_cedar_message_preserves_format_and_policy_identity() {
+        let yaml = SandboxPolicy::default();
+        let cedar = SandboxPolicy {
+            cedar_policy: Some(super::CedarPolicy::default()),
+            ..Default::default()
+        };
+        let decoded = SandboxPolicy::decode(cedar.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.is_cedar());
+        assert_eq!(decoded.cedar_source(), "");
+        assert!(!yaml.is_cedar());
+        assert_ne!(
+            crate::policy_identity::deterministic_policy_hash(&yaml),
+            crate::policy_identity::deterministic_policy_hash(&decoded),
+        );
+    }
 
     // SandboxPolicy payload encoded by the pre-0.1.0 schema with
     // NetworkBinary.harness=true. Keep this fixed fixture to prove that the

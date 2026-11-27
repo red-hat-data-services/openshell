@@ -23,6 +23,35 @@ pub struct DeleteOptions {
     pub allow_missing: bool,
 }
 
+/// Options for resuming a suspended sandbox.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeOptions {
+    /// Boot the workload cleanly when the retained memory state cannot be
+    /// restored. When false, resume fails instead.
+    pub restart_if_restore_fails: bool,
+}
+
+/// Options for the retrying sandbox create entry points.
+///
+/// The retrying creates wait out a gateway mutation-lock timeout and an
+/// `AlreadyExists` holder that is still being deleted. They are opt-in:
+/// library callers own their retry policy, so the plain create methods never
+/// retry.
+#[derive(Clone, Copy, Debug)]
+pub struct CreateRetryOptions {
+    /// Wall-clock budget covering retry delays and `AlreadyExists` cleanup
+    /// waits. The first attempt always runs, even with a zero budget.
+    pub budget: Duration,
+}
+
+impl Default for CreateRetryOptions {
+    fn default() -> Self {
+        Self {
+            budget: Duration::from_mins(1),
+        }
+    }
+}
+
 /// A deletion acknowledgement is not necessarily completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -53,6 +82,11 @@ fn deletion_outcomes_preserve_unknown_values() {
     assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
     assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
     assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+#[test]
+fn create_retry_defaults_to_a_one_minute_budget() {
+    assert_eq!(CreateRetryOptions::default().budget, Duration::from_mins(1));
 }
 
 /// Result for the original target, never a same-name replacement.
@@ -215,6 +249,8 @@ pub enum SandboxPhase {
     Stopped,
     Starting,
     Completed,
+    Suspending,
+    Suspended,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -230,6 +266,8 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Stopped => Self::Stopped,
             proto::SandboxPhase::Starting => Self::Starting,
             proto::SandboxPhase::Completed => Self::Completed,
+            proto::SandboxPhase::Suspending => Self::Suspending,
+            proto::SandboxPhase::Suspended => Self::Suspended,
         }
     }
 }
@@ -390,6 +428,10 @@ pub struct SandboxRef {
     /// Service URLs returned by sandbox creation, keyed by service name. The
     /// empty key identifies the unnamed service. Non-create reads leave this empty.
     pub service_urls: HashMap<String, String>,
+    /// Configured application origins; these do not establish installation readiness.
+    pub application_service_urls: HashMap<String, String>,
+    /// Gateway-routed alternatives.
+    pub gateway_service_urls: HashMap<String, String>,
     pub restart_count: u32,
     pub next_restart_at_ms: Option<i64>,
     pub main_process_started_at_ms: Option<i64>,
@@ -443,6 +485,8 @@ impl SandboxRef {
                 .then_some(sandbox.host_key_fingerprint),
             created_from_workload_template,
             service_urls: HashMap::new(),
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             restart_count,
             next_restart_at_ms,
             main_process_started_at_ms,

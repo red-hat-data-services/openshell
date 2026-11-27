@@ -92,7 +92,7 @@ A complete narrow REST-inspected rule looks like this:
 
 ```json
 {
-  "intent_summary": "Allow gh to update repository contents in NVIDIA/OpenShell only.",
+  "intent_summary": "Allow gh to update repository contents in ai-openshell/openshell only.",
   "operations": [
     {
       "addRule": {
@@ -109,7 +109,7 @@ A complete narrow REST-inspected rule looks like this:
                 {
                   "allow": {
                     "method": "PUT",
-                    "path": "/repos/NVIDIA/OpenShell/contents/**"
+                    "path": "/repos/ai-openshell/openshell/contents/**"
                   }
                 }
               ]
@@ -224,6 +224,6 @@ behavior:
 
 - `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
   This is what `/v1/denials` reads from.
-- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — full OCSF JSON events, only
+- `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` — full OCSF JSON events, only
   written when the `ocsf_json_enabled` setting is on. Not used by
   `/v1/denials`; useful for SIEM ingestion.

@@ -18,6 +18,9 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
+use openshell_core::proto::service_discovery_server::ServiceDiscoveryServer;
+use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -43,7 +46,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::authenticator::AuthenticatorChain,
+    auth::audit::{self, AuthzDenial, ConnectionSource, RequestOrigin},
+    auth::authenticator::{AuthFailureReason, AuthMechanism, Authentication, AuthenticatorChain},
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
@@ -235,11 +239,15 @@ impl MultiplexService {
     }
 
     /// Serve a connection, routing to gRPC or HTTP based on content-type.
-    pub async fn serve<S>(&self, stream: S) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub async fn serve<S>(
+        &self,
+        stream: S,
+        source: ConnectionSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_with_peer_identity(stream, None, source).await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -247,11 +255,12 @@ impl MultiplexService {
         &self,
         stream: S,
         peer_identity: Option<Identity>,
+        source: ConnectionSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_verified_certificate(stream, peer_identity, None)
+        self.serve_with_verified_certificate(stream, peer_identity, None, source)
             .await
     }
 
@@ -261,6 +270,7 @@ impl MultiplexService {
         stream: S,
         peer_identity: Option<Identity>,
         certificate_sha256: Option<String>,
+        source: ConnectionSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -272,7 +282,7 @@ impl MultiplexService {
                     identity.provider == crate::auth::identity::IdentityProvider::Mtls
                         && identity.roles.iter().any(|role| role == "operator")
                 })
-                .zip(certificate_sha256)
+                .zip(certificate_sha256.clone())
                 .map(|(identity, certificate_sha256)| OperatorPrincipal {
                     identity: identity.clone(),
                     certificate_sha256,
@@ -287,15 +297,43 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        // The private host stream carries launch secrets, so it bypasses the
+        // configurable interceptors.
+        let openshell = SupervisorHostRoute::new(
+            SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
+                self.state.clone(),
+            ))
+            .max_decoding_message_size(
+                self.state
+                    .compute
+                    .supervisor_host()
+                    .map_or(MAX_GRPC_DECODE_SIZE, |controller| {
+                        controller.pool_limits().max_host_message_bytes()
+                    }),
+            ),
+            openshell,
+        );
         let reflection = self.state.reflection_service.clone();
-        let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
-            admin_role: oidc.admin_role.clone(),
-            user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
-        });
+        let sandbox_updates = SandboxUpdatesServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let sandbox_updates = GatewayInterceptorGrpcService::new(
+            sandbox_updates,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
+        let discovery = ServiceDiscoveryServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let discovery = GatewayInterceptorGrpcService::new(
+            discovery,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
+        let authz_policy = self.state.config.oidc.as_ref().map(AuthzPolicy::from);
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection),
+            GrpcRouter::new(openshell, reflection)
+                .with_sandbox_updates(sandbox_updates)
+                .with_discovery(discovery),
             authenticator_chain,
             authz_policy,
             self.state
@@ -307,9 +345,13 @@ impl MultiplexService {
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         )
-        .with_operator(operator);
-        let grpc_service =
+        .with_peer_certificate(certificate_sha256)
+        .with_operator(operator)
+        .with_connection_source(source)
+        .with_logons(self.state.logons.clone());
+        let mut grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
+        grpc_service.provider_token_limiter = self.state.provider_token_rate_limiter.clone();
         let http_service = http_router(self.state.clone());
 
         let grpc_service = request_id_middleware!(grpc_service);
@@ -358,6 +400,57 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Routes the private supervisor host service past the gateway interceptors
+/// and every other gRPC path to the `OpenShell` service.
+#[derive(Clone)]
+struct SupervisorHostRoute<N> {
+    host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+    gateway: N,
+}
+
+impl<N> SupervisorHostRoute<N> {
+    fn new(
+        host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+        gateway: N,
+    ) -> Self {
+        Self { host, gateway }
+    }
+}
+
+impl<N> tower::Service<Request<BoxBody>> for SupervisorHostRoute<N>
+where
+    N: tower::Service<Request<BoxBody>, Response = Response<tonic::body::Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    N::Future: Send + 'static,
+{
+    type Response = Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.gateway.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        if req
+            .uri()
+            .path()
+            .starts_with(crate::grpc::supervisor_host::SUPERVISOR_HOST_PATH_PREFIX)
+        {
+            let mut host = self.host.clone();
+            Box::pin(async move {
+                <SupervisorHostServer<_> as tower::Service<Request<BoxBody>>>::call(&mut host, req)
+                    .await
+            })
+        } else {
+            let mut gateway = self.gateway.clone();
+            Box::pin(async move { gateway.ready().await?.call(req).await })
+        }
     }
 }
 
@@ -456,7 +549,7 @@ where
             if grpc_status_from_response(&response) != "0"
                 || response
                     .headers()
-                    .get("openshell-replayed")
+                    .get(crate::grpc::mutation_replay::REPLAYED_HEADER)
                     .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
@@ -744,6 +837,11 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
             fields.insert("replica_id".to_string(), peer.replica_id.clone());
             fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
         }
+        Principal::Supervisor(supervisor) => {
+            fields.insert("kind".to_string(), "supervisor".to_string());
+            fields.insert("subject".to_string(), supervisor.identity.subject.clone());
+            fields.insert("token_id".to_string(), supervisor.identity.token_id.clone());
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -834,6 +932,7 @@ impl GrpcRateLimiter {
 struct GrpcRateLimitService<S> {
     inner: S,
     limiter: Option<GrpcRateLimiter>,
+    provider_token_limiter: Option<GrpcRateLimiter>,
     /// Set by `poll_ready` when it reports synthetic readiness for an
     /// exhausted limiter without polling the inner service. The paired `call`
     /// must then reject with `RESOURCE_EXHAUSTED` instead of forwarding to an
@@ -848,6 +947,7 @@ impl<S> GrpcRateLimitService<S> {
         Self {
             inner,
             limiter,
+            provider_token_limiter: None,
             rate_limited: false,
         }
     }
@@ -878,6 +978,10 @@ where
             .limiter
             .as_ref()
             .is_some_and(|limiter| !limiter.has_capacity())
+            && self
+                .provider_token_limiter
+                .as_ref()
+                .is_none_or(|limiter| !limiter.has_capacity())
         {
             self.rate_limited = true;
             return Poll::Ready(Ok(()));
@@ -897,11 +1001,15 @@ where
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
         }
-        if self
-            .limiter
-            .as_ref()
-            .is_some_and(|limiter| !limiter.allow())
+        let limiter = if req.uri().path() == "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
         {
+            self.provider_token_limiter
+                .as_ref()
+                .or(self.limiter.as_ref())
+        } else {
+            self.limiter.as_ref()
+        };
+        if limiter.is_some_and(|limiter| !limiter.allow()) {
             let response =
                 tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
             return Box::pin(async move { Ok(response) });
@@ -911,11 +1019,13 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and reflection.
+/// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R> {
+pub struct GrpcRouter<N, R, U = N, D = N> {
     openshell: N,
     reflection: R,
+    sandbox_updates: Option<U>,
+    discovery: Option<D>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -923,13 +1033,35 @@ impl<N, R> GrpcRouter<N, R> {
         Self {
             openshell,
             reflection,
+            sandbox_updates: None,
+            discovery: None,
+        }
+    }
+
+    fn with_sandbox_updates<U>(self, sandbox_updates: U) -> GrpcRouter<N, R, U> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: Some(sandbox_updates),
+            discovery: self.discovery,
+        }
+    }
+}
+
+impl<N, R, U, D> GrpcRouter<N, R, U, D> {
+    fn with_discovery<T>(self, discovery: T) -> GrpcRouter<N, R, U, T> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: self.sandbox_updates,
+            discovery: Some(discovery),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+impl<N, R, U, D, B> tower::Service<Request<B>> for GrpcRouter<N, R, U, D>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -940,6 +1072,16 @@ where
         + Send
         + 'static,
     R::Future: Send,
+    U: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    U::Future: Send,
+    D: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    D::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -953,6 +1095,20 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
             let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.SandboxUpdates/")
+            && let Some(mut svc) = self.sandbox_updates.clone()
+        {
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.ServiceDiscovery/")
+            && let Some(mut svc) = self.discovery.clone()
+        {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
             let mut svc = self.openshell.clone();
@@ -970,10 +1126,12 @@ where
 /// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
-/// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
+/// 3. `SupervisorTokenAuthenticator` — validates the shared supervisor's
+///    gateway-minted token (its own `typ`); applies to no other bearer.
+/// 4. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
 ///    JWTs against the durable sandbox identity. Untyped legacy sandbox JWTs
 ///    are not admitted.
-/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 5. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -984,9 +1142,8 @@ where
 /// local developer user when `auth.allow_unauthenticated_users` is explicitly
 /// enabled.
 ///
-/// When neither OIDC nor sandbox credentials are configured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through unless mTLS or local unauthenticated users are enabled.
+/// When no bearer authenticators are configured, the chain is left as `None`.
+/// The router still requires an mTLS principal or the explicit development opt-in.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
@@ -996,6 +1153,9 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
         authenticators.push(driver);
     }
     if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
+        authenticators.push(Arc::new(
+            crate::auth::supervisor_token::SupervisorTokenAuthenticator::new(authority.clone()),
+        ));
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
                 authority,
@@ -1019,8 +1179,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - Strip any external `x-openshell-auth-source` marker first (so callers
 ///   cannot spoof a sandbox identity).
 /// - Health probes / reflection bypass the chain entirely.
-/// - When no chain is configured (OIDC not configured), forward without
-///   authentication — preserves today's pass-through behavior.
+/// - When no chain is configured, require an mTLS principal or the explicit
+///   development opt-in.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
@@ -1032,9 +1192,12 @@ pub struct AuthGrpcRouter<S> {
     authz_policy: Option<AuthzPolicy>,
     /// mTLS peer identity extracted from the TLS handshake.
     peer_identity: Option<Identity>,
+    peer_certificate_sha256: Option<String>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
+    connection_source: Option<ConnectionSource>,
+    logons: audit::Logons,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -1060,14 +1223,35 @@ impl<S> AuthGrpcRouter<S> {
             authenticator_chain,
             authz_policy,
             peer_identity,
+            peer_certificate_sha256: None,
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
+            connection_source: None,
+            logons: audit::Logons::default(),
         }
     }
 
     fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
         self.operator = operator;
+        self
+    }
+
+    fn with_connection_source(mut self, source: ConnectionSource) -> Self {
+        self.connection_source = Some(source);
+        self
+    }
+
+    /// The fingerprint of the verified client certificate that
+    /// authenticated `peer_identity`.
+    fn with_peer_certificate(mut self, certificate_sha256: Option<String>) -> Self {
+        self.peer_certificate_sha256 = certificate_sha256;
+        self
+    }
+
+    /// Share logon records with the gateway's other connections.
+    fn with_logons(mut self, logons: audit::Logons) -> Self {
+        self.logons = logons;
         self
     }
 }
@@ -1110,12 +1294,19 @@ where
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
         let operator = self.operator.clone();
+        let connection_source = self.connection_source;
+        let logons = self.logons.clone();
+        let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let mut req = req;
+            if let Some(source) = connection_source {
+                req.extensions_mut().insert(source);
+            }
 
             let path = req.uri().path().to_string();
+            let origin = |headers: &http::HeaderMap| RequestOrigin::new(connection_source, headers);
 
             // Health probes and reflection — truly unauthenticated.
             if oidc::is_unauthenticated_method(&path) {
@@ -1124,27 +1315,59 @@ where
 
             let principal = if let Some(operator) = operator {
                 if req.headers().contains_key(http::header::AUTHORIZATION) {
+                    audit::emit_authentication_failure(
+                        &path,
+                        &origin(req.headers()),
+                        Some(AuthMechanism::Mtls),
+                        AuthFailureReason::ConflictingCredentials,
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "operator certificates must not be combined with authorization headers",
                     )));
                 }
                 Principal::Operator(operator)
-            } else if let Some(chain) = chain {
+            } else if let Some(chain) = &chain {
                 match chain.authenticate(req.headers(), &path).await {
-                    Ok(Some(p)) => p,
-                    Ok(None) => match (mtls_auth_enabled, peer_identity) {
+                    Ok(Authentication::Accepted(p)) => p,
+                    Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
                         (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
                         _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
                         _ => {
+                            let (mechanism, reason) = match outcome {
+                                Authentication::Declined(decline) => {
+                                    (Some(decline.mechanism), decline.reason)
+                                }
+                                _ => (None, AuthFailureReason::MissingCredential),
+                            };
+                            audit::emit_authentication_failure(
+                                &path,
+                                &origin(req.headers()),
+                                mechanism,
+                                reason,
+                            );
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
                         }
                     },
-                    Err(status) => return Ok(status_response(status)),
+                    Err(rejection) => {
+                        audit::emit_authentication_failure(
+                            &path,
+                            &origin(req.headers()),
+                            Some(rejection.mechanism),
+                            rejection.reason,
+                        );
+                        return Ok(status_response(rejection.status));
+                    }
                 }
             } else if mtls_auth_enabled {
                 let Some(identity) = peer_identity else {
+                    audit::emit_authentication_failure(
+                        &path,
+                        &origin(req.headers()),
+                        Some(AuthMechanism::Mtls),
+                        AuthFailureReason::MissingCredential,
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "missing client certificate",
                     )));
@@ -1153,55 +1376,92 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — dev / fronting-proxy deployments.
-                // Inject a local-dev principal so downstream handlers that
-                // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                audit::emit_authentication_failure(
+                    &path,
+                    &origin(req.headers()),
+                    None,
+                    AuthFailureReason::MissingCredential,
+                );
+                return Ok(status_response(tonic::Status::unauthenticated(
+                    "authentication required",
+                )));
             };
+            let origin = origin(req.headers());
+            audit::emit_logon(
+                &logons,
+                &path,
+                &origin,
+                &principal,
+                req.headers(),
+                peer_certificate_sha256.as_deref(),
+            );
 
-            match principal {
-                Principal::Operator(_) => {
-                    if !crate::auth::method_authz::is_operator_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "operators may not call supervisor, peer, or unknown methods",
-                        )));
-                    }
+            let method_denied = |message: &str| {
+                let denial = if crate::auth::method_authz::lookup(&path).is_some() {
+                    AuthzDenial::MethodNotPermitted
+                } else {
+                    AuthzDenial::UnknownMethod
+                };
+                Some((denial, tonic::Status::permission_denied(message)))
+            };
+            let denial = match principal {
+                Principal::Operator(_)
+                    if !crate::auth::method_authz::is_operator_callable(&path) =>
+                {
+                    method_denied("operators may not call supervisor, peer, or unknown methods")
                 }
-                Principal::User(ref user) => {
-                    if !crate::auth::method_authz::is_user_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "this method requires a sandbox principal",
-                        )));
-                    }
-                    if let Some(ref policy) = authz_policy
-                        && let Err(status) = policy.check(&user.identity, &path)
-                    {
-                        return Ok(status_response(status));
-                    }
+                Principal::User(_) if !crate::auth::method_authz::is_user_callable(&path) => {
+                    method_denied("this method requires a sandbox principal")
                 }
-                Principal::Sandbox(_) => {
-                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "sandbox principals may not call this method",
-                        )));
-                    }
+                Principal::User(ref user) => authz_policy
+                    .as_ref()
+                    .and_then(|policy| policy.check(&user.identity, &path).err())
+                    .map(|rbac| (rbac.denial, rbac.status)),
+                Principal::Sandbox(_)
+                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) =>
+                {
+                    method_denied("sandbox principals may not call this method")
                 }
-                Principal::Peer(_) => {
-                    if !crate::auth::method_authz::is_peer_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "gateway peer principals may not call this method",
-                        )));
-                    }
+                Principal::Peer(_) if !crate::auth::method_authz::is_peer_callable(&path) => {
+                    method_denied("gateway peer principals may not call this method")
+                }
+                Principal::Supervisor(_)
+                    if !crate::auth::method_authz::is_supervisor_callable(&path) =>
+                {
+                    method_denied(
+                        "supervisor tokens may call only the supervisor assignment stream",
+                    )
                 }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
+                Principal::Operator(_)
+                | Principal::Sandbox(_)
+                | Principal::Peer(_)
+                | Principal::Supervisor(_) => None,
+            };
+            if let Some((denial, status)) = denial {
+                audit::emit_authorization_denial_for(&path, &origin, &principal, denial);
+                return Ok(status_response(status));
             }
 
-            req.extensions_mut().insert(principal);
-            inner.ready().await?.call(req).await
+            if path.starts_with("/openshell.v1.ServiceDiscovery/")
+                && req.headers().contains_key(http::header::AUTHORIZATION)
+                && let Some(chain) = &chain
+            {
+                let recheck = crate::grpc::service_discovery::BearerRecheck {
+                    chain: chain.clone(),
+                    headers: req.headers().clone(),
+                    policy: authz_policy.clone(),
+                    path: path.clone(),
+                };
+                req.extensions_mut().insert(recheck);
+            }
+            req.extensions_mut().insert(principal.clone());
+            let call = inner.ready().await?.call(req);
+            audit::with_audited_request(path, origin, &principal, call).await
         })
     }
 }
@@ -1401,10 +1661,16 @@ where
 /// Fingerprint of the leaf certificate verified during the TLS handshake.
 pub fn extract_peer_certificate_sha256<S>(
     stream: &tokio_rustls::server::TlsStream<S>,
-) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let certificate = stream.get_ref().1.peer_certificates()?.first()?;
-    Some(format!("{:x}", Sha256::digest(certificate.as_ref())))
+) -> Result<Option<String>, openshell_crypto::CryptoError> {
+    let Some(certificate) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+    else {
+        return Ok(None);
+    };
+    openshell_crypto::sha256(certificate.as_ref()).map(|digest| Some(hex::encode(digest)))
 }
 
 /// Boxed body type for uniform handling.
@@ -1453,7 +1719,8 @@ mod tests {
     use tower::Service;
 
     #[derive(Clone)]
-    struct PostCommitTestInterceptor;
+    struct PostCommitTestInterceptor(&'static str);
+    const CREATE_SANDBOX_RPC: &str = "openshell.v1.OpenShell/CreateSandbox";
 
     #[tonic::async_trait]
     impl GatewayInterceptor for PostCommitTestInterceptor {
@@ -1467,7 +1734,7 @@ mod tests {
                 bindings: vec![InterceptorBinding {
                     id: "audit-create-sandbox".to_string(),
                     selector: Some(InterceptorSelector {
-                        rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                        rpc: self.0.to_string(),
                         service: String::new(),
                         method: String::new(),
                     }),
@@ -1511,13 +1778,16 @@ mod tests {
         Bytes::from(frame)
     }
 
-    async fn post_commit_test_runtime() -> (GatewayInterceptorRuntime, tokio::task::JoinHandle<()>)
-    {
+    async fn post_commit_test_runtime(
+        rpc: &'static str,
+    ) -> (GatewayInterceptorRuntime, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor))
+                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor(
+                    rpc,
+                )))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1531,6 +1801,66 @@ mod tests {
         .unwrap()
         .unwrap();
         (runtime, task)
+    }
+
+    #[tokio::test]
+    async fn direct_ssh_preserves_ssh_session_interceptor_bindings() {
+        use openshell_core::forward::DIRECT_SSH_HEADER;
+        use openshell_core::proto::{
+            GetSandboxRequest, Sandbox, SandboxPhase, TcpForwardFrame, TcpForwardInit,
+            datamodel::v1::ObjectMeta, open_shell_client::OpenShellClient, tcp_forward_frame,
+            tcp_forward_init, workspace_selector,
+        };
+        for rpc in [
+            "openshell.v1.OpenShell/CreateSshSession",
+            "openshell.v1.OpenShell/RevokeSshSession",
+            CREATE_SANDBOX_RPC,
+        ] {
+            let (runtime, task) = post_commit_test_runtime(rpc).await;
+            let mut state = crate::grpc::test_support::test_server_state().await;
+            Arc::get_mut(&mut state).unwrap().gateway_interceptors = Some(runtime);
+            let mut sandbox = Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "sb-1".into(),
+                    name: "agent".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            sandbox.set_phase(SandboxPhase::Ready as i32);
+            state.store.put_message(&sandbox).await.unwrap();
+            let mut client = OpenShellClient::new(OpenShellServer::with_interceptor(
+                OpenShellService::new(state),
+                crate::test_support::authenticate_as_dev_user,
+            ));
+            let lookup = GetSandboxRequest {
+                name: "agent".into(),
+                workspace_scope: Some(workspace_selector("default")),
+            };
+            let response = client.get_sandbox(lookup).await.unwrap();
+            assert_eq!(
+                response.metadata().contains_key(DIRECT_SSH_HEADER),
+                rpc == CREATE_SANDBOX_RPC,
+                "{rpc}"
+            );
+            if rpc != CREATE_SANDBOX_RPC {
+                let frame = TcpForwardFrame {
+                    payload: Some(tcp_forward_frame::Payload::Init(TcpForwardInit {
+                        workspace: "default".into(),
+                        sandbox: "agent".into(),
+                        target: Some(tcp_forward_init::Target::DirectSshSandboxId("sb-1".into())),
+                        ..Default::default()
+                    })),
+                };
+                let denied = client
+                    .forward_tcp(tokio_stream::iter([frame]))
+                    .await
+                    .unwrap_err();
+                assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{rpc}");
+            }
+            task.abort();
+        }
     }
 
     #[test]
@@ -1591,7 +1921,9 @@ mod tests {
         path: &str,
         headers: &[(&str, &str)],
     ) -> Response<Incoming> {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
+            .await
+            .unwrap();
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
             .handshake(TokioIo::new(stream))
             .await
@@ -1730,7 +2062,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_decode_failure_preserves_committed_response() {
-        let (runtime, interceptor_task) = post_commit_test_runtime().await;
+        let (runtime, interceptor_task) = post_commit_test_runtime(CREATE_SANDBOX_RPC).await;
         let committed = Arc::new(AtomicUsize::new(0));
         let committed_for_service = committed.clone();
         let committed_body = Bytes::from_static(b"malformed committed gRPC response");
@@ -1778,7 +2110,7 @@ mod tests {
             &self,
             request: tonic::Request<DescribeRequest>,
         ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
-            let mut manifest = PostCommitTestInterceptor
+            let mut manifest = PostCommitTestInterceptor(CREATE_SANDBOX_RPC)
                 .describe(request)
                 .await?
                 .into_inner();
@@ -1836,7 +2168,7 @@ mod tests {
             &self,
             request: tonic::Request<ProviderProfileSnapshotRequest>,
         ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
-            PostCommitTestInterceptor
+            PostCommitTestInterceptor(CREATE_SANDBOX_RPC)
                 .snapshot_provider_profiles(request)
                 .await
         }
@@ -2169,6 +2501,55 @@ mod tests {
             0,
             "inner service must not be called when poll_ready short-circuited the limiter",
         );
+    }
+
+    #[tokio::test]
+    async fn provider_token_budget_is_shared_across_connections_and_isolated_from_control() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let control = GrpcRateLimiter::from_config(&config);
+        let tokens = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(CountingGrpcService { calls }, control);
+        service.provider_token_limiter = tokens;
+        let mut other_connection = service.clone();
+        let token_request = || {
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/GetSandboxProviderAccessToken")
+                .body(())
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+        let exhausted = other_connection
+            .ready()
+            .await
+            .unwrap()
+            .call(token_request())
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
+        let control = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&control), "0");
+        let exhausted = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&exhausted), "8");
     }
 
     #[tokio::test]
@@ -2662,6 +3043,13 @@ mod tests {
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
         );
+        assert_eq!(
+            otel_span_name(
+                &http::Method::POST,
+                "/openshell.v1.SandboxUpdates/UpdateSandbox"
+            ),
+            "openshell.v1.SandboxUpdates/UpdateSandbox"
+        );
     }
 
     /// Non-RPC paths use a low-cardinality method-only name because sandbox
@@ -2731,10 +3119,15 @@ mod tests {
             name,
             calls: calls.clone(),
         };
-        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
+            .with_sandbox_updates(service("sandbox_updates"))
+            .with_discovery(service("discovery"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
+            "/openshell.v1.SandboxUpdates/UpdateSandbox",
+            "/openshell.v1.ServiceDiscovery/GetServiceRouteSnapshot",
+            "/openshell.v1.ServiceDiscovery/WatchServiceRoutes",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2748,7 +3141,16 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "openshell",
+                "sandbox_updates",
+                "discovery",
+                "discovery",
+                "reflection"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2768,7 +3170,11 @@ mod tests {
             Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
         });
         let rejecting_oidc = Arc::new(MockAuthenticator::returning(Err(
-            tonic::Status::unauthenticated("OIDC credentials required"),
+            crate::auth::authenticator::AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
+                tonic::Status::unauthenticated("OIDC credentials required"),
+            ),
         )));
         let grpc = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(unrouted, reflection),
@@ -2840,7 +3246,14 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+        assert_eq!(
+            names,
+            vec![
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.ServiceDiscovery"
+            ]
+        );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
         let Some(MessageResponse::FileDescriptorResponse(response)) =
@@ -2859,6 +3272,11 @@ mod tests {
                 .get_service_by_name("openshell.v1.OpenShell")
                 .is_some(),
             "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.SandboxUpdates")
+                .is_some()
         );
         assert!(
             reflected_pool
@@ -3199,15 +3617,66 @@ mod tests {
         assert_eq!(normalize_http_path("/"), "unknown");
     }
 
+    #[tokio::test]
+    async fn served_connection_reports_its_peer_and_generated_request_id() {
+        use openshell_core::proto::{ListSandboxesRequest, open_shell_client::OpenShellClient};
+        use openshell_ocsf::test_support::OcsfCapture;
+
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.mtls_auth.enabled = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = MultiplexService::new(state);
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let _ = service.serve(stream, ConnectionSource::Peer(peer)).await;
+        });
+        let capture = OcsfCapture::default();
+        let _guard = capture.install();
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let error = OpenShellClient::new(channel)
+            .list_sandboxes(ListSandboxesRequest::default())
+            .await
+            .expect_err("a request without a client certificate must be rejected");
+        let returned_request_id = error
+            .metadata()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("the gateway returns the request ID it generated");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["src_endpoint"]["ip"], "127.0.0.1");
+        assert!(events[0]["src_endpoint"]["port"].as_u64().is_some());
+        assert_eq!(
+            events[0]["metadata"]["correlation_uid"],
+            returned_request_id
+        );
+    }
+
     mod auth_router {
         use super::*;
+        use crate::auth::audit::test_support::{
+            PEER_IP, REQUEST_ID, assert_authentication_failure, assert_boundary_finding,
+            assert_denial, assert_logon, assert_redacted, peer,
+        };
+        use crate::auth::authenticator::AuthRejection;
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::test_support::{sandbox, user};
         use crate::auth::principal::{
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use openshell_ocsf::test_support::OcsfCapture;
         use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
@@ -3264,18 +3733,6 @@ mod tests {
                 .map(|v| v.to_str().unwrap().to_string())
         }
 
-        fn user_principal(subject: &str) -> Principal {
-            Principal::User(UserPrincipal {
-                identity: Identity {
-                    subject: subject.to_string(),
-                    display_name: None,
-                    roles: vec![],
-                    scopes: vec![],
-                    provider: IdentityProvider::Oidc,
-                },
-            })
-        }
-
         fn provider_writer_principal() -> Principal {
             Principal::User(UserPrincipal {
                 identity: Identity {
@@ -3298,22 +3755,57 @@ mod tests {
             }
         }
 
-        fn sandbox_principal() -> Principal {
-            Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            })
-        }
-
         fn operator_principal() -> OperatorPrincipal {
             let mut identity = mtls_identity("operator");
             identity.roles = vec!["operator".to_string()];
             OperatorPrincipal {
                 identity,
                 certificate_sha256: "verified-leaf".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn operator_only_requires_operator_certificate() {
+            for (peer_identity, operator) in [
+                (None, None),
+                (Some(mtls_identity("ordinary-user")), None),
+                (
+                    Some(operator_principal().identity),
+                    Some(operator_principal()),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let authenticated = operator.is_some();
+                let (recorder, seen) = PrincipalRecorder::new();
+                // Operator-only authentication has no bearer chain and disables
+                // both user mTLS authentication and the development opt-in.
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    peer_identity,
+                    false,
+                    false,
+                )
+                .with_operator(operator);
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                let response = router.call(empty_request(path)).await.unwrap();
+
+                if authenticated {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+                    assert!(seen.lock().unwrap().is_none());
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+                }
             }
         }
 
@@ -3360,6 +3852,124 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn supervisor_tokens_reach_only_the_assignment_stream() {
+            let attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
+            let supervisor = Principal::Supervisor(crate::auth::principal::SupervisorPrincipal {
+                identity: openshell_supervisor_control::HostIdentity {
+                    subject: "openshell-supervisor:test".to_string(),
+                    token_id: "token".to_string(),
+                    expires_at: i64::MAX,
+                },
+            });
+            let supervisor_chain = || {
+                AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                    Authentication::Accepted(supervisor.clone()),
+                )))])
+            };
+            for (method, permitted) in [
+                (attach, true),
+                ("/openshell.v1.OpenShell/ListSandboxes", false),
+                ("/openshell.v1.OpenShell/ConnectSupervisor", false),
+                ("/openshell.v1.OpenShell/GetSandboxConfig", false),
+                ("/openshell.v1.OpenShell/GetProviderCredentials", false),
+                ("/openshell.v1.OpenShell/RefreshSandboxToken", false),
+                ("/openshell.v1.OpenShell/PeerRelay", false),
+                ("/openshell.v1.OpenShell/Unknown", false),
+            ] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::new(recorder, Some(supervisor_chain()), None)
+                    .call(empty_request(method))
+                    .await
+                    .unwrap();
+                if permitted {
+                    assert!(grpc_status(&response).is_none(), "{method}");
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Supervisor(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"), "{method}");
+                }
+            }
+
+            // No other principal reaches the stream: an mTLS user, an
+            // operator, a sandbox, a peer, or an unauthenticated dev user,
+            // even when local unauthenticated users are allowed.
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                None,
+                None,
+                Some(mtls_identity("openshell-client")),
+                true,
+                false,
+            )
+            .call(empty_request(attach))
+            .await
+            .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            let (recorder, seen) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                Some(AuthenticatorChain::new(vec![Arc::new(
+                    MockAuthenticator::returning(Ok(Authentication::NotApplicable)),
+                )])),
+                None,
+                None,
+                false,
+                true,
+            )
+            .call(empty_request(attach))
+            .await
+            .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(seen.lock().unwrap().is_none());
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::new(recorder, None, None)
+                .with_operator(Some(operator_principal()))
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            for principal in [
+                sandbox("sandbox-a"),
+                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "replica".into(),
+                    pod_uid: "pod".into(),
+                }),
+            ] {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::new(recorder, Some(chain), None)
+                    .call(empty_request(attach))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            }
+            // Without a bearer chain, the development opt-in still grants no
+            // access to the assignment stream. Otherwise authentication fails
+            // before method authorization.
+            for (allow_unauthenticated_users, expected_status) in [(true, "7"), (false, "16")] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    None,
+                    false,
+                    allow_unauthenticated_users,
+                )
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some(expected_status));
+                assert!(seen.lock().unwrap().is_none());
+            }
+        }
+
+        #[tokio::test]
         async fn user_bearer_claims_and_local_dev_cannot_export_credentials() {
             let mut user = mtls_identity("ordinary-user");
             user.provider = IdentityProvider::Oidc;
@@ -3367,14 +3977,14 @@ mod tests {
             user.scopes = vec!["openshell:all".into()];
             for principal in [
                 Principal::User(UserPrincipal { identity: user }),
-                sandbox_principal(),
+                sandbox("sandbox-a"),
                 Principal::Peer(crate::auth::principal::PeerPrincipal {
                     replica_id: "replica".into(),
                     pod_uid: "pod".into(),
                 }),
             ] {
                 let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
-                    Ok(Some(principal)),
+                    Ok(Authentication::Accepted(principal)),
                 ))]);
                 let (recorder, _) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3387,7 +3997,8 @@ mod tests {
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
             let (recorder, _) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
             let response = router
                 .call(empty_request(
                     "/openshell.v1.OpenShell/GetProviderCredentials",
@@ -3429,7 +4040,9 @@ mod tests {
 
         #[tokio::test]
         async fn mtls_peer_identity_fills_missing_principal_when_enabled() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::with_peer_identity(
@@ -3498,9 +4111,11 @@ mod tests {
 
         #[tokio::test]
         async fn reflection_bypasses_oidc_and_mtls_user_authentication() {
-            let oidc = Arc::new(MockAuthenticator::returning(Err(
+            let oidc = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("OIDC credentials required"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![oidc]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
@@ -3523,7 +4138,9 @@ mod tests {
 
         #[tokio::test]
         async fn unauthenticated_dev_user_fills_missing_principal_when_enabled() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
@@ -3566,9 +4183,9 @@ mod tests {
 
         #[tokio::test]
         async fn user_principal_lands_in_request_extensions() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(user_principal(
-                "alice",
-            )))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                user("alice"),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3585,7 +4202,9 @@ mod tests {
 
         #[tokio::test]
         async fn sandbox_principal_lands_in_request_extensions() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                sandbox("sandbox-a"),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3602,7 +4221,9 @@ mod tests {
 
         #[tokio::test]
         async fn sandbox_principal_can_call_allowlisted_method() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                sandbox("sandbox-a"),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3653,7 +4274,9 @@ mod tests {
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
             ] {
-                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                    admin_user(),
+                ))));
                 let chain = AuthenticatorChain::new(vec![mock]);
                 let (recorder, seen) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy.clone()));
@@ -3674,7 +4297,7 @@ mod tests {
                 scopes_enabled: true,
             };
 
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
                 provider_writer_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
@@ -3687,7 +4310,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert!(seen.lock().unwrap().is_some());
 
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
                 provider_writer_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
@@ -3709,7 +4332,9 @@ mod tests {
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
             ] {
-                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                    sandbox("sandbox-a"),
+                ))));
                 let chain = AuthenticatorChain::new(vec![mock]);
                 let (recorder, seen) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3721,9 +4346,729 @@ mod tests {
             }
         }
 
+        fn assert_authorization_denial(event: &serde_json::Value, operation: &str, reason: &str) {
+            assert_denial(
+                event,
+                &format!("/openshell.v1.OpenShell/{operation}"),
+                reason,
+            );
+            assert_eq!(event["api"]["operation"], operation);
+            assert_eq!(event["api"]["service"]["name"], "openshell.v1.OpenShell");
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_on_admin_method_emits_denial_and_correlated_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let request = Request::builder()
+                .uri("/openshell.v1.OpenShell/CreateProvider")
+                .header("authorization", "Bearer canary-secret-token-9f2c")
+                .header("x-request-id", REQUEST_ID)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_authorization_denial(&events[0], "CreateProvider", "method_not_permitted");
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "sandbox-a", "type_id": 99, "type": "Sandbox"}})
+            );
+            assert_eq!(events[0]["severity_id"], 3);
+
+            let finding = &events[1];
+            assert_boundary_finding(&events[0], finding);
+            for event in &events {
+                assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
+                assert_redacted(event, "canary-secret-token");
+            }
+        }
+
+        #[tokio::test]
+        async fn user_missing_rbac_role_emits_denial_without_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: false,
+            };
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy));
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "ListSandboxes", "missing_role");
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "alice", "type_id": 1, "type": "User"}})
+            );
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_on_unknown_method_is_denied_without_a_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/SomeFutureMethod"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "SomeFutureMethod", "unknown_method");
+        }
+
+        #[tokio::test]
+        async fn permitted_sandbox_call_emits_no_authorization_event() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_some());
+            assert!(authorization_events(&capture).is_empty());
+        }
+
+        #[tokio::test]
+        async fn peer_and_operator_denials_name_their_principal_type() {
+            for (principal_type, router) in [
+                (
+                    "Admin",
+                    AuthGrpcRouter::with_peer_identity(
+                        PrincipalRecorder::new().0,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                    )
+                    .with_operator(Some(operator_principal())),
+                ),
+                (
+                    "Gateway Peer",
+                    AuthGrpcRouter::new(
+                        PrincipalRecorder::new().0,
+                        Some(AuthenticatorChain::new(vec![Arc::new(
+                            MockAuthenticator::returning(Ok(Authentication::Accepted(
+                                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                                    replica_id: "gateway-1".to_string(),
+                                    pod_uid: "pod-1".to_string(),
+                                }),
+                            ))),
+                        )])),
+                        None,
+                    ),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let mut router = router;
+
+                let res = router
+                    .call(empty_request("/openshell.v1.OpenShell/ConnectSupervisor"))
+                    .await
+                    .unwrap();
+
+                assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{principal_type}");
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{principal_type}: {events:?}");
+                assert_authorization_denial(
+                    &events[0],
+                    "ConnectSupervisor",
+                    "method_not_permitted",
+                );
+                assert_eq!(events[0]["actor"]["user"]["type"], principal_type);
+            }
+        }
+
+        /// Calls the sandbox-scope guard for another sandbox, as a handler
+        /// would for a request body naming it.
+        #[derive(Clone)]
+        struct CrossSandboxHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for CrossSandboxHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let principal = req.extensions().get::<Principal>().cloned().unwrap();
+                Box::pin(async move {
+                    let status = crate::auth::guard::ensure_sandbox_scope(&principal, "sandbox-b")
+                        .expect_err("another sandbox must be denied");
+                    Ok(status.into_http())
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn handler_denial_is_recorded_against_the_routed_request() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let mut router = AuthGrpcRouter::new(CrossSandboxHandler, Some(chain), None)
+                .with_connection_source(ConnectionSource::Peer("10.42.0.7:51234".parse().unwrap()));
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_authorization_denial(&events[0], "GetSandboxConfig", "cross_sandbox");
+            assert_eq!(events[0]["src_endpoint"]["ip"], "10.42.0.7");
+            assert_eq!(
+                events[0]["resources"],
+                serde_json::json!([{"uid": "sandbox-b", "type": "sandbox"}])
+            );
+            assert_boundary_finding(&events[0], &events[1]);
+        }
+
+        /// Answers every request with `status` and its details, in the
+        /// response headers, or in the trailers of a stream when `streamed`.
+        #[derive(Clone)]
+        struct DetailedStatusHandler {
+            status: tonic::Status,
+            streamed: bool,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for DetailedStatusHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                use http_body::Frame;
+                use http_body_util::StreamBody;
+                let response = self.status.clone().into_http::<tonic::body::Body>();
+                if !self.streamed {
+                    return Box::pin(async move { Ok(response) });
+                }
+                let trailers = response.headers().clone();
+                let body = tonic::body::Body::new(StreamBody::new(tokio_stream::iter([
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"frame"))),
+                    Ok(Frame::trailers(trailers)),
+                ])));
+                Box::pin(async move { Ok(Response::new(body)) })
+            }
+        }
+
+        /// Answers every request with `code`.
+        #[derive(Clone)]
+        struct StatusHandler(tonic::Code);
+
+        impl<B: Send + 'static> Service<Request<B>> for StatusHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                let code = self.0;
+                Box::pin(async move { Ok(tonic::Status::new(code, "refused").into_http()) })
+            }
+        }
+
+        /// Never answers, as a handler would when its client disconnects
+        /// first.
+        #[derive(Clone)]
+        struct PendingHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for PendingHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        /// Answers with headers and then a body that sends a data frame and
+        /// ends with `code` in its trailers, or never ends when `code` is
+        /// `None`, as a streaming handler does.
+        #[derive(Clone)]
+        struct StreamHandler(Option<tonic::Code>);
+
+        impl<B: Send + 'static> Service<Request<B>> for StreamHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                use http_body::Frame;
+                use http_body_util::StreamBody;
+                let body = self.0.map_or_else(
+                    || {
+                        tonic::body::Body::new(StreamBody::new(tokio_stream::pending::<
+                            Result<Frame<Bytes>, Infallible>,
+                        >()))
+                    },
+                    |code| {
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", (code as i32).into());
+                        tonic::body::Body::new(StreamBody::new(tokio_stream::iter([
+                            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"frame"))),
+                            Ok(Frame::trailers(trailers)),
+                        ])))
+                    },
+                );
+                Box::pin(async move { Ok(Response::new(body)) })
+            }
+        }
+
+        /// Refuses the caller as a non-member of a workspace, as a handler
+        /// checking workspace membership would.
+        #[derive(Clone)]
+        struct WorkspaceDenialHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for WorkspaceDenialHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let principal = req.extensions().get::<Principal>().cloned().unwrap();
+                Box::pin(async move {
+                    let status = audit::deny(
+                        &principal,
+                        AuthzDenial::NotWorkspaceMember {
+                            workspace: "team-a",
+                        },
+                        "not a member",
+                    );
+                    Ok(status.into_http())
+                })
+            }
+        }
+
+        fn user_router<S>(inner: S) -> AuthGrpcRouter<S> {
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            AuthGrpcRouter::new(inner, Some(chain), None).with_connection_source(peer())
+        }
+
+        fn request_with_id(path: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .uri(path)
+                .header("x-request-id", REQUEST_ID)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn user_mutation_emits_one_api_activity_record() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, _) = PrincipalRecorder::new();
+
+            user_router(recorder)
+                .call(request_with_id("/openshell.v1.OpenShell/DeleteSandbox"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "DeleteSandbox", 4);
+            assert_eq!(event["status_id"], 1, "{event}");
+            assert_eq!(event["severity_id"], 1, "{event}");
+            assert_eq!(
+                event["actor"],
+                serde_json::json!({"user": {"uid": "alice", "type_id": 1, "type": "User"}})
+            );
+            assert_eq!(event["src_endpoint"]["ip"], PEER_IP, "{event}");
+            assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID, "{event}");
+        }
+
+        #[tokio::test]
+        async fn operator_mutation_names_the_operator() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                PrincipalRecorder::new().0,
+                None,
+                None,
+                Some(operator_principal().identity),
+                false,
+                false,
+            )
+            .with_operator(Some(operator_principal()));
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/CreateProvider"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateProvider", 1);
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "operator", "type_id": 2, "type": "Admin"}})
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_mutation_records_the_grpc_code() {
+            for (code, detail, severity_id) in [
+                (tonic::Code::InvalidArgument, "rejected:invalid_argument", 2),
+                (tonic::Code::NotFound, "rejected:not_found", 2),
+                (
+                    tonic::Code::FailedPrecondition,
+                    "rejected:failed_precondition",
+                    2,
+                ),
+                (tonic::Code::Internal, "error:internal", 3),
+                (tonic::Code::Unavailable, "error:unavailable", 3),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+
+                user_router(StatusHandler(code))
+                    .call(request_with_id("/openshell.v1.OpenShell/UpdateProvider"))
+                    .await
+                    .unwrap();
+
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{code:?}: {events:?}");
+                let event = &events[0];
+                assert_mutation(event, "UpdateProvider", 3);
+                assert_eq!(event["status_id"], 2, "{event}");
+                assert_eq!(event["status_detail"], detail, "{event}");
+                assert_eq!(event["severity_id"], severity_id, "{event}");
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_mutation_records_an_unknown_outcome() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let mut router = user_router(PendingHandler);
+            let call = router.call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"));
+            tokio::time::timeout(Duration::from_millis(10), call)
+                .await
+                .unwrap_err();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "CreateWorkspace", 1);
+            assert_eq!(event["status_id"], 0, "{event}");
+            assert_eq!(event["status_detail"], "unknown:cancelled", "{event}");
+            assert_eq!(event["severity_id"], 3, "{event}");
+        }
+
+        #[tokio::test]
+        async fn streamed_mutation_records_the_status_its_stream_ends_with() {
+            use http_body_util::BodyExt;
+            for (code, status_id, detail) in [
+                (tonic::Code::Ok, 1, None),
+                (tonic::Code::Unavailable, 2, Some("error:unavailable")),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+
+                let res = user_router(StreamHandler(Some(code)))
+                    .call(request_with_id("/openshell.v1.OpenShell/ExecSandbox"))
+                    .await
+                    .unwrap();
+                assert!(authorization_events(&capture).is_empty());
+                res.into_body().collect().await.unwrap();
+
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{events:?}");
+                let event = &events[0];
+                assert_mutation(event, "ExecSandbox", 99);
+                assert_eq!(event["status_id"], status_id, "{event}");
+                assert_eq!(
+                    event.get("status_detail").and_then(|d| d.as_str()),
+                    detail,
+                    "{event}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_mutation_records_the_gateway_error_reason() {
+            use http_body_util::BodyExt;
+            use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
+            let with_reason = |reason: &str, domain: &str| {
+                tonic::Status::with_error_details(
+                    tonic::Code::Aborted,
+                    "refused",
+                    ErrorDetails::with_error_info(reason, domain, std::collections::HashMap::new()),
+                )
+            };
+            let cases = [
+                (
+                    openshell_core::rpc_error::resource_version_conflict("stale", Some(7)),
+                    "rejected:aborted:RESOURCE_VERSION_CONFLICT",
+                ),
+                (
+                    openshell_core::rpc_error::failed_precondition(
+                        "REQUEST_OUTCOME_UNCERTAIN",
+                        "uncertain",
+                    ),
+                    "rejected:failed_precondition:REQUEST_OUTCOME_UNCERTAIN",
+                ),
+                (
+                    with_reason("UPSTREAM_REASON", "example.com"),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason("not a reason", ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+                (
+                    with_reason(&"A".repeat(65), ERROR_DOMAIN),
+                    "rejected:aborted",
+                ),
+            ];
+            for streamed in [false, true] {
+                for (status, detail) in &cases {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+
+                    let handler = DetailedStatusHandler {
+                        status: status.clone(),
+                        streamed,
+                    };
+                    let res = user_router(handler)
+                        .call(request_with_id("/openshell.v1.OpenShell/UpdateConfig"))
+                        .await
+                        .unwrap();
+                    res.into_body().collect().await.unwrap();
+
+                    let events = authorization_events(&capture);
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    let event = &events[0];
+                    assert_eq!(event["status_id"], 2, "{event}");
+                    assert_eq!(
+                        event["status_detail"], *detail,
+                        "streamed={streamed} {event}"
+                    );
+                    assert_eq!(event["message"], format!("mutation failed: {detail}"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn dropped_stream_records_an_unknown_outcome() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let res = user_router(StreamHandler(None))
+                .call(request_with_id("/openshell.v1.OpenShell/ForwardTcp"))
+                .await
+                .unwrap();
+            drop(res);
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_mutation(event, "ForwardTcp", 99);
+            assert_eq!(event["status_id"], 0, "{event}");
+            assert_eq!(event["status_detail"], "unknown:cancelled", "{event}");
+        }
+
+        #[tokio::test]
+        async fn handler_denial_is_the_only_record_of_a_mutation() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            let res = user_router(WorkspaceDenialHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/DeleteProvider"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "DeleteProvider", "not_workspace_member");
+            assert_eq!(events[0]["activity_id"], 4, "{}", events[0]);
+        }
+
+        #[tokio::test]
+        async fn router_denial_of_a_mutation_names_its_activity() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: false,
+            };
+            let mut router =
+                AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), Some(policy));
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/CreateSandbox"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "CreateSandbox", "missing_role");
+            assert_eq!(events[0]["activity_id"], 1, "{}", events[0]);
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_and_read_calls_are_not_recorded() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let mut sandbox_router =
+                AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
+
+            sandbox_router
+                .call(empty_request("/openshell.v1.OpenShell/UpdateConfig"))
+                .await
+                .unwrap();
+            user_router(PrincipalRecorder::new().0)
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(authorization_events(&capture).is_empty());
+        }
+
+        /// Answers every request with a stored result replayed by request ID.
+        #[derive(Clone)]
+        struct ReplayHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for ReplayHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                Box::pin(async move {
+                    let mut response = Response::new(tonic::body::Body::empty());
+                    response.headers_mut().insert(
+                        crate::grpc::mutation_replay::REPLAYED_HEADER,
+                        "true".parse().unwrap(),
+                    );
+                    Ok(response)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn replayed_mutation_records_a_no_op() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+
+            user_router(ReplayHandler)
+                .call(request_with_id("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_mutation(&events[0], "CreateWorkspace", 1);
+            assert_eq!(events[0]["status_id"], 1, "{}", events[0]);
+            assert_eq!(
+                events[0]["status_detail"], "no_op:replayed",
+                "{}",
+                events[0]
+            );
+        }
+
+        /// Assert that `event` is a gateway mutation record for `operation`.
+        fn assert_mutation(event: &serde_json::Value, operation: &str, activity_id: u8) {
+            openshell_ocsf_validate::validate_event(event)
+                .unwrap_or_else(|e| panic!("{e}\n{event}"));
+            assert_eq!(event["class_uid"], 6003, "{event}");
+            assert_eq!(event["activity_id"], activity_id, "{event}");
+            assert_eq!(event["api"]["operation"], operation, "{event}");
+            assert_eq!(
+                event["api"]["service"]["name"], "openshell.v1.OpenShell",
+                "{event}"
+            );
+            assert_eq!(
+                event["http_request"]["url"]["path"],
+                format!("/openshell.v1.OpenShell/{operation}"),
+                "{event}"
+            );
+        }
+
         #[tokio::test]
         async fn missing_principal_returns_unauthenticated() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3784,9 +5129,11 @@ mod tests {
 
         #[tokio::test]
         async fn authenticator_error_short_circuits() {
-            let mock = Arc::new(MockAuthenticator::returning(Err(
+            let mock = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("forged"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3798,13 +5145,631 @@ mod tests {
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
         }
 
+        /// Captured events other than authentication events.
+        fn authorization_events(capture: &OcsfCapture) -> Vec<serde_json::Value> {
+            capture
+                .json_events()
+                .into_iter()
+                .filter(|event| event["class_uid"] != 3002)
+                .collect()
+        }
+
+        /// Assert that `event` is the router's unidentified Authentication
+        /// failure for `reason`, at `severity_id`.
+        fn assert_router_authentication_failure(
+            event: &serde_json::Value,
+            path: &str,
+            reason: &str,
+            severity_id: u8,
+        ) {
+            assert_authentication_failure(event, path, reason);
+            assert_eq!(event["severity_id"], severity_id);
+            assert_eq!(event["user"]["type_id"], 0);
+            assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
+        }
+
+        #[tokio::test]
+        async fn missing_credential_emits_authentication_failure() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert!(events[0].get("auth_protocol_id").is_none());
+        }
+
+        #[tokio::test]
+        async fn missing_client_certificate_emits_mtls_authentication_failure() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false);
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert_eq!(events[0]["auth_protocol_id"], 99);
+            assert_eq!(events[0]["auth_protocol"], "mtls");
+        }
+
+        #[tokio::test]
+        async fn operator_with_authorization_header_emits_conflicting_credentials() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false)
+                    .with_operator(Some(operator_principal()));
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            let canary = "Bearer canary-secret-token-9f2c";
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", canary)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "conflicting_credentials", 3);
+            assert_eq!(events[0]["auth_protocol"], "mtls");
+            assert_redacted(&events[0], "canary-secret-token");
+        }
+
+        async fn call_with_rejection(
+            rejection: AuthRejection,
+            path: &str,
+        ) -> (tonic::Status, Vec<serde_json::Value>) {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Err(
+                rejection,
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer canary-secret-token-9f2c")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
+            (status, capture.json_events())
+        }
+
+        #[tokio::test]
+        async fn declined_credential_emits_its_classification_with_the_missing_credential_status() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Declined(crate::auth::authenticator::AuthDecline {
+                    mechanism: AuthMechanism::GatewayPeer,
+                    reason: AuthFailureReason::InvalidCredential,
+                }),
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/PeerRelay";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(status.message(), "missing authorization header");
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "invalid_credential", 3);
+            assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        async fn missing_credential_event(
+            source: ConnectionSource,
+            request_id: &str,
+        ) -> serde_json::Value {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::new(recorder, Some(chain), None).with_connection_source(source);
+            let request = Request::builder()
+                .uri("/openshell.v1.OpenShell/ListSandboxes")
+                .header("x-request-id", request_id)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            router.call(request).await.unwrap();
+
+            let mut events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            events.remove(0)
+        }
+
+        #[tokio::test]
+        async fn authentication_failure_carries_peer_address_and_request_id() {
+            let event = missing_credential_event(peer(), REQUEST_ID).await;
+
+            assert_eq!(
+                event["src_endpoint"],
+                serde_json::json!({"ip": PEER_IP, "port": 51234})
+            );
+            assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
+        }
+
+        #[tokio::test]
+        async fn ipv4_mapped_peer_address_is_reported_as_ipv4() {
+            let event = missing_credential_event(
+                ConnectionSource::Peer("[::ffff:203.0.113.7]:51234".parse().unwrap()),
+                REQUEST_ID,
+            )
+            .await;
+
+            assert_eq!(event["src_endpoint"]["ip"], PEER_IP);
+        }
+
+        #[tokio::test]
+        async fn tunnel_source_is_named_and_non_uuid_request_ids_are_dropped() {
+            let event =
+                missing_credential_event(ConnectionSource::EdgeTunnel, "attacker [controlled]")
+                    .await;
+
+            assert_eq!(
+                event["src_endpoint"],
+                serde_json::json!({"name": "edge-tunnel"})
+            );
+            assert!(event["metadata"].get("correlation_uid").is_none());
+            assert_redacted(&event, "attacker");
+        }
+
+        #[tokio::test]
+        async fn connection_source_reaches_handlers() {
+            let seen = Arc::new(Mutex::new(None));
+            let recorded = seen.clone();
+            let inner = tower::service_fn(move |req: Request<Full<Bytes>>| {
+                *recorded.lock().unwrap() = req.extensions().get::<ConnectionSource>().copied();
+                async { Ok::<_, Infallible>(Response::new(tonic::body::Body::empty())) }
+            });
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let source = peer();
+            let mut router =
+                AuthGrpcRouter::new(inner, Some(chain), None).with_connection_source(source);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert_eq!(*seen.lock().unwrap(), Some(source));
+        }
+
+        #[tokio::test]
+        async fn rejected_oidc_credential_emits_classified_authentication_failure() {
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            let (status, events) = call_with_rejection(
+                AuthRejection::new(
+                    AuthMechanism::Oidc,
+                    AuthFailureReason::ExpiredCredential,
+                    tonic::Status::unauthenticated("invalid token: ExpiredSignature"),
+                ),
+                path,
+            )
+            .await;
+
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(status.message(), "invalid token: ExpiredSignature");
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "expired_credential", 2);
+            assert_eq!(events[0]["auth_protocol_id"], 4);
+            assert_eq!(events[0]["auth_protocol"], "OpenID");
+            assert_redacted(&events[0], "canary-secret-token");
+            assert_redacted(&events[0], "ExpiredSignature");
+        }
+
+        #[tokio::test]
+        async fn rejected_sandbox_credential_emits_classified_authentication_failure() {
+            let path = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment";
+            let (status, events) = call_with_rejection(
+                AuthRejection::new(
+                    AuthMechanism::SandboxJwt,
+                    AuthFailureReason::StaleIdentity,
+                    tonic::Status::unauthenticated(
+                        "gateway token does not match the active sandbox identity",
+                    ),
+                ),
+                path,
+            )
+            .await;
+
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(&events[0], path, "stale_identity", 3);
+            assert_eq!(events[0]["auth_protocol_id"], 99);
+            assert_eq!(events[0]["auth_protocol"], "sandbox_jwt");
+        }
+
+        fn bearer_request(path: &str, token: &str, request_id: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-request-id", request_id)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn credential_logs_on_once_and_exempt_requests_emit_nothing() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::new(recorder, Some(chain), None).with_connection_source(peer());
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            for request in [
+                bearer_request(path, "canary-secret-token-9f2c", REQUEST_ID),
+                bearer_request(
+                    path,
+                    "canary-secret-token-9f2c",
+                    "0d9a4c1e-5b6f-4a7d-9e8c-1f2a3b4c5d6e",
+                ),
+                bearer_request(
+                    "/openshell.v1.OpenShell/Health",
+                    "canary-secret-token-9f2c",
+                    REQUEST_ID,
+                ),
+            ] {
+                let res = router.call(request).await.unwrap();
+                assert!(grpc_status(&res).is_none());
+            }
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_logon(&events[0], path);
+            assert_eq!(
+                events[0]["user"],
+                serde_json::json!({"uid": "alice", "type_id": 1, "type": "User"})
+            );
+            assert_eq!(events[0]["auth_protocol_id"], 4);
+            assert_eq!(
+                events[0]["src_endpoint"],
+                serde_json::json!({"ip": PEER_IP, "port": 51234})
+            );
+            assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
+            assert_redacted(&events[0], "canary-secret-token");
+        }
+
+        #[tokio::test]
+        async fn each_new_credential_logs_on() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/GetSandboxConfig";
+
+            for token in ["first-token", "refreshed-token", "first-token"] {
+                router
+                    .call(bearer_request(path, token, REQUEST_ID))
+                    .await
+                    .unwrap();
+            }
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 2, "{events:?}");
+            for event in &events {
+                assert_logon(event, path);
+                assert_eq!(
+                    event["user"],
+                    serde_json::json!({"uid": "sandbox-a", "type_id": 99, "type": "Sandbox"})
+                );
+                assert_eq!(event["auth_protocol"], "sandbox_jwt");
+            }
+        }
+
+        #[tokio::test]
+        async fn unverified_header_bytes_do_not_make_a_new_logon() {
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            for (case, router, headers) in [
+                (
+                    "mTLS user with ignored authorization headers",
+                    AuthGrpcRouter::with_peer_identity(
+                        PrincipalRecorder::new().0,
+                        None,
+                        None,
+                        Some(mtls_identity("alice")),
+                        true,
+                        false,
+                    ),
+                    ["Basic first-nonce", "Basic second-nonce"],
+                ),
+                (
+                    "bearer scheme spelled differently",
+                    AuthGrpcRouter::new(
+                        PrincipalRecorder::new().0,
+                        Some(AuthenticatorChain::new(vec![Arc::new(
+                            MockAuthenticator::returning(Ok(Authentication::Accepted(user(
+                                "alice",
+                            )))),
+                        )])),
+                        None,
+                    ),
+                    ["Bearer alice-token", "bEARER alice-token"],
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let mut router = router;
+
+                for authorization in headers {
+                    let request = Request::builder()
+                        .uri(path)
+                        .header("authorization", authorization)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap();
+                    router.call(request).await.unwrap();
+                }
+
+                let events = capture.json_events();
+                assert_eq!(events.len(), 1, "{case}: {events:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn logon_names_the_protocol_that_established_the_principal() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "gateway-1".to_string(),
+                    pod_uid: "pod-1".to_string(),
+                })),
+            )))]);
+            let mut router = AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/PeerRelay";
+
+            router
+                .call(bearer_request(path, "peer-token", REQUEST_ID))
+                .await
+                .unwrap();
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_logon(&events[0], path);
+            assert_eq!(events[0]["user"]["type"], "Gateway Peer");
+            assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        #[tokio::test]
+        async fn verified_credentials_log_on_before_a_sandbox_token_method_denies_them() {
+            for path in [
+                "/openshell.v1.OpenShell/IssueSandboxToken",
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+            ] {
+                for (principal, principal_type) in [
+                    (user("alice"), "User"),
+                    (Principal::Operator(operator_principal()), "Admin"),
+                    (
+                        Principal::Peer(crate::auth::principal::PeerPrincipal {
+                            replica_id: "gateway-1".to_string(),
+                            pod_uid: "pod-1".to_string(),
+                        }),
+                        "Gateway Peer",
+                    ),
+                ] {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+                    let chain = AuthenticatorChain::new(vec![Arc::new(
+                        MockAuthenticator::returning(Ok(Authentication::Accepted(principal))),
+                    )]);
+                    let (recorder, seen) = PrincipalRecorder::new();
+                    let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                    let res = router
+                        .call(bearer_request(path, "verified-token", REQUEST_ID))
+                        .await
+                        .unwrap();
+
+                    assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+                    assert!(seen.lock().unwrap().is_none(), "{path}");
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 2, "{principal_type} {path}: {events:?}");
+                    assert_logon(&events[0], path);
+                    assert_eq!(events[0]["user"]["type"], principal_type);
+                    assert_eq!(events[1]["class_uid"], 6003);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn handlers_that_finish_verification_record_their_own_logon() {
+            for (principal, path) in [
+                (
+                    Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: "sandbox-a".to_string(),
+                        source: SandboxIdentitySource::ComputeDriver {
+                            driver_name: "kubernetes".to_string(),
+                            runtime_identity: "pod-uid".to_string(),
+                        },
+                        trust_domain: None,
+                    }),
+                    "/openshell.v1.OpenShell/IssueSandboxToken",
+                ),
+                (
+                    Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: "sandbox-a".to_string(),
+                        source: SandboxIdentitySource::BootstrapJwt {
+                            issuer: "openshell-gateway:test".to_string(),
+                            auth_epoch: None,
+                        },
+                        trust_domain: None,
+                    }),
+                    "/openshell.v1.OpenShell/RefreshSandboxToken",
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                router
+                    .call(bearer_request(path, "sandbox-token", REQUEST_ID))
+                    .await
+                    .unwrap();
+
+                assert!(seen.lock().unwrap().is_some(), "{path} reached the handler");
+                let events = capture.json_events();
+                assert!(events.is_empty(), "{path}: {events:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn connections_share_logons() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let logons = audit::Logons::default();
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            for _ in 0..2 {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(user("alice"))),
+                ))]);
+                let mut connection =
+                    AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None)
+                        .with_logons(logons.clone());
+                connection
+                    .call(bearer_request(path, "alice-token", REQUEST_ID))
+                    .await
+                    .unwrap();
+            }
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+        }
+
+        #[tokio::test]
+        async fn each_certificate_logs_on_once() {
+            // A connection authenticated by the certificate with `fingerprint`,
+            // whose subject is always "alice".
+            let user = |fingerprint: &str, logons: &audit::Logons| {
+                AuthGrpcRouter::with_peer_identity(
+                    PrincipalRecorder::new().0,
+                    None,
+                    None,
+                    Some(mtls_identity("alice")),
+                    true,
+                    false,
+                )
+                .with_peer_certificate(Some(fingerprint.to_string()))
+                .with_logons(logons.clone())
+            };
+            let admin = |fingerprint: &str, logons: &audit::Logons| {
+                AuthGrpcRouter::with_peer_identity(
+                    PrincipalRecorder::new().0,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .with_operator(Some(OperatorPrincipal {
+                    certificate_sha256: fingerprint.to_string(),
+                    ..operator_principal()
+                }))
+                .with_logons(logons.clone())
+            };
+            for principal_type in ["User", "Admin"] {
+                let router = |fingerprint: &str, logons: &audit::Logons| {
+                    if principal_type == "User" {
+                        user(fingerprint, logons)
+                    } else {
+                        admin(fingerprint, logons)
+                    }
+                };
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let logons = audit::Logons::default();
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                // Two connections with one certificate, then a renewed
+                // certificate for the same subject.
+                for fingerprint in ["sha256-original", "sha256-original", "sha256-renewed"] {
+                    let mut router = router(fingerprint, &logons);
+                    for _ in 0..2 {
+                        router.call(empty_request(path)).await.unwrap();
+                    }
+                }
+
+                let events = capture.json_events();
+                assert_eq!(events.len(), 2, "{principal_type}: {events:?}");
+                for event in &events {
+                    assert_logon(event, path);
+                    assert_eq!(event["user"]["type"], principal_type);
+                    assert_eq!(event["auth_protocol"], "mtls");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unauthenticated_dev_user_does_not_log_on() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_some());
+            let events = capture.json_events();
+            assert!(events.is_empty(), "{events:?}");
+        }
+
         #[tokio::test]
         async fn health_methods_bypass_chain() {
             // Authenticator is wired to fail-closed; the request still gets
             // through because the path is exempt.
-            let mock = Arc::new(MockAuthenticator::returning(Err(
+            let mock = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("would reject"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![mock.clone()]);
             let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);

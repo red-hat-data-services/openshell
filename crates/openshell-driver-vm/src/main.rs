@@ -6,10 +6,11 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::SupervisorOtlpArgs;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
-    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -97,8 +98,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -111,6 +112,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
+
+    #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_EXTRACTION_MAX_BYTES")]
+    bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
 
     #[arg(
         long,
@@ -129,6 +133,22 @@ struct Args {
     /// Deprecated; client private keys are rejected.
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
+
+    /// Gateway-owned normalized destination trust artifact. This hidden option
+    /// is supplied only by the in-process gateway VM factory.
+    #[arg(long, hide = true)]
+    additional_ca_bundle: Option<PathBuf>,
+
+    /// Expected SHA-256 generation of the gateway-owned destination trust
+    /// artifact. Supplied with the path so the child can authenticate its
+    /// one-time startup read without receiving CA bytes on argv or in env.
+    #[arg(long, hide = true)]
+    additional_ca_digest: Option<String>,
+
+    /// Expected certificate count in the gateway-normalized destination trust
+    /// artifact.
+    #[arg(long, hide = true)]
+    additional_ca_certificate_count: Option<usize>,
 
     /// Corporate forward proxy for supervisor TLS egress.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
@@ -160,6 +180,19 @@ struct Args {
     /// server certificates re-signed by a TLS-intercepting proxy.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE")]
     upstream_proxy_ca_bundle: Option<PathBuf>,
+
+    /// AAAA handling for the host supervisors' mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_VM_POLICY_DNS_IPV6_EGRESS")]
+    policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefix (RFC 6052 CIDR) of the host network. Repeatable.
+    #[arg(
+        long = "nat64-prefix",
+        env = "OPENSHELL_VM_NAT64_PREFIXES",
+        value_delimiter = ','
+    )]
+    nat64_prefixes: Vec<String>,
 
     /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
     #[arg(
@@ -227,6 +260,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_VM_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -247,6 +283,12 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_vsock_control_socket: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    vm_vsock_runtime_initiated: bool,
+
+    #[arg(long, hide = true)]
+    vm_mount: Vec<String>,
 }
 
 #[tokio::main]
@@ -270,12 +312,18 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_vm::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
+    args.otlp.warn_deprecated();
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -291,17 +339,20 @@ async fn main() -> Result<()> {
         );
     }
 
+    let supervisor_otlp = args.otlp.supervisor_otlp();
     let driver = VmDriver::new(VmDriverConfig {
         allow_driver_config: args.admission_config_json.allow_driver_config,
         resource_admission: args.admission_config_json.resource_admission.clone(),
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_otlp,
+        supervisor_gateway_name: args.gateway_name.clone(),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
+        bootstrap_extraction_max_bytes: args.bootstrap_extraction_max_bytes,
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
@@ -310,6 +361,10 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        additional_ca_bundle: args.additional_ca_bundle.clone(),
+        additional_ca_digest: args.additional_ca_digest.clone(),
+        additional_ca_certificate_count: args.additional_ca_certificate_count,
+        additional_ca_snapshot: None,
         upstream_proxy: openshell_core::UpstreamProxyConfig {
             https_proxy: args.upstream_proxy.clone(),
             no_proxy: args.upstream_no_proxy.clone(),
@@ -318,6 +373,10 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
         },
         proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        ipv6_egress: openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
+            nat64_prefixes: args.nat64_prefixes.clone(),
+        },
         provider_spiffe_workload_api_tcp_endpoint: args
             .provider_spiffe_workload_api_tcp_endpoint
             .clone(),
@@ -329,6 +388,7 @@ async fn main() -> Result<()> {
         sandbox_gid: args.sandbox_gid,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
+        enable_bind_mounts: args.enable_bind_mounts,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -618,6 +678,12 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
 
+    let mounts = args
+        .vm_mount
+        .iter()
+        .map(|m| parse_vm_mount_arg(m))
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(VmLaunchConfig {
         root_disk,
         overlay_disk,
@@ -641,7 +707,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
             (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
                 guest_port,
                 host_socket,
-                host_initiated: true,
+                host_initiated: !args.vm_vsock_runtime_initiated,
             }),
             (None, None) => None,
             _ => {
@@ -651,6 +717,36 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
                 );
             }
         },
+        mounts,
+    })
+}
+
+fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
+    // Split from the right: the driver generates the tag and mode, so a tab
+    // in the source can never shift them.
+    let mut parts = arg.rsplitn(3, '\t');
+    let mode = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format: {arg}"))?;
+    let tag = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing tag): {arg}"))?;
+    let source = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing source): {arg}"))?;
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        _ => {
+            return Err(format!(
+                "invalid --vm-mount mode '{mode}': expected 'ro' or 'rw'"
+            ));
+        }
+    };
+    Ok(VmMount {
+        host_path: PathBuf::from(source),
+        tag: tag.to_string(),
+        read_only,
     })
 }
 
@@ -710,7 +806,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -752,6 +848,29 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_egress_flags_parse_with_supervisor_names() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--policy-dns-ipv6-egress",
+            "enabled",
+            "--nat64-prefix",
+            "64:ff9b:1::/96",
+            "--nat64-prefix",
+            "2001:db8:64::/96",
+        ]);
+        assert_eq!(
+            args.policy_dns_ipv6_egress,
+            Some(openshell_core::PolicyDnsIpv6Egress::Enabled)
+        );
+        assert_eq!(args.nat64_prefixes, ["64:ff9b:1::/96", "2001:db8:64::/96"]);
+        assert!(
+            Args::parse_from(["openshell-driver-vm"])
+                .nat64_prefixes
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn corporate_proxy_settings_default_to_unset() {
         let args = Args::parse_from(["openshell-driver-vm"]);
         assert!(args.upstream_proxy.is_none());
@@ -760,6 +879,45 @@ mod tests {
         assert!(!args.upstream_proxy_auth_allow_insecure);
         assert!(!args.upstream_proxy_connect_by_hostname);
         assert!(args.upstream_proxy_ca_bundle.is_none());
+    }
+
+    #[test]
+    fn internal_network_trust_options_have_no_environment_aliases() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--additional-ca-bundle",
+            "/var/lib/openshell/network/additional-ca.crt",
+            "--additional-ca-digest",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--additional-ca-certificate-count",
+            "2",
+        ]);
+        assert_eq!(
+            args.additional_ca_bundle.as_deref(),
+            Some(PathBuf::from("/var/lib/openshell/network/additional-ca.crt").as_path())
+        );
+        assert_eq!(
+            args.additional_ca_digest.as_deref(),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(args.additional_ca_certificate_count, Some(2));
+
+        temp_env::with_vars(
+            [
+                (
+                    "OPENSHELL_VM_ADDITIONAL_CA_BUNDLE",
+                    Some("/tmp/untrusted.crt"),
+                ),
+                ("OPENSHELL_VM_ADDITIONAL_CA_DIGEST", Some("sha256:bad")),
+                ("OPENSHELL_VM_ADDITIONAL_CA_CERTIFICATE_COUNT", Some("999")),
+            ],
+            || {
+                let args = Args::parse_from(["openshell-driver-vm"]);
+                assert!(args.additional_ca_bundle.is_none());
+                assert!(args.additional_ca_digest.is_none());
+                assert!(args.additional_ca_certificate_count.is_none());
+            },
+        );
     }
 
     #[test]
@@ -949,5 +1107,39 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readonly() {
+        let m = parse_vm_mount_arg("/host/src\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readwrite() {
+        let m = parse_vm_mount_arg("/host/src\tosfs1\trw").unwrap();
+        assert!(!m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_keeps_tag_and_mode_when_source_has_tab() {
+        let m = parse_vm_mount_arg("/host/src\tvfs9\trw\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src\tvfs9\trw"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_unknown_mode() {
+        let err = parse_vm_mount_arg("/host/src\tosfs0\treadonly").unwrap_err();
+        assert!(err.contains("expected 'ro' or 'rw'"));
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_missing_fields() {
+        assert!(parse_vm_mount_arg("/host/src\tosfs0").is_err());
+        assert!(parse_vm_mount_arg("/host/src").is_err());
     }
 }

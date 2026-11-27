@@ -16,6 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Initial stopped-sandbox configuration update protocol advertised by gateways.
+pub const SANDBOX_UPDATE_PROTOCOL: u32 = 1;
+
+/// Initial workspace secrets protocol advertised by gateways. A gateway that
+/// advertises it validates secret references and guards workspace deletion.
+pub const WORKSPACE_SECRETS_PROTOCOL: u32 = 1;
+
 const MEMBER_OBJECT_TYPE: &str = "gateway_member";
 
 /// How long a membership record stays valid without a refresh.
@@ -43,6 +50,12 @@ fn member_object_id(replica_id: &str) -> String {
 struct MemberPayload {
     replica_id: String,
     peer_endpoint: String,
+    /// Binary capability, not feature activation. Missing denotes old replicas.
+    #[serde(default)]
+    sandbox_update_protocol: u32,
+    /// Binary capability, not feature activation. Missing denotes old replicas.
+    #[serde(default)]
+    workspace_secrets_protocol: u32,
 }
 
 /// A gateway replica that was alive as of its last refresh.
@@ -71,6 +84,8 @@ impl GatewayMemberIndex {
         let payload = MemberPayload {
             replica_id: replica_id.to_string(),
             peer_endpoint: peer_endpoint.to_string(),
+            sandbox_update_protocol: SANDBOX_UPDATE_PROTOCOL,
+            workspace_secrets_protocol: WORKSPACE_SECRETS_PROTOCOL,
         };
         let bytes = serde_json::to_vec(&payload)
             .map_err(|err| PersistenceError::Encode(err.to_string()))?;
@@ -205,6 +220,9 @@ pub fn spawn_membership_worker(
 
             match index.ring().await {
                 Ok((ring, members)) => {
+                    if let Some(controller) = state.compute.supervisor_host() {
+                        controller.set_gateway_replicas(ring.replica_count());
+                    }
                     let peers: HashMap<String, String> = members
                         .into_iter()
                         .map(|member| (member.replica_id, member.peer_endpoint))

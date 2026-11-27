@@ -4,16 +4,16 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs, warn_credential_env_vars,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
+    parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
-    confirm_global_setting_takeover, format_epoch_ms, format_setting_value, format_timestamp,
-    format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
-    non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
-    print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
-    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
+    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
+    format_setting_value, format_timestamp, handle_platform_progress_event,
+    is_provisioning_progress_event, non_empty_or, parse_cli_setting_value, parse_duration_to_ms,
+    phase_name, print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
+    provisioning_blocker_message, provisioning_timeout_message, scrub_git_env, short_hash,
     truncate_status_field,
 };
 pub use crate::commands::gateway::{
@@ -30,20 +30,28 @@ pub use crate::commands::provider::{
     provider_profile_describe, provider_profile_describe_text, provider_profile_export,
     provider_profile_export_text, provider_profile_import, provider_profile_lint,
     provider_profile_update, provider_refresh_config, provider_refresh_delete,
-    provider_refresh_status, provider_rotate, provider_update, sandbox_provider_attach,
-    sandbox_provider_detach, sandbox_provider_list,
+    provider_refresh_inline_secrets, provider_refresh_status, provider_rotate, provider_update,
+    sandbox_provider_attach, sandbox_provider_detach, sandbox_provider_list,
 };
 pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provider_status};
+pub use crate::commands::secret::{
+    SecretCreateInput, SecretUpdateInput, SecretValueSource, secret_create, secret_delete,
+    secret_get, secret_list, secret_update,
+};
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{
-    TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
+    GrpcClient, TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
 };
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
+};
+use openshell_core::create_retry::{
+    AlreadyExistsPlan, CleanupPhase, HolderProvenance, RetryPlan, cleanup_wait_delay,
+    plan_already_exists, plan_retry, retry_stopped_suffix,
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
@@ -57,13 +65,15 @@ use openshell_core::proto::{
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
-    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxResponse, SandboxRestartPolicy, SandboxServiceExposure,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceBackendHttpVersion, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
+    StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
     UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
+use openshell_core::rpc_error::{MUTATION_LOCK_TIMEOUT, decode_details, is_mutation_lock_timeout};
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
@@ -96,7 +106,7 @@ fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::D
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
@@ -104,7 +114,7 @@ pub use openshell_core::forward::{
 };
 
 #[derive(Debug, PartialEq, Eq)]
-enum SandboxUploadPlan {
+pub(crate) enum SandboxUploadPlan {
     GitAware {
         base_dir: PathBuf,
         files: Vec<String>,
@@ -450,12 +460,18 @@ pub struct SandboxCreateConfig<'a> {
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
     pub suppress_credential_warnings: bool,
     pub restart_policy: &'a str,
+    pub provision_timeout_secs: Option<u32>,
+    /// Seconds to retry a create that lost the gateway mutation lock. `Some(0)`
+    /// disables retries; `None` reads `OPENSHELL_CREATE_RETRY_TIMEOUT` or the
+    /// 60s default.
+    pub create_retry_timeout_secs: Option<u32>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -480,13 +496,521 @@ impl Default for SandboxCreateConfig<'_> {
             tty_override: None,
             auto_providers_override: None,
             labels: HashMap::new(),
+            annotations: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
             detach: false,
             suppress_credential_warnings: false,
             restart_policy: "never",
+            provision_timeout_secs: None,
+            create_retry_timeout_secs: None,
         }
+    }
+}
+
+/// Upper bound on `OPENSHELL_CREATE_RETRY_TIMEOUT`, so an oversized value
+/// cannot build a budget that overflows the retry deadline.
+const MAX_CREATE_RETRY_TIMEOUT_SECS: u64 = 86_400;
+
+/// Resolve the create-retry budget from the flag value and the environment.
+///
+/// The flag wins; `OPENSHELL_CREATE_RETRY_TIMEOUT` follows the
+/// `OPENSHELL_PROVISION_TIMEOUT` precedent; the default keeps retries on for
+/// 60 seconds. A zero budget disables retries, which `--no-create-retry`
+/// selects. Both sources are clamped to 24 hours, so neither can build a
+/// budget that runs without bound.
+fn resolve_create_retry_timeout(flag_secs: Option<u32>) -> Duration {
+    if let Some(secs) = flag_secs {
+        return Duration::from_secs(u64::from(secs).min(MAX_CREATE_RETRY_TIMEOUT_SECS));
+    }
+    let secs = std::env::var("OPENSHELL_CREATE_RETRY_TIMEOUT")
+        .ok()
+        .map_or(60, |value| {
+            // An all-digits value that overflows `u64` is still a budget, not
+            // garbage: clamp it to the ceiling instead of falling back to the
+            // default.
+            value.parse::<u64>().unwrap_or_else(|_| {
+                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    u64::MAX
+                } else {
+                    60
+                }
+            })
+        });
+    Duration::from_secs(secs.min(MAX_CREATE_RETRY_TIMEOUT_SECS))
+}
+
+/// Deadline `budget` from now, saturating rather than panicking when the
+/// budget is larger than an [`Instant`] can represent.
+fn deadline_after(budget: Duration) -> Instant {
+    let now = Instant::now();
+    let mut budget = budget;
+    loop {
+        if let Some(deadline) = now.checked_add(budget) {
+            return deadline;
+        }
+        budget /= 2;
+    }
+}
+
+/// Seed for create-retry jitter, drawn once per create call.
+///
+/// `RandomState::new()` mixes a per-process and per-thread counter, so separate
+/// CLI invocations retrying the same sandbox name pick different jitter.
+/// Deriving it from the sandbox name instead would make every contender
+/// re-collide in lockstep.
+fn create_retry_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Decoded `RetryInfo` delay from a gateway status, when present.
+fn gateway_retry_delay(status: &Status) -> Option<Duration> {
+    decode_details(status)?.retry_info()?.retry_delay
+}
+
+/// One-decimal seconds for retry progress lines, e.g. `1.2s`.
+fn format_retry_delay(delay: Duration) -> String {
+    format!("{:.1}s", delay.as_secs_f64())
+}
+
+/// Whole seconds left in the retry budget, e.g. `47s`.
+fn format_retry_budget(remaining: Duration) -> String {
+    format!("{}s", remaining.as_secs())
+}
+
+/// Decision for the next create attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateAttemptPlan {
+    /// Sleep, then send the create again.
+    Sleep(Duration),
+    /// Stop and surface the failure.
+    Stop,
+}
+
+/// Wall-clock budget and jitter seed shared by one create retry loop.
+#[derive(Debug, Clone, Copy)]
+struct CreateRetry {
+    deadline: Instant,
+    seed: u64,
+}
+
+impl CreateRetry {
+    fn new(budget: Duration, seed: u64) -> Self {
+        Self {
+            deadline: deadline_after(budget),
+            seed,
+        }
+    }
+
+    /// Time left for retries and the `AlreadyExists` cleanup wait.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Plan the next attempt after a failed create.
+    ///
+    /// Only `MUTATION_LOCK_TIMEOUT` retries: every other failure may have run
+    /// after the gateway persisted the create, so repeating it can duplicate a
+    /// sandbox. `attempts_made` counts the create sends so far, so the shared
+    /// decision layer can stop at its attempt cap; `waited` is how long the
+    /// failed send took.
+    fn plan_create(
+        &self,
+        status: &Status,
+        attempts_made: u32,
+        waited: Duration,
+    ) -> CreateAttemptPlan {
+        if !is_mutation_lock_timeout(status) {
+            return CreateAttemptPlan::Stop;
+        }
+        match plan_retry(
+            gateway_retry_delay(status),
+            attempts_made,
+            waited,
+            self.seed,
+            self.remaining(),
+        ) {
+            RetryPlan::Sleep(delay) => CreateAttemptPlan::Sleep(delay),
+            RetryPlan::Stop => CreateAttemptPlan::Stop,
+        }
+    }
+}
+
+/// Hint shown when a live sandbox keeps the requested name.
+const SANDBOX_NAME_TAKEN_HINT: &str = "\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name";
+
+/// Report for a create that failed with `AlreadyExists` without retrying.
+fn already_exists_report(status: &Status) -> miette::Report {
+    miette::miette!("{}{SANDBOX_NAME_TAKEN_HINT}", status.message())
+}
+
+/// Annotation for a create failure that ended the retry loop.
+///
+/// Names the attempt count and, when the surfaced failure is not itself a lock
+/// timeout, the original lock timeout.
+fn create_retry_annotation(attempts: u32, lock_timeout: Option<&str>) -> String {
+    retry_stopped_suffix(attempts, lock_timeout)
+}
+
+/// Report for a lock timeout that ended the retry loop.
+fn create_timeout_report(status: &Status, attempts: u32) -> miette::Report {
+    miette::miette!(
+        "{}{}",
+        status.message(),
+        create_retry_annotation(attempts, None)
+    )
+}
+
+/// Report for a named create that ended retrying on `AlreadyExists`.
+///
+/// A terminal stop on the first attempt with no prior lock timeout keeps its
+/// plain shape; every other stop names the attempt count so a cleanup-wait
+/// timeout is never misread as a bare name conflict. `budget_exhausted` forces
+/// the annotation even on the first attempt, because an exhausted cleanup wait
+/// is never a terminal "name taken" answer. `detail` appends the observation
+/// that ended the wait, such as an unreadable holder status. The delete-first
+/// hint appears only when a live holder keeps the name.
+fn create_conflict_report(
+    status: &Status,
+    attempts: u32,
+    lock_timeout: Option<&str>,
+    holder_is_live: bool,
+    budget_exhausted: bool,
+    detail: Option<&str>,
+) -> miette::Report {
+    let mut message = status.message().to_string();
+    if let Some(detail) = detail {
+        message.push_str("; ");
+        message.push_str(detail);
+    }
+    if budget_exhausted || attempts > 1 || lock_timeout.is_some() {
+        message.push_str(&create_retry_annotation(attempts, lock_timeout));
+    }
+    if holder_is_live {
+        message.push_str(SANDBOX_NAME_TAKEN_HINT);
+    }
+    miette::miette!("{message}")
+}
+
+/// Send one create attempt without retrying.
+async fn create_sandbox_once(
+    client: &mut GrpcClient,
+    request: CreateSandboxRequest,
+) -> Result<SandboxResponse> {
+    match client.create_sandbox(request).await {
+        Ok(response) => Ok(response.into_inner()),
+        Err(status) if status.code() == Code::AlreadyExists => Err(already_exists_report(&status)),
+        Err(status) => Err(miette::miette!(status.to_string())),
+    }
+}
+
+/// Send the create, retrying only while the gateway mutation lock is busy.
+///
+/// `workspace` scopes the `AlreadyExists` phase poll the way the create request
+/// was scoped: a poll without it would disambiguate the name against the wrong
+/// workspace. Progress lines go to stderr so structured output on stdout stays
+/// parseable.
+async fn create_sandbox_with_retry(
+    client: &mut GrpcClient,
+    request: CreateSandboxRequest,
+    workspace: &str,
+    retry: CreateRetry,
+) -> Result<SandboxResponse> {
+    let name = request.name.clone();
+    let mut create_attempts: u32 = 0;
+    let mut not_found_retries: u32 = 0;
+    // Dual use: the last lock-timeout message annotates the surfaced failure,
+    // and its presence is how the AlreadyExists wait derives
+    // `HolderProvenance` (a record this command may have left). It is set only
+    // when a retry was actually planned, so a Stop on the first lock timeout
+    // keeps the plain error shape.
+    let mut lock_timeout: Option<String> = None;
+    // Identity of the holder observed during the current AlreadyExists
+    // conflict. Reset when a NotFound observation drives a create retry:
+    // that holder is gone, and the next conflict's holder is expected to have
+    // a fresh id (an own re-attempt persists a new record), so the
+    // same-name-replacement guard must not compare against the stale one.
+    let mut holder_id: Option<String> = None;
+
+    loop {
+        create_attempts += 1;
+        let sent = Instant::now();
+        match client.create_sandbox(request.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            // A lock timeout means different things per gateway step. The
+            // pre-record creation guard rejects before any write ran, so the
+            // request stays repeatable as-is. The SSH identity step also
+            // reports this reason, but only after the record was persisted:
+            // that failure is compensated server-side, and the next attempt
+            // resolves through the AlreadyExists cleanup wait below. A `--from`
+            // create whose staged archive was consumed by that step surfaces
+            // the gateway's spent-token error instead of retrying; re-staging
+            // the archive is tracked separately. `request_id` stays empty: a
+            // non-empty one would engage mutation replay and surface the
+            // recorded failure instead of retrying.
+            Err(status) if is_mutation_lock_timeout(&status) => {
+                let remaining = retry.remaining();
+                match retry.plan_create(&status, create_attempts, sent.elapsed()) {
+                    CreateAttemptPlan::Sleep(delay) => {
+                        eprintln!(
+                            "gateway busy ({MUTATION_LOCK_TIMEOUT}); retrying in {} (attempt {}, budget {} left)",
+                            format_retry_delay(delay),
+                            create_attempts + 1,
+                            format_retry_budget(remaining),
+                        );
+                        let message = status.message().to_string();
+                        tokio::time::sleep(delay).await;
+                        // A late timer wake must not start an attempt outside
+                        // the budget; an attempt that starts inside it may
+                        // still overrun, per the retry policy's contract.
+                        if retry.remaining().is_zero() {
+                            return Err(create_timeout_report(&status, create_attempts));
+                        }
+                        lock_timeout = Some(message);
+                    }
+                    CreateAttemptPlan::Stop => {
+                        return Err(create_timeout_report(&status, create_attempts));
+                    }
+                }
+            }
+            // A named create can lose the name to a sandbox that is still
+            // being deleted or still being created. The name frees when
+            // cleanup finishes, so the decision layer below waits, retries, or
+            // stops per phase.
+            Err(status) if status.code() == Code::AlreadyExists => {
+                if name.is_empty() {
+                    return Err(already_exists_report(&status));
+                }
+                let poll_delay = gateway_retry_delay(&status);
+                let mut wait_attempt: u32 = 0;
+                loop {
+                    let remaining = retry.remaining();
+                    if remaining.is_zero() {
+                        // The budget is spent before the poll: surface the
+                        // conflict instead of starting a read that cannot be
+                        // bounded.
+                        return Err(create_conflict_report(
+                            &status,
+                            create_attempts,
+                            lock_timeout.as_deref(),
+                            false,
+                            true,
+                            None,
+                        ));
+                    }
+                    let poll = GetSandboxRequest {
+                        name: name.clone(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            workspace.to_string(),
+                        )),
+                    };
+                    // Bound the read itself: a stuck GetSandbox must not keep
+                    // the retrying create pending past its budget.
+                    let observed = match tokio::time::timeout(remaining, client.get_sandbox(poll))
+                        .await
+                    {
+                        Err(_elapsed) => {
+                            return Err(create_conflict_report(
+                                &status,
+                                create_attempts,
+                                lock_timeout.as_deref(),
+                                false,
+                                true,
+                                None,
+                            ));
+                        }
+                        Ok(result) => match result {
+                            Ok(response) => match response.into_inner().sandbox {
+                                Some(sandbox) => {
+                                    let observed = match sandbox.phase() {
+                                        phase if phase == SandboxPhase::Deleting as i32 => {
+                                            CleanupPhase::Deleting
+                                        }
+                                        phase if phase == SandboxPhase::Provisioning as i32 => {
+                                            CleanupPhase::Provisioning
+                                        }
+                                        _ => CleanupPhase::Live,
+                                    };
+                                    // A missing id cannot identify the holder, so
+                                    // it neither counts as a change nor replaces
+                                    // the recorded id with an empty string.
+                                    let id = sandbox
+                                        .metadata
+                                        .as_ref()
+                                        .map(|metadata| metadata.id.as_str())
+                                        .filter(|id| !id.is_empty());
+                                    // A different id means the name changed hands;
+                                    // waiting on it would watch the wrong holder. A
+                                    // live replacement keeps the name, so it gets
+                                    // the same delete-first hint as a live holder.
+                                    if let (Some(held), Some(id)) = (holder_id.as_deref(), id)
+                                        && held != id
+                                    {
+                                        return Err(create_conflict_report(
+                                            &status,
+                                            create_attempts,
+                                            lock_timeout.as_deref(),
+                                            observed == CleanupPhase::Live,
+                                            false,
+                                            None,
+                                        ));
+                                    }
+                                    if let Some(id) = id {
+                                        holder_id = Some(id.to_string());
+                                    }
+                                    observed
+                                }
+                                None => CleanupPhase::NotFound,
+                            },
+                            Err(not_found) if not_found.code() == Code::NotFound => {
+                                CleanupPhase::NotFound
+                            }
+                            // A transient read failure says nothing about the
+                            // holder: wait one poll interval and ask again while
+                            // the budget allows.
+                            Err(transient) if transient.code() == Code::Unavailable => {
+                                let delay =
+                                    cleanup_wait_delay(poll_delay, wait_attempt, retry.seed);
+                                if delay > retry.remaining() {
+                                    return Err(create_conflict_report(
+                                        &status,
+                                        create_attempts,
+                                        lock_timeout.as_deref(),
+                                        false,
+                                        true,
+                                        None,
+                                    ));
+                                }
+                                eprintln!(
+                                    "sandbox '{name}' holder status unavailable; retrying in {} (budget {} left)",
+                                    format_retry_delay(delay),
+                                    format_retry_budget(retry.remaining()),
+                                );
+                                tokio::time::sleep(delay).await;
+                                wait_attempt += 1;
+                                continue;
+                            }
+                            // Any other read failure says nothing about the holder
+                            // either, but waiting cannot resolve it. Surface the
+                            // name conflict, not the read error, so the caller
+                            // keeps the AlreadyExists contract and the delete-first
+                            // hint.
+                            Err(other) => {
+                                let detail =
+                                    format!("holder status unavailable: {}", other.message());
+                                return Err(create_conflict_report(
+                                    &status,
+                                    create_attempts,
+                                    lock_timeout.as_deref(),
+                                    false,
+                                    false,
+                                    Some(&detail),
+                                ));
+                            }
+                        },
+                    };
+                    if observed != CleanupPhase::NotFound {
+                        not_found_retries = 0;
+                    }
+                    // A provisioning holder is only waited out when an earlier
+                    // attempt of this command may have left it: a lock timeout
+                    // was already observed.
+                    let provenance = if lock_timeout.is_some() {
+                        HolderProvenance::OwnPriorAttempt
+                    } else {
+                        HolderProvenance::OtherCaller
+                    };
+                    match plan_already_exists(
+                        observed,
+                        not_found_retries,
+                        poll_delay,
+                        wait_attempt,
+                        create_attempts,
+                        retry.seed,
+                        provenance,
+                    ) {
+                        AlreadyExistsPlan::Wait(delay) => {
+                            if delay > retry.remaining() {
+                                return Err(create_conflict_report(
+                                    &status,
+                                    create_attempts,
+                                    lock_timeout.as_deref(),
+                                    false,
+                                    true,
+                                    None,
+                                ));
+                            }
+                            eprintln!(
+                                "sandbox '{name}' exists and {}; waiting for cleanup ({}, budget {} left)",
+                                cleanup_phase_progress(observed),
+                                format_retry_delay(delay),
+                                format_retry_budget(retry.remaining()),
+                            );
+                            tokio::time::sleep(delay).await;
+                            wait_attempt += 1;
+                        }
+                        AlreadyExistsPlan::RetryCreate => {
+                            if retry.remaining().is_zero() {
+                                return Err(create_conflict_report(
+                                    &status,
+                                    create_attempts,
+                                    lock_timeout.as_deref(),
+                                    false,
+                                    true,
+                                    None,
+                                ));
+                            }
+                            eprintln!(
+                                "sandbox '{name}' is not visible; retrying the create (budget {} left)",
+                                format_retry_budget(retry.remaining()),
+                            );
+                            not_found_retries += 1;
+                            // The observed holder is gone (NotFound drove this
+                            // retry), so the next conflict starts without a
+                            // recorded id to compare against.
+                            holder_id = None;
+                            break;
+                        }
+                        AlreadyExistsPlan::Stop => {
+                            // A Provisioning holder under OwnPriorAttempt
+                            // reaches Stop only through the attempt cap, which
+                            // the attempt-count annotation already names; only
+                            // another caller's provisioning holder gets the
+                            // attribution.
+                            return Err(create_conflict_report(
+                                &status,
+                                create_attempts,
+                                lock_timeout.as_deref(),
+                                observed == CleanupPhase::Live,
+                                false,
+                                if observed == CleanupPhase::Provisioning
+                                    && provenance == HolderProvenance::OtherCaller
+                                {
+                                    Some("the holder is still being created by another caller")
+                                } else {
+                                    None
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(status) => return Err(miette::miette!(status.to_string())),
+        }
+    }
+}
+
+/// Progress phrase for a holder observed during the cleanup wait.
+fn cleanup_phase_progress(observed: CleanupPhase) -> &'static str {
+    match observed {
+        CleanupPhase::Deleting => "is being deleted",
+        CleanupPhase::Provisioning => "is still being created",
+        CleanupPhase::NotFound | CleanupPhase::Live => "cannot be observed",
     }
 }
 
@@ -518,12 +1042,15 @@ pub async fn sandbox_create(
         tty_override,
         auto_providers_override,
         labels,
+        mut annotations,
         environment,
         approval_mode,
         output,
         detach,
         suppress_credential_warnings,
         restart_policy,
+        provision_timeout_secs,
+        create_retry_timeout_secs,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -590,8 +1117,8 @@ pub async fn sandbox_create(
     }
 
     // Resolve the --from flag into a container image reference, or stage a
-    // rootfs tar on the gateway and retain its staging token. Template creates
-    // resolve workload shape on the gateway and skip --from.
+    // rootfs tar on the gateway and retain its single-use staging token.
+    // Template creates resolve workload shape on the gateway and skip --from.
     let (image, rootfs_tar_token): (Option<String>, Option<String>) = if template.is_some() {
         (None, None)
     } else {
@@ -662,14 +1189,12 @@ pub async fn sandbox_create(
             && command.is_empty()
             && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
     let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
-    let annotations = if persist {
-        HashMap::new()
-    } else {
-        HashMap::from([(
+    if !persist {
+        annotations.insert(
             "openshell.nvidia.com/retention".to_string(),
             "ephemeral".to_string(),
-        )])
-    };
+        );
+    }
     let request = CreateSandboxRequest {
         request_id: String::new(),
         spec: Some(SandboxSpec {
@@ -710,21 +1235,31 @@ pub async fn sandbox_create(
             .collect(),
     };
 
-    let response = match client.create_sandbox(request).await {
-        Ok(resp) => resp,
-        Err(status) if status.code() == Code::AlreadyExists => {
-            return Err(miette::miette!(
-                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
-                status.message()
-            ));
-        }
-        Err(status) => return Err(miette::miette!(status.to_string())),
+    let create_retry_timeout = resolve_create_retry_timeout(create_retry_timeout_secs);
+    // Box the attempts: the retry loop carries enough state that inlining it
+    // pushes every caller's future past clippy's size lint.
+    let response = if create_retry_timeout.is_zero() {
+        Box::pin(create_sandbox_once(&mut client, request)).await?
+    } else {
+        Box::pin(create_sandbox_with_retry(
+            &mut client,
+            request,
+            workspace,
+            CreateRetry::new(create_retry_timeout, create_retry_seed()),
+        ))
+        .await?
     };
-    let response = response.into_inner();
+    let application_service_urls = response.application_service_urls;
     let service_urls = response
         .service_urls
         .into_iter()
-        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .map(|(service, url)| {
+            let url = application_service_urls
+                .get(&service)
+                .cloned()
+                .unwrap_or_else(|| service_url_for_gateway(&url, &effective_server));
+            (service, url)
+        })
         .collect::<HashMap<_, _>>();
     let sandbox = response
         .sandbox
@@ -837,11 +1372,15 @@ pub async fn sandbox_create(
     let mut last_phase = sandbox.phase();
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
-    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
+    let mut last_condition_message = provisioning_blocker_message(sandbox.status.as_ref());
     let provision_timeout = Duration::from_secs(
-        std::env::var("OPENSHELL_PROVISION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        provision_timeout_secs
+            .map(u64::from)
+            .or_else(|| {
+                std::env::var("OPENSHELL_PROVISION_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
@@ -911,7 +1450,7 @@ pub async fn sandbox_create(
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
                 last_sandbox = s.clone();
-                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                if let Some(message) = provisioning_blocker_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
 
@@ -1062,10 +1601,11 @@ pub async fn sandbox_create(
                 }
                 // Boxed so the upload state machine lives on the heap instead of
                 // inflating the `sandbox_create` future (clippy::large_futures).
-                Box::pin(sandbox_upload_planned(
+                Box::pin(crate::ssh::sandbox_upload_planned(
                     upload_plan,
                     &effective_server,
                     &sandbox_name,
+                    Some(sandbox.object_id()),
                     Path::new(local_path),
                     dest,
                     &effective_tls,
@@ -1113,10 +1653,9 @@ pub async fn sandbox_create(
                     "\u{2713}".green().bold(),
                 );
                 if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
-                    eprintln!(
-                        "  Access at: {}",
-                        service_url_for_gateway(url, &effective_server)
-                    );
+                    eprintln!("  Access at: {url}");
+                } else {
+                    eprintln!("  {NO_PUBLIC_SERVICE_URL}");
                 }
             }
 
@@ -1372,7 +1911,7 @@ fn rootfs_tar_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) 
 /// file. Returns the token to pass on `CreateSandbox`.
 async fn stage_rootfs_tar(
     gateway_name: &str,
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     workspace: &str,
     tar_path: &Path,
 ) -> Result<String> {
@@ -1519,11 +2058,12 @@ fn merge_rootfs_tar_driver_config(
     Ok(config)
 }
 
-/// Load sandbox policy YAML.
+/// Load a sandbox policy file, YAML or Cedar.
 ///
 /// Resolution order: `--policy` flag > `OPENSHELL_SANDBOX_POLICY` env var.
 /// Returns `None` when no policy source is configured, allowing the server
-/// to apply its own default.
+/// to apply its own default. A Cedar file is carried as-is; the gateway
+/// validates it.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     openshell_policy::load_sandbox_policy(cli_path)
 }
@@ -1638,6 +2178,7 @@ where
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await;
     let config = match config_result {
@@ -1806,6 +2347,17 @@ where
         println!(
             "    Results come from observed MCP over HTTP traffic. They do not check current availability or tool-call success."
         );
+    }
+
+    if let Some(observation) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+    {
+        println!("  {}", "Last token grant failure:".dimmed());
+        for line in token_grant_failure_display_lines(observation) {
+            println!("    {line}");
+        }
     }
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
@@ -2232,7 +2784,7 @@ pub async fn service_forward_tcp(
 }
 
 async fn create_forward_session_token(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     sandbox_name: &str,
     workspace: &str,
 ) -> std::result::Result<String, ForwardTcpConnectionError> {
@@ -2258,7 +2810,7 @@ fn forward_requires_session_token(status: &Status) -> bool {
 
 /// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     name: &str,
     workspace: &str,
 ) -> Result<Option<AsciiMetadataValue>> {
@@ -2352,7 +2904,7 @@ fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(Str
 
 #[allow(clippy::too_many_arguments)] // one connection's sandbox, target, and authorization context
 async fn forward_one_tcp_connection(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     socket: tokio::net::TcpStream,
     sandbox_name: String,
     workspace: String,
@@ -2438,7 +2990,7 @@ type OpenForwardTcpStream = (
 );
 
 async fn open_forward_tcp_stream(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     init: TcpForwardInit,
     replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<OpenForwardTcpStream, Status> {
@@ -2451,7 +3003,7 @@ async fn open_forward_tcp_stream(
     Ok((tx, response?.into_inner()))
 }
 
-async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
+async fn revoke_forward_session_token(client: &mut GrpcClient, token: Option<String>) {
     if let Some(token) = token {
         let _ = client
             .revoke_ssh_session(RevokeSshSessionRequest {
@@ -2565,7 +3117,7 @@ impl Drop for TaskGuard {
 
 #[allow(clippy::too_many_arguments)]
 async fn sandbox_exec_streaming_grpc(
-    mut client: crate::tls::GrpcClient,
+    mut client: GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
     workdir: Option<&str>,
@@ -2958,8 +3510,8 @@ pub async fn sandbox_list(
             {
                 phase.red().to_string()
             }
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Suspended) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(
@@ -3037,10 +3589,22 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
                     "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "last_failure": endpoint.last_failure.as_ref().map(endpoint_failure_to_json),
                 })
             })
             .collect::<Vec<_>>()
     });
+    let last_token_grant_failure = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+        .map(|observation| {
+            serde_json::json!({
+                "destination_host": observation.destination_host,
+                "destination_port": observation.destination_port,
+                "failure": observation.failure.as_ref().map(endpoint_failure_to_json),
+            })
+        });
     let admission = sandbox
         .status
         .as_ref()
@@ -3097,6 +3661,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
+        "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -3154,6 +3719,83 @@ fn endpoint_result_name(result: EndpointResult) -> &'static str {
     }
 }
 
+fn endpoint_failure_domain_name(domain: i32) -> &'static str {
+    match openshell_core::proto::EndpointFailureDomain::try_from(domain) {
+        Ok(openshell_core::proto::EndpointFailureDomain::TokenGrant) => "token_grant",
+        Ok(openshell_core::proto::EndpointFailureDomain::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn endpoint_failure_recovery_name(
+    action: openshell_core::proto::ProviderCredentialRefreshRecoveryAction,
+) -> &'static str {
+    match action {
+        // Structured output names every value; "-" is a table placeholder.
+        openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Unspecified => {
+            "unspecified"
+        }
+        action => crate::commands::provider::provider_refresh_recovery_action_name(action),
+    }
+}
+
+fn endpoint_failure_to_json(failure: &openshell_core::proto::EndpointFailure) -> serde_json::Value {
+    serde_json::json!({
+        "domain": endpoint_failure_domain_name(failure.domain),
+        "code": failure.code,
+        "recovery_action": endpoint_failure_recovery_name(failure.recovery_action()),
+        "provider": failure.provider,
+        "credential_key": failure.credential_key,
+        "stage": failure.stage,
+        "upstream_http_status": failure.upstream_http_status,
+        "request_id": failure.request_id,
+    })
+}
+
+fn endpoint_failure_display_lines(failure: &openshell_core::proto::EndpointFailure) -> Vec<String> {
+    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction as Recovery;
+    let upstream = failure
+        .upstream_http_status
+        .map(|status| format!(", upstream HTTP {status}"))
+        .unwrap_or_default();
+    let recovery = match failure.recovery_action() {
+        Recovery::Retry => "Retry later; the failure can be temporary.",
+        Recovery::Reauthorize => "Reauthorize the provider credential.",
+        Recovery::FixConfiguration => {
+            "An operator must fix the provider or identity configuration."
+        }
+        Recovery::Investigate => "An operator must investigate gateway and supervisor logs.",
+        Recovery::Unspecified => "No recovery action provided.",
+    };
+    let mut lines = vec![format!(
+        "Cause: {} ({}, stage {}{upstream})",
+        failure.code,
+        endpoint_failure_domain_name(failure.domain).replace('_', " "),
+        failure.stage,
+    )];
+    if !failure.provider.is_empty() {
+        lines.push(format!(
+            "Credential: {}/{}",
+            failure.provider, failure.credential_key
+        ));
+    }
+    lines.push(format!("Recovery: {recovery}"));
+    lines.push(format!("Request ID: {}", failure.request_id));
+    lines
+}
+
+fn token_grant_failure_display_lines(
+    observation: &openshell_core::proto::TokenGrantFailureObservation,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Destination: {} (port {})",
+        observation.destination_host, observation.destination_port
+    )];
+    if let Some(failure) = observation.failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines
+}
+
 fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     let ports = endpoint
         .ports
@@ -3179,14 +3821,18 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         .last_reported_time
         .as_ref()
         .map_or_else(|| "no report yet".to_string(), ToString::to_string);
-    vec![
+    let mut lines = vec![
         format!(
             "{} (ports: {ports}; path: {})",
             endpoint.host, endpoint.path
         ),
         format!("Last result: {result}"),
-        format!("Reported at (gateway acceptance): {reported_at}"),
-    ]
+    ];
+    if let Some(failure) = endpoint.last_failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines.push(format!("Reported at (gateway acceptance): {reported_at}"));
+    lines
 }
 
 fn restart_policy_name(policy: i32) -> &'static str {
@@ -4009,6 +4655,14 @@ pub async fn sandbox_stop(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    // A successful stop can preserve a canonical result when the transient
+    // compute resource is already gone. There is no Stopped event to wait for.
+    if sandbox.phase() == SandboxPhase::Completed as i32
+        || (sandbox.phase() == SandboxPhase::Error as i32 && has_main_process_result(&sandbox))
+    {
+        println!("{} Sandbox {name} already finished", "✓".green().bold());
+        return Ok(());
+    }
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
     println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())
@@ -4040,8 +4694,112 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
+pub async fn sandbox_suspend(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Resume a suspended sandbox and wait until it is ready.
+pub async fn sandbox_resume(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            restart_if_restore_fails: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Whether `phase` means a lifecycle wait for `target` can no longer succeed
+/// without another lifecycle request.
+fn lifecycle_phase_blocks_target(target: SandboxPhase, phase: SandboxPhase) -> bool {
+    match target {
+        SandboxPhase::Ready => matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Suspended => matches!(
+            phase,
+            SandboxPhase::Ready
+                | SandboxPhase::Starting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Stopped => phase == SandboxPhase::Deleting,
+        _ => false,
+    }
+}
+
+fn lifecycle_phase_error(
+    sandbox: &Sandbox,
+    target: SandboxPhase,
+    phase: SandboxPhase,
+) -> Option<miette::Report> {
+    if phase == SandboxPhase::Error {
+        let detail = provisioning_blocker_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Some(miette!(
+            "{detail} while waiting for {}",
+            phase_name(target as i32)
+        ));
+    }
+    if lifecycle_phase_blocks_target(target, phase) {
+        return Some(miette!(
+            "sandbox entered {} while waiting for {}",
+            phase_name(phase as i32),
+            phase_name(target as i32)
+        ));
+    }
+    None
+}
+
 async fn wait_for_lifecycle_phase(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     sandbox: Sandbox,
     target: SandboxPhase,
 ) -> Result<Sandbox> {
@@ -4049,10 +4807,8 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
-    if current == SandboxPhase::Error {
-        let detail = ready_false_condition_message(sandbox.status.as_ref())
-            .unwrap_or_else(|| "sandbox entered Error".to_string());
-        return Err(miette!("{detail} while waiting for {target:?}"));
+    if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
+        return Err(err);
     }
 
     let timeout = Duration::from_secs(
@@ -4108,34 +4864,51 @@ async fn wait_for_lifecycle_phase(
             if phase == target {
                 return Ok(sandbox);
             }
-            if phase == SandboxPhase::Error {
-                let detail = ready_false_condition_message(sandbox.status.as_ref())
-                    .unwrap_or_else(|| "sandbox entered Error".to_string());
-                return Err(miette!(detail));
+            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
+                return Err(err);
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_expose(
     server: &str,
     sandbox: &str,
     service: &str,
     target_port: u16,
     authorization_mode: ServiceAuthorizationMode,
+    backend_http_version: ServiceBackendHttpVersion,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let response = expose_service_endpoint(
-        server,
-        sandbox,
-        service,
-        target_port,
-        authorization_mode,
-        workspace,
-        tls,
-    )
-    .await?;
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            name: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+            authorization_mode: authorization_mode as i32,
+            backend_http_version: backend_http_version as i32,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))?
+        .into_inner();
+
+    if backend_http_version == ServiceBackendHttpVersion::Http2
+        && response.endpoint.as_ref().is_none_or(|endpoint| {
+            endpoint.backend_http_version() != ServiceBackendHttpVersion::Http2
+        })
+    {
+        return Err(miette!(
+            "the gateway did not confirm the HTTP/2 backend and may have saved an HTTP/1.1 declaration. Upgrade the gateway and expose the service again"
+        ));
+    }
 
     if service.is_empty() {
         println!(
@@ -4153,38 +4926,13 @@ pub async fn service_expose(
             target_port,
         );
     }
-    if !response.url.is_empty() {
-        let url = service_url_for_gateway(&response.url, server);
+    if response.url.is_empty() {
+        println!("  {NO_PUBLIC_SERVICE_URL}");
+    } else {
+        let url = preferred_service_url(&response, server);
         println!("  URL: {}", url.cyan());
     }
     Ok(())
-}
-
-async fn expose_service_endpoint(
-    server: &str,
-    sandbox: &str,
-    service: &str,
-    target_port: u16,
-    authorization_mode: ServiceAuthorizationMode,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<ServiceEndpointResponse> {
-    let mut client = grpc_client(server, tls).await?;
-    client
-        .expose_service(ExposeServiceRequest {
-            request_id: String::new(),
-            sandbox: sandbox.to_string(),
-            name: service.to_string(),
-            target_port: u32::from(target_port),
-            domain: true,
-            authorization_mode: authorization_mode as i32,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
-        .map(tonic::Response::into_inner)
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
@@ -4367,7 +5115,7 @@ fn print_service_endpoint_table(
             let url = if response.url.is_empty() {
                 String::new()
             } else {
-                service_url_for_gateway(&response.url, gateway_endpoint)
+                preferred_service_url(response, gateway_endpoint)
             };
             Some((
                 workspace.to_string(),
@@ -4458,7 +5206,7 @@ fn service_endpoint_to_json(
     let url = if response.url.is_empty() {
         String::new()
     } else {
-        service_url_for_gateway(&response.url, gateway_endpoint)
+        preferred_service_url(response, gateway_endpoint)
     };
 
     Some(serde_json::json!({
@@ -4468,8 +5216,12 @@ fn service_endpoint_to_json(
         "target_port": endpoint.target_port,
         "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
+        "application_url": response.application_url,
+        "gateway_url": service_url_for_gateway(&response.gateway_url, gateway_endpoint),
     }))
 }
+
+const NO_PUBLIC_SERVICE_URL: &str = "No public URL is configured for this service. Ask the gateway operator to configure application ingress or gateway service routing.";
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
@@ -4482,13 +5234,16 @@ fn service_authorization_mode_name(mode: i32) -> &'static str {
     }
 }
 
-/// Read gcloud Application Default Credentials from disk.
-///
-/// Returns `(client_id, client_secret, refresh_token)`.
-///
-/// Checks `GOOGLE_APPLICATION_CREDENTIALS` first; falls back to
-/// `$CLOUDSDK_CONFIG/application_default_credentials.json` when set, then to
-/// `~/.config/gcloud/application_default_credentials.json`.
+/// Application origins are independent of the gateway transport. Only legacy
+/// gateway URLs inherit a caller's external gateway port.
+fn preferred_service_url(response: &ServiceEndpointResponse, gateway: &str) -> String {
+    if response.application_url.is_empty() {
+        service_url_for_gateway(&response.url, gateway)
+    } else {
+        response.application_url.clone()
+    }
+}
+
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -4515,6 +5270,7 @@ pub async fn workspace_create(
     server: &str,
     name: &str,
     label_args: &[String],
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     use openshell_core::proto::CreateWorkspaceRequest;
@@ -4542,6 +5298,10 @@ pub async fn workspace_create(
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
 
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
+
     println!(
         "{} Created workspace {}",
         "✓".green().bold(),
@@ -4551,7 +5311,7 @@ pub async fn workspace_create(
     Ok(())
 }
 
-pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn workspace_get(server: &str, name: &str, output: &str, tls: &TlsOptions) -> Result<()> {
     use openshell_core::proto::GetWorkspaceRequest;
 
     let mut client = grpc_client(server, tls).await?;
@@ -4566,6 +5326,10 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
         .into_inner()
         .workspace
         .ok_or_else(|| miette!("workspace missing from response"))?;
+
+    if crate::output::print_output_single(output, &workspace, workspace_to_json)? {
+        return Ok(());
+    }
 
     println!("{}", "Workspace:".cyan().bold());
     println!();
@@ -5117,38 +5881,6 @@ fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
     Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
-async fn sandbox_upload_planned(
-    plan: SandboxUploadPlan,
-    server: &str,
-    name: &str,
-    local_path: &Path,
-    sandbox_path: Option<&str>,
-    tls: &TlsOptions,
-    workspace: &str,
-) -> Result<Option<String>> {
-    match plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-            Ok(None)
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
-                .await
-                .map(Some)
-        }
-    }
-}
-
 /// Upload a local path to a sandbox.
 ///
 /// Symlink sources, including dangling links, bypass Git-aware filtering so
@@ -5170,10 +5902,11 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    let uploaded_path = sandbox_upload_planned(
+    let uploaded_path = crate::ssh::sandbox_upload_planned(
         upload_plan,
         server,
         name,
+        None,
         local_path,
         sandbox_path,
         tls,
@@ -5192,6 +5925,42 @@ pub async fn sandbox_upload(
 // ---------------------------------------------------------------------------
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
+
+pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
+    let policy = openshell_policy::parse_sandbox_policy_file(Path::new(policy_path))?;
+    let size = policy.encoded_len();
+    if size > openshell_policy::MAX_AUTHORED_POLICY_SIZE {
+        miette::bail!(
+            "policy serialized size exceeds maximum ({size} > {})",
+            openshell_policy::MAX_AUTHORED_POLICY_SIZE
+        );
+    }
+    let mut violations: Vec<String> = openshell_policy::find_endpoint_ambiguities(&policy)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut middlewares: Vec<_> = policy.network_middlewares.iter().collect();
+    middlewares.sort_by_key(|(name, _)| *name);
+    for (name, middleware) in middlewares {
+        if middleware.middleware.starts_with("openshell/")
+            && let Err(error) = openshell_supervisor_middleware_builtins::validate_config(
+                &middleware.middleware,
+                &middleware.config.clone().unwrap_or_default(),
+            )
+        {
+            violations.push(format!("middleware config '{name}' is invalid: {error}"));
+        }
+    }
+    if let Err(error) = openshell_policy::validate_and_canonicalize_authored_policy(policy) {
+        violations.extend(error);
+    }
+    if !violations.is_empty() {
+        miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
+    }
+    println!("Policy is valid (offline): {policy_path}");
+    println!("Gateway checks for providers, external middleware, images and drivers are not run.");
+    Ok(())
+}
 
 pub async fn sandbox_policy_set_global(
     server: &str,
@@ -5251,6 +6020,7 @@ pub async fn sandbox_settings_get(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -5707,6 +6477,7 @@ pub async fn sandbox_policy_update(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -5715,6 +6486,12 @@ pub async fn sandbox_policy_update(
     if current.policy_source == PolicySource::Global as i32 {
         return Err(miette!(
             "policy is managed globally; delete the global policy before using `openshell policy update`"
+        ));
+    }
+    if current.policy.as_ref().is_some_and(SandboxPolicy::is_cedar) {
+        return Err(miette!(
+            "incremental policy updates are not available for Cedar policies; edit the Cedar \
+             policy and replace it with `openshell policy set`"
         ));
     }
 
@@ -5962,7 +6739,7 @@ where
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                    .wrap_err("failed to serialize policy")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
                 writeln!(stderr, "Policy payload not available for this version")
@@ -5998,6 +6775,7 @@ where
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6070,7 +6848,7 @@ where
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                    .wrap_err("failed to serialize policy")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
         }
@@ -6132,7 +6910,7 @@ pub async fn sandbox_policy_get_global(
                 println!("---");
                 let policy = policy_for_view(policy, view);
                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                    .wrap_err("failed to serialize policy")?;
                 print!("{yaml_str}");
             } else {
                 eprintln!("Policy payload not available for this version");
@@ -6217,9 +6995,7 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
     }
 
     let mut base_policy = policy.clone();
-    base_policy
-        .network_policies
-        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    openshell_policy::strip_provider_rule_names(&mut base_policy);
     Cow::Owned(base_policy)
 }
 
@@ -6841,7 +7617,7 @@ pub async fn sandbox_draft_history(
 
         println!(
             "  {} {} [{}] {}",
-            format_timestamp_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
+            format_optional_epoch_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
             event_colored,
             entry.chunk_id.get(..8).unwrap_or(&entry.chunk_id),
             entry.description,
@@ -6880,6 +7656,9 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     } else {
         endpoint.protocol.as_str()
     };
+    if endpoint.protocol.is_empty() || endpoint.protocol.eq_ignore_ascii_case("tcp") {
+        return format!("{host_port} [{layer_tag}, no HTTP method/path filter]");
+    }
     tags.push(layer_tag.to_string());
 
     if endpoint.access != 0 {
@@ -6908,17 +7687,54 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
-        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
-        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
-        ready_false_condition_message, relay_local_socket, resolve_from,
+        CreateAttemptPlan, CreateRetry, ForwardTcpConnectionError, MAX_CREATE_RETRY_TIMEOUT_SECS,
+        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, create_retry_annotation,
+        deadline_after, format_endpoint, format_log_line, forward_requires_session_token,
+        git_sync_files, has_main_process_result, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_driver_config_json, parse_env_from_pairs,
+        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
+        proto_execution_timeout, provisioning_blocker_message, provisioning_timeout_message,
+        relay_local_socket, resolve_create_retry_timeout, resolve_from,
         rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
         service_endpoint_to_json, service_status_error, service_url_for_gateway,
         workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
+        use super::lifecycle_phase_blocks_target;
+        use openshell_core::proto::SandboxPhase;
+
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspended
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Starting
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Stopped
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Ready
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Stopped,
+            SandboxPhase::Suspended
+        ));
+    }
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
@@ -6950,6 +7766,191 @@ mod tests {
                 nanos: 0,
             }
         );
+    }
+
+    fn mutation_lock_timeout(delay: Duration) -> Status {
+        openshell_core::rpc_error::unavailable(
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+            "gateway busy",
+            delay,
+        )
+    }
+
+    #[test]
+    fn create_retry_sleeps_between_the_server_floor_and_the_jitter_bound() {
+        let retry = CreateRetry::new(Duration::from_mins(1), 7);
+        let delay = Duration::from_millis(200);
+        for attempts_made in 1..=4 {
+            let floor = delay * (1 << (attempts_made - 1));
+            let CreateAttemptPlan::Sleep(sleep) =
+                retry.plan_create(&mutation_lock_timeout(delay), attempts_made, Duration::ZERO)
+            else {
+                panic!("a lock timeout inside the budget must retry");
+            };
+            assert!(sleep >= floor, "the floor must not be undercut: {sleep:?}");
+            assert!(
+                sleep <= floor + floor / 2,
+                "jitter is capped at half the delay: {sleep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_retry_stops_at_the_attempt_cap() {
+        let retry = CreateRetry::new(Duration::from_mins(1), 7);
+        let status = mutation_lock_timeout(Duration::from_millis(1));
+        assert!(matches!(
+            retry.plan_create(
+                &status,
+                openshell_core::create_retry::MAX_CREATE_ATTEMPTS - 1,
+                Duration::ZERO
+            ),
+            CreateAttemptPlan::Sleep(_)
+        ));
+        assert_eq!(
+            retry.plan_create(
+                &status,
+                openshell_core::create_retry::MAX_CREATE_ATTEMPTS,
+                Duration::ZERO
+            ),
+            CreateAttemptPlan::Stop,
+            "the attempt cap must stop the retry even with budget left"
+        );
+    }
+
+    #[test]
+    fn create_retry_stops_when_the_budget_is_spent() {
+        let retry = CreateRetry::new(Duration::ZERO, 7);
+        assert_eq!(
+            retry.plan_create(
+                &mutation_lock_timeout(Duration::from_millis(1)),
+                1,
+                Duration::ZERO
+            ),
+            CreateAttemptPlan::Stop
+        );
+    }
+
+    #[test]
+    fn create_retry_ignores_other_transient_failures() {
+        // DATABASE_UNAVAILABLE and a bare UNAVAILABLE also carry RetryInfo, but
+        // a create may have persisted before them, so repeating is unsafe.
+        let retry = CreateRetry::new(Duration::from_mins(1), 7);
+        let database = openshell_core::rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            "database is unavailable",
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            retry.plan_create(&database, 1, Duration::ZERO),
+            CreateAttemptPlan::Stop
+        );
+        assert_eq!(
+            retry.plan_create(
+                &Status::unavailable("gateway restarting"),
+                1,
+                Duration::ZERO
+            ),
+            CreateAttemptPlan::Stop
+        );
+        assert_eq!(
+            retry.plan_create(&Status::invalid_argument("bad name"), 1, Duration::ZERO),
+            CreateAttemptPlan::Stop
+        );
+    }
+
+    #[test]
+    fn create_retry_deadline_saturates_for_a_huge_budget() {
+        let deadline = deadline_after(Duration::MAX);
+        assert!(
+            deadline > Instant::now(),
+            "a budget that overflows Instant must still produce a future deadline"
+        );
+    }
+
+    #[test]
+    fn create_retry_annotation_names_the_attempts_and_the_lock_timeout() {
+        assert_eq!(
+            create_retry_annotation(2, Some("gateway busy")),
+            " (create retry stopped after 2 create attempts; last mutation lock timeout: gateway busy)"
+        );
+        assert_eq!(
+            create_retry_annotation(1, None),
+            " (create retry stopped after 1 create attempt)"
+        );
+    }
+
+    #[test]
+    fn create_retry_timeout_prefers_the_flag_then_the_environment() {
+        assert_eq!(
+            resolve_create_retry_timeout(Some(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_create_retry_timeout(Some(0)),
+            Duration::ZERO,
+            "--no-create-retry disables retries"
+        );
+        assert_eq!(
+            resolve_create_retry_timeout(Some(u32::MAX)),
+            Duration::from_secs(MAX_CREATE_RETRY_TIMEOUT_SECS),
+            "the flag is clamped to 24 hours like the environment"
+        );
+        Environment::new()
+            .set("OPENSHELL_CREATE_RETRY_TIMEOUT", "7")
+            .run(|| {
+                assert_eq!(
+                    resolve_create_retry_timeout(None),
+                    Duration::from_secs(7),
+                    "the environment supplies the budget when the flag is absent"
+                );
+                assert_eq!(
+                    resolve_create_retry_timeout(Some(3)),
+                    Duration::from_secs(3),
+                    "the flag wins over the environment"
+                );
+            });
+        Environment::new()
+            .remove("OPENSHELL_CREATE_RETRY_TIMEOUT")
+            .run(|| {
+                assert_eq!(
+                    resolve_create_retry_timeout(None),
+                    Duration::from_mins(1),
+                    "retries stay on by default"
+                );
+            });
+        Environment::new()
+            .set("OPENSHELL_CREATE_RETRY_TIMEOUT", "0")
+            .run(|| {
+                assert_eq!(
+                    resolve_create_retry_timeout(None),
+                    Duration::ZERO,
+                    "a zero environment budget disables retries like --no-create-retry"
+                );
+            });
+        for value in ["90000", "18446744073709551615", "18446744073709551616"] {
+            Environment::new()
+                .set("OPENSHELL_CREATE_RETRY_TIMEOUT", value)
+                .run(|| {
+                    assert_eq!(
+                        resolve_create_retry_timeout(None),
+                        Duration::from_secs(MAX_CREATE_RETRY_TIMEOUT_SECS),
+                        "an oversized environment budget is clamped to 24 hours, \
+                         including a value above u64::MAX"
+                    );
+                });
+        }
+        for value in ["abc", "-1"] {
+            Environment::new()
+                .set("OPENSHELL_CREATE_RETRY_TIMEOUT", value)
+                .run(|| {
+                    assert_eq!(
+                        resolve_create_retry_timeout(None),
+                        Duration::from_mins(1),
+                        "an unparseable environment budget falls back to the default"
+                    );
+                });
+        }
     }
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
@@ -7082,6 +8083,8 @@ mod tests {
     #[test]
     fn service_endpoint_json_has_raw_fields_and_normalized_url() {
         let response = ServiceEndpointResponse {
+            application_url: String::new(),
+            gateway_url: String::new(),
             endpoint: Some(ServiceEndpoint {
                 metadata: Some(ObjectMeta {
                     workspace: "team-a".to_string(),
@@ -7107,6 +8110,8 @@ mod tests {
                 "target_port": 8080,
                 "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
+                "application_url": "",
+                "gateway_url": "",
             })
         );
         assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
@@ -7178,6 +8183,57 @@ mod tests {
                 assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+            });
+    }
+
+    #[test]
+    fn parse_env_from_pairs_reads_named_and_same_name_environment_variables() {
+        Environment::new()
+            .set("NAV_PARSE_ENV_FROM_NAMED", "named-value")
+            .set("NAV_PARSE_ENV_FROM_SAME", "same-name-value")
+            .run(|| {
+                let parsed = parse_env_from_pairs(&[
+                    "SANDBOX_NAMED=NAV_PARSE_ENV_FROM_NAMED".to_string(),
+                    "NAV_PARSE_ENV_FROM_SAME".to_string(),
+                ])
+                .expect("parse");
+                assert_eq!(
+                    parsed.get("SANDBOX_NAMED"),
+                    Some(&"named-value".to_string())
+                );
+                assert_eq!(
+                    parsed.get("NAV_PARSE_ENV_FROM_SAME"),
+                    Some(&"same-name-value".to_string())
+                );
+            });
+    }
+
+    #[test]
+    fn parse_env_from_pairs_rejects_missing_invalid_reserved_and_duplicate_keys() {
+        Environment::new()
+            .remove("NAV_PARSE_ENV_FROM_MISSING")
+            .set("NAV_PARSE_ENV_FROM_PRESENT", "value")
+            .run(|| {
+                for (input, expected) in [
+                    ("TARGET=NAV_PARSE_ENV_FROM_MISSING", "is not set"),
+                    ("1BAD=NAV_PARSE_ENV_FROM_PRESENT", "key must match"),
+                    ("TARGET=BAD-NAME", "source must match"),
+                    ("OPENSHELL_RESERVED=NAV_PARSE_ENV_FROM_PRESENT", "reserved"),
+                ] {
+                    let error =
+                        parse_env_from_pairs(&[input.to_string()]).expect_err("must reject");
+                    assert!(
+                        error.to_string().contains(expected),
+                        "unexpected error: {error}"
+                    );
+                }
+
+                let error = parse_env_from_pairs(&[
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                ])
+                .expect_err("duplicate must reject");
+                assert!(error.to_string().contains("duplicate --env-from"));
             });
     }
 
@@ -7816,6 +8872,20 @@ mod tests {
     }
 
     #[test]
+    fn application_origin_is_preserved_when_gateway_uses_a_port_forward() {
+        let response = ServiceEndpointResponse {
+            application_url: "https://default--demo--web.services.example.com:10443/".into(),
+            gateway_url: "https://default--demo--web.api.example.com:8080/".into(),
+            url: "https://default--demo--web.services.example.com:10443/".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::preferred_service_url(&response, "https://localhost:29092"),
+            response.application_url
+        );
+    }
+
+    #[test]
     fn service_url_for_gateway_uses_external_gateway_port() {
         assert_eq!(
             service_url_for_gateway(
@@ -7921,7 +8991,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_false_condition_message_prefers_reason_and_message() {
+    fn provisioning_blocker_message_prefers_reason_and_message() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -7935,13 +9005,13 @@ mod tests {
         };
 
         assert_eq!(
-            ready_false_condition_message(Some(&status)).as_deref(),
+            provisioning_blocker_message(Some(&status)).as_deref(),
             Some("Unschedulable: Another GPU sandbox may already be using the available GPU.")
         );
     }
 
     #[test]
-    fn ready_false_condition_message_ignores_non_ready_conditions() {
+    fn provisioning_blocker_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
@@ -7954,7 +9024,121 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(ready_false_condition_message(Some(&status)).is_none());
+        assert!(provisioning_blocker_message(Some(&status)).is_none());
+    }
+
+    #[test]
+    fn provisioning_blocker_message_prefers_unschedulable_pod_scheduled_condition() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: "Unschedulable".to_string(),
+                    message: "0/11 nodes are available: 11 Insufficient cpu.".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("Unschedulable: 0/11 nodes are available: 11 Insufficient cpu.")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_ignores_scheduled_pod_condition() {
+        let status = SandboxStatus {
+            agent_pod: "scheduled-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending: Waiting for effective configuration validation")
+        );
+    }
+
+    #[test]
+    fn provisioning_blocker_message_falls_back_when_pod_scheduled_has_no_detail() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            provisioning_blocker_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending")
+        );
+    }
+
+    #[test]
+    fn lifecycle_phase_error_reports_scheduling_failure() {
+        use super::lifecycle_phase_error;
+        use openshell_core::proto::SandboxPhase;
+
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Error as i32,
+                conditions: vec![SandboxCondition {
+                    r#type: "PodScheduled".into(),
+                    status: "False".into(),
+                    reason: "Unschedulable".into(),
+                    message: "0/5 nodes are available: 1 Too many pods".into(),
+                    transition_time: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = lifecycle_phase_error(&sandbox, SandboxPhase::Ready, SandboxPhase::Error)
+            .expect("Error phase should fail the wait");
+        assert_eq!(
+            err.to_string(),
+            "Unschedulable: 0/5 nodes are available: 1 Too many pods while waiting for Ready"
+        );
     }
 
     #[test]
@@ -8264,9 +9448,30 @@ mod tests {
         let l4 = NetworkEndpoint {
             host: "host.example.test".to_string(),
             port: 443,
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/orders".into(),
+                    ..Default::default()
+                }),
+            }],
             ..Default::default()
         };
-        assert_eq!(format_endpoint(&l4), "host.example.test:443 [L4]");
+        assert_eq!(
+            format_endpoint(&l4),
+            "host.example.test:443 [L4, no HTTP method/path filter]"
+        );
+        let tcp = NetworkEndpoint {
+            protocol: "tcp".to_string(),
+            access: 0,
+            rules: vec![],
+            ..l4
+        };
+        assert_eq!(
+            format_endpoint(&tcp),
+            "host.example.test:443 [tcp, no HTTP method/path filter]"
+        );
 
         let l7_readonly = NetworkEndpoint {
             host: "host.example.test".to_string(),
@@ -8627,6 +9832,7 @@ mod tests {
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
                     last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
+                    last_failure: None,
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
@@ -8674,6 +9880,7 @@ mod tests {
                     "path": "/mcp",
                     "last_result": "TransportFailed",
                     "last_reported_at": "2026-09-05T10:01:00Z",
+                    "last_failure": null,
                 }])
             );
         }
@@ -8688,6 +9895,7 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8709,6 +9917,7 @@ mod tests {
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
             last_reported_time: None,
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8736,9 +9945,89 @@ mod tests {
                 "path": "/**",
                 "last_result": "NoObservedExchange",
                 "last_reported_at": "",
+                "last_failure": null,
             }])
         );
         assert_eq!(output["conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn token_grant_failure_renders_in_text_and_structured_output() {
+        use openshell_core::proto::{
+            EndpointFailure, EndpointFailureDomain, ProviderCredentialRefreshRecoveryAction,
+            TokenGrantFailureObservation,
+        };
+        let failure = EndpointFailure {
+            domain: EndpointFailureDomain::TokenGrant.into(),
+            code: "provider_authorization_required".to_string(),
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize.into(),
+            provider: "github".to_string(),
+            credential_key: "access_token".to_string(),
+            stage: "token_endpoint".to_string(),
+            upstream_http_status: Some(409),
+            request_id: "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908".to_string(),
+        };
+        let endpoint = EndpointStatus {
+            host: "tools.example.test".to_string(),
+            last_failure: Some(failure.clone()),
+            ..Default::default()
+        };
+        let observation = TokenGrantFailureObservation {
+            destination_host: "api.example.test".to_string(),
+            destination_port: 8443,
+            failure: Some(failure),
+        };
+        let cause = [
+            "Cause: provider_authorization_required (token grant, stage token_endpoint, upstream HTTP 409)",
+            "Credential: github/access_token",
+            "Recovery: Reauthorize the provider credential.",
+            "Request ID: 7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        ];
+        // MCP endpoint status places the cause between the result and report time.
+        let endpoint_lines = super::endpoint_status_display_lines(&endpoint);
+        assert_eq!(endpoint_lines[2..6], cause);
+        assert!(endpoint_lines[6].starts_with("Reported at"));
+        assert_eq!(
+            super::token_grant_failure_display_lines(&observation),
+            [&["Destination: api.example.test (port 8443)"][..], &cause].concat()
+        );
+
+        let output = super::sandbox_to_json(&Sandbox {
+            status: Some(SandboxStatus {
+                endpoint_statuses: vec![endpoint],
+                last_token_grant_failure: Some(Box::new(observation)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let failure_json = serde_json::json!({
+            "domain": "token_grant",
+            "code": "provider_authorization_required",
+            "recovery_action": "reauthorize",
+            "provider": "github",
+            "credential_key": "access_token",
+            "stage": "token_endpoint",
+            "upstream_http_status": 409,
+            "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        });
+        assert_eq!(output["endpoint_statuses"][0]["last_failure"], failure_json);
+        assert_eq!(
+            output["last_token_grant_failure"],
+            serde_json::json!({
+                "destination_host": "api.example.test",
+                "destination_port": 8443,
+                "failure": failure_json,
+            })
+        );
+        assert!(super::sandbox_to_json(&Sandbox::default())["last_token_grant_failure"].is_null());
+
+        let unknown = super::endpoint_failure_to_json(&EndpointFailure {
+            domain: 99,
+            recovery_action: 99,
+            ..Default::default()
+        });
+        assert_eq!(unknown["domain"], "unknown");
+        assert_eq!(unknown["recovery_action"], "unspecified");
     }
 
     #[test]

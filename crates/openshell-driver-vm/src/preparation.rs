@@ -12,7 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -124,7 +124,9 @@ impl Attempt {
     pub fn create(cache_root: &Path) -> io::Result<Self> {
         let root = cache_root.join(ATTEMPTS_DIR);
         fs::create_dir_all(&root)?;
-        let name = format!("attempt-{:032x}", rand::random::<u128>());
+        let random =
+            u128::from_ne_bytes(openshell_crypto::random_bytes::<16>().map_err(io::Error::other)?);
+        let name = format!("attempt-{random:032x}");
         let directory = root.join(&name);
         let lease_path = root.join(format!("{name}.lease"));
         let mut lease = OpenOptions::new()
@@ -404,7 +406,7 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
     if marker != LEASE_MARKER {
         return Ok(false);
     }
-    match fs::remove_dir_all(directory) {
+    match remove_staging_tree(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -415,6 +417,29 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
         Err(error) => return Err(error),
     }
     Ok(true)
+}
+
+/// Remove a private staging tree after its writers have stopped. Image
+/// directory modes may deny the driver permission to unlink their children.
+pub(super) fn remove_staging_tree(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+        result => return result,
+    }
+
+    let mut pending = vec![path.to_owned()];
+    while let Some(dir) = pending.pop() {
+        if dir.symlink_metadata()?.is_dir() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            for child in dir.read_dir()? {
+                let child = child?;
+                if child.file_type()?.is_dir() {
+                    pending.push(child.path());
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(path)
 }
 
 fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
@@ -563,6 +588,26 @@ pub(super) fn send(message: &Message) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn removes_inaccessible_staging_directories_without_following_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("staged");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&outside, dir.join("link")).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        remove_staging_tree(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
+        assert_eq!(
+            fs::metadata(outside).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
 
     fn request(root: &Path) -> Request {
         Request {
@@ -833,19 +878,24 @@ mod tests {
     fn restart_reclaims_inactive_attempts_and_preserves_active_shared_and_unknown_data() {
         let temp = tempfile::tempdir().unwrap();
         let cache = super::super::image_cache_root_dir(temp.path());
-        let inactive = Attempt::create(&cache).unwrap();
-        let inactive_directory = inactive.directory.clone();
+        let attempts = cache.join(ATTEMPTS_DIR);
+        fs::create_dir_all(&attempts).unwrap();
+        // Model files left by a terminated driver without opening a live lease.
+        // A dropped lease can remain locked briefly when a concurrent fork has
+        // inherited its descriptor and not yet closed it during exec.
+        let inactive_directory = attempts.join(format!("attempt-{:032x}", 3));
+        fs::create_dir(&inactive_directory).unwrap();
         fs::write(inactive_directory.join("partial.ext4"), b"unfinished").unwrap();
-        drop(inactive);
+        fs::write(inactive_directory.with_extension("lease"), LEASE_MARKER).unwrap();
         let active = Attempt::create(&cache).unwrap();
         let committed = cache.join("shared-image");
         fs::create_dir(&committed).unwrap();
         fs::write(committed.join("rootfs.ext4"), b"valid shared image").unwrap();
         let legacy = cache.join("image.staging-legacy");
         fs::create_dir(&legacy).unwrap();
-        let unmarked = cache.join(ATTEMPTS_DIR).join(format!("attempt-{:032x}", 1));
+        let unmarked = attempts.join(format!("attempt-{:032x}", 1));
         fs::create_dir(&unmarked).unwrap();
-        let link = cache.join(ATTEMPTS_DIR).join(format!("attempt-{:032x}", 2));
+        let link = attempts.join(format!("attempt-{:032x}", 2));
         symlink(&committed, &link).unwrap();
         fs::write(unmarked.with_extension("lease"), b"unrelated lock").unwrap();
 

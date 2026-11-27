@@ -8,10 +8,18 @@ local socket that responds to an API ping. An explicitly selected Docker driver
 falls back to `/var/run/docker.sock` when no candidate responds.
 
 When the gateway configures `[openshell.gateway.otlp]`, the in-process driver
-exports spans to the same OTLP/gRPC collector as
+exports spans to the same OTLP collector, over its configured protocol, as
 `openshell-driver-docker`. The standalone driver accepts
-`OPENSHELL_OTLP_ENDPOINT`, continues W3C trace context from gateway RPC
-metadata, and flushes spans during graceful shutdown.
+`OPENSHELL_OTLP_ENDPOINT` and `OPENSHELL_OTLP_PROTOCOL`, with
+`OPENSHELL_OTLP_CA_FILE`, `OPENSHELL_OTLP_CERT_FILE`, and
+`OPENSHELL_OTLP_KEY_FILE` for an `https://` collector, continues W3C trace
+context from gateway RPC
+metadata, and flushes spans during graceful shutdown. When
+`[openshell.gateway.otlp.agent]` is enabled, the driver also sets
+`OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, plus
+`OPENSHELL_OTLP_AGENT_PROTOCOL` for a non-gRPC collector, which starts the
+agent trace relay. The standalone driver takes them as `--otlp-agent-endpoint`
+and `--otlp-agent-protocol`.
 
 ## Runtime Model
 
@@ -41,9 +49,9 @@ mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
-bypassed. The trusted supervisor companion uses Docker host networking, where
-it reaches the gateway's primary loopback listener and originates approved
-egress.
+bypassed. The trusted supervisor companion originates approved egress. Its
+operator-owned `supervisor_network_mode` defaults to `host`. Set `bridge` to
+run the supervisor on Docker's bridge network; `auto` also selects host.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
@@ -108,14 +116,101 @@ LSM decisions remain authoritative.
 | `network_mode = host` on the supervisor | Lets the trusted supervisor reach the gateway's primary loopback listener and originate approved upstream connections. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
-| Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
+| Private named volumes | Separate volumes carry sandbox bootstrap keys, the runtime-initiated Unix socket, and supervisor-only credentials. The supervisor mounts bootstrap keys read-only and only the socket volume writable. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
+New containers dial the supervisor at `/.openshell/channel/control/supervisor/control.sock`.
+The runtime remains the TLS/gRPC server; the supervisor verifies its pinned
+identity and supplies the existing bearer credential. Saved descriptors retain
+the legacy Unix listener for existing containers, including across restart.
+New generations require matching supervisor and sandbox runtime binaries.
+
 ## Stop, Start, and Delete
 
-Stop terminates the supervisor companion and stops the workload container
-without removing it. Docker retains the workload writable layer and attached
+Set `persist_workspace = true` in `[openshell.drivers.docker]` to give newly
+created default `/sandbox` workspaces a driver-owned local volume. The setting
+defaults to false and does not migrate existing writable-layer workspaces.
+Custom working directories and image-declared volumes overlapping `/sandbox`
+are rejected when enabled. Initialization prepares the workspace ownership;
+it does not copy the image's workspace contents into the volume.
+
+The driver records and rechecks the volume identity and workload UID/GID before
+restart, including when external resource admission is disabled. Stop retains
+the data. Explicit sandbox deletion removes the owned workspace volume and
+reports removal failures. Startup orphan cleanup retains workspace volumes
+without a workload; an interrupted create requires explicit recovery/removal.
+This option advertises the optional workload update capability. The gateway's
+separate `enable_sandbox_updates` setting must also be enabled to accept updates.
+
+Persistence ownership comes from `workspace-storage.json` in the protected
+per-sandbox driver directory, bound into the private bootstrap and runtime
+descriptor. It records the namespace, sandbox, workload UID/GID and exact volume
+identity. Container labels do not select persistent storage or authorize volume
+admission, updates or removal. All caller template labels retain their existing
+meaning, including generic and Docker-specific workspace label names.
+
+### Stopped Workload Image Updates
+
+The Docker updater implements the existing configuration-update RPC for
+image-only changes on stopped, persistent `/sandbox` workspaces. Source and
+target images must already be cached locally and declare no image volumes. The
+target must declare an explicit numeric `USER UID:GID` matching the recorded
+non-root workload identity. Symbolic users/groups, UID-only users, and an absent
+`USER` are rejected before replacement; update preflight does not resolve image
+accounts. Command and environment changes are unsupported.
+
+The update replaces the stopped workload container while preserving the native
+sandbox ID and owned workspace volume. It refreshes the private runtime evidence
+for the replacement; it does not change the trusted sandbox or supervisor images.
+A private operation record lets the same accepted operation resume after an
+interruption. Start refuses an unfinished update. Stop and startup reconciliation
+retain its data and runtime resources; explicit Delete removes its owned storage.
+Retry through the gateway to finish the accepted update before starting it.
+The operation never starts the workload or rolls back workspace data implicitly.
+
+#### Live Driver Integration Test
+
+The opt-in test below uses a real Docker daemon and isolated, uniquely labeled
+stopped containers and a workspace volume. It checks numeric/symbolic identity
+refusal, A-to-B replacement, retained file bytes, replay, and recovery after an
+accepted update loses its source container. Cleanup verifies ownership and never
+forces removal. This is driver integration coverage; gateway authorization,
+supervisor startup, and authenticated workload operations still require E2E.
+
+From the repository root, prepare the four local test images:
+
+```shell
+for version in A B BAD SYMBOLIC; do
+  case "$version" in
+    BAD) fixture_user=2000:2000 ;;
+    SYMBOLIC) fixture_user=other:other ;;
+    *) fixture_user=1234:1235 ;;
+  esac
+  docker build --network=none --build-arg VERSION="$version" \
+    --build-arg WORKLOAD_USER="$fixture_user" -t "openshell-image-update-test:$version" \
+    crates/openshell-driver-docker/tests/fixtures/image-update
+done
+
+OPENSHELL_DOCKER_UPDATE_IMAGE_A=openshell-image-update-test:A \
+OPENSHELL_DOCKER_UPDATE_IMAGE_B=openshell-image-update-test:B \
+OPENSHELL_DOCKER_UPDATE_IMAGE_BAD=openshell-image-update-test:BAD \
+OPENSHELL_DOCKER_UPDATE_IMAGE_SYMBOLIC=openshell-image-update-test:SYMBOLIC \
+cargo test --locked -p openshell-driver-docker --lib \
+  live_stopped_image_replacement -- --ignored --nocapture
+```
+
+The Docker CLI must be on `PATH` and use the same daemon as the SDK. On Docker
+Desktop, set `DOCKER_HOST` to the socket reported by `docker context inspect`.
+
+For authenticated gateway/supervisor qualification, including SSH exec,
+replacement, gateway restart, interrupted credential-publication repair and
+complete API deletion, run the separate
+[Docker update testkit suite](../../tests/suites/features/docker-updates/README.md).
+
+Stop terminates the supervisor companion, allowing it 10 seconds to stop the
+workload, and stops the workload container without removing it. Docker retains
+the workload writable layer and attached
 volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
 and creates a new supervisor companion. A durably stopped sandbox stays stopped
 across gateway restarts.
@@ -158,7 +253,7 @@ openshell sandbox create \
 `/openshell-sandbox` binary. The driver extracts that binary as bytes and
 stages it into the stopped workload. `supervisor_image` contains the
 dynamically linked glibc `/openshell-supervisor` binary that runs in the
-host-networked supervisor container. Release and gateway image builds bake
+supervisor companion container. Release and gateway image builds bake
 matching image tags into the binary.
 
 ## Gateway session and TLS
@@ -172,7 +267,7 @@ When no endpoint is configured, the supervisor connects to
 Docker daemon host. A configured HTTPS server certificate must include the
 endpoint host in its subject alternative names.
 
-The driver publishes host loopback as the backend address for
+In host mode, the driver publishes host loopback as the backend address for
 `host.openshell.internal`. Policy DNS resolves that reserved name through the
 mediated path, so policies can reach host services without a Docker bridge,
 container DNS alias, or another gateway listener.
@@ -181,9 +276,33 @@ For HTTPS endpoints, the supervisor receives only the gateway CA and
 uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
-Docker Engine on Linux supports host networking directly. Docker Desktop
-requires host networking to be enabled in Settings and does not support it
-when Enhanced Container Isolation is enabled.
+Host mode on Docker Desktop requires host networking enabled in Settings.
+For bridge mode or a gateway endpoint using `host.docker.internal`, the driver
+resolves Docker's `host-gateway` once during initialization and caches it.
+A temporary container runs `--help` from the immutable supervisor image with
+no network, no capabilities, no privilege escalation, and a read-only root
+filesystem. The driver downloads Docker's generated `/etc/hosts` through the
+archive API, preferring a unique IPv4 address and otherwise a unique IPv6
+address. Resolution has a 30-second timeout; forced cleanup has a separate
+10-second timeout and runs after success or failure.
+
+The driver uses the selected address for both host aliases and the runtime
+descriptor's trust pin; workload DNS and hosts files cannot select it. Host
+mode with other gateway endpoints retains its gateway-address pin. An explicit
+operator-owned `host_gateway_ip` overrides discovery and skips the temporary
+container. No supervisor changes or per-sandbox discovery are required.
+
+When `grpc_endpoint` is omitted, bridge mode uses `host.docker.internal` on
+Desktop or for a wildcard gateway listener, and the concrete bind address for
+other non-loopback Linux listeners. The port is the gateway bind port; remapped
+container publications require an explicit endpoint. Native Linux loopback-only
+listeners cannot serve a bridge supervisor and produce an actionable error.
+Explicit endpoints retain TLS verification and are never rewritten; bridge
+rejects loopback/unspecified endpoint addresses. Host services bound only to
+loopback are also unreachable from a native Linux bridge supervisor.
+
+The selected network mode does not change the sandbox's mandatory Landlock
+and seccomp qualification.
 
 The supervisor owns these security-critical variables:
 

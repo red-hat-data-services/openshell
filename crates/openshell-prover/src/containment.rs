@@ -92,7 +92,15 @@ pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyEr
         landlock,
         process,
         network_middlewares,
+        endpoint_settings,
     } = document;
+    if !endpoint_settings.is_empty() {
+        return Err(ParsePolicyError(
+            "invalid policy: endpoint_settings is available only through the Cedar policy API; \
+             set these fields on network_policies endpoints instead"
+                .to_string(),
+        ));
+    }
     Ok(ContainmentPolicy {
         filesystem_policy,
         network_policies,
@@ -2247,6 +2255,16 @@ mod tests {
 
     fn parse(value: &str) -> ContainmentPolicy {
         parse_policy_str(value).expect("valid policy")
+    }
+
+    #[test]
+    fn unknown_policy_controls_are_not_silently_omitted_from_containment_checks() {
+        for control in ["ui", "unsupported_control"] {
+            let source = format!("version: 1\n{control}: {{}}\n");
+            let error =
+                parse_policy_str(&source).expect_err("unknown policy authority must fail closed");
+            assert!(error.to_string().contains(control));
+        }
     }
 
     fn options() -> CheckOptions {

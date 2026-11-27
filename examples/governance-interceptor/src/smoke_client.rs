@@ -3,11 +3,12 @@
 
 //! Authenticated negative-path client for the governance example smoke suite.
 
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use openshell_core::proto::{
     GetSandboxConfigRequest, NetworkActivitySummary, PolicyChunk, SubmitPolicyAnalysisRequest,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
+use openshell_crypto::jwt::encode;
 use serde::Serialize;
 use tonic::Code;
 use tonic::metadata::AsciiMetadataValue;
@@ -59,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name.clone(),
             workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -126,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name,
             workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();

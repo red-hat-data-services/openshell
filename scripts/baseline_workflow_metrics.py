@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-REPO = "NVIDIA/OpenShell"
+REPO = "ai-openshell/openshell"
 
 WORKFLOWS: list[str] = [
     "branch-checks.yml",
@@ -52,8 +52,9 @@ WORKFLOWS: list[str] = [
     "package-release-binaries.yml",
     "release-canary.yml",
     "release-dev.yml",
-    "release-tag.yml",
+    "release-prerelease.yml",
     "release-vm-kernel.yml",
+    "release.yml",
 ]
 
 # Reusable workflows (workflow_call targets). The Actions API returns no runs

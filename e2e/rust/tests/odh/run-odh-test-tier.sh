@@ -28,6 +28,8 @@ if [[ -z "${TIER}" || -z "${PHASE}" || -z "${REPORT}" || $# -ne 3 ]]; then
 fi
 
 resolved="$("${PYTHON_BIN}" "${SCRIPT_DIR}/tier_plan.py" "${TIER}" "${SCRIPT_DIR}/tiers.toml" "${PHASE}")"
+OPENSHELL_E2E_GATEWAY_MODE="$(printf '%s' "${resolved}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["phase"]["mode"])')"
+export OPENSHELL_E2E_GATEWAY_MODE
 filter="$(printf '%s' "${resolved}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["filter"])')"
 results_dir="${OPENSHELL_E2E_RESULTS_DIR:-${ROOT}/results}"
 mkdir -p "${results_dir}"
@@ -54,7 +56,7 @@ junit_xml="${results_dir}/e2e-odh.xml"
 rm -f "${junit_xml}" "${report}" "${report%.xml}.html"
 config_file="$(mktemp)"
 trap 'rm -f "${config_file}"' EXIT
-"${PYTHON_BIN}" - "${ROOT}/.config/nextest.toml" "${config_file}" "${junit_xml}" <<'PY'
+"${PYTHON_BIN}" - "${SCRIPT_DIR}/nextest.toml" "${config_file}" "${junit_xml}" <<'PY'
 import pathlib, sys
 source, destination, report = map(pathlib.Path, sys.argv[1:])
 text = source.read_text()
@@ -63,7 +65,7 @@ if old not in text:
     raise SystemExit("ODH nextest JUnit path setting not found")
 destination.write_text(text.replace(old, f'path = "{report}"'))
 PY
-nextest_args=(--profile e2e-odh --config-file "${config_file}" --no-tests fail -E "${filter}")
+nextest_args=(--profile e2e-odh --config-file "${ROOT}/.config/nextest.toml" --tool-config-file "odh:${config_file}" --no-tests fail -E "${filter}")
 if [[ -n "${OPENSHELL_E2E_NEXTEST_ARCHIVE:-}" ]]; then
 	nextest_args+=(--archive-file "${OPENSHELL_E2E_NEXTEST_ARCHIVE}" --workspace-remap "${ROOT}/e2e/rust")
 else

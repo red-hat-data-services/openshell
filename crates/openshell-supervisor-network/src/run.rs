@@ -9,6 +9,7 @@
 //! whose RAII fields keep the proxy task alive for the lifetime of the
 //! sandbox supervisor.
 
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -21,7 +22,7 @@ use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx,
 };
 
 use openshell_core::activity::ActivitySender;
@@ -34,11 +35,35 @@ use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
 };
-use crate::opa::OpaEngine;
-use crate::policy_local::PolicyLocalContext;
+use crate::l7::token_grant_injection::TokenGrantResolver;
+use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
+pub use crate::token_grant::ProviderIdentitySource;
+use crate::token_grant::{GatewayTokenGrantResolver, SpiffeTokenGrantResolver};
 use openshell_core::endpoint_status::EndpointObservationSender;
-use openshell_isolation_interface::contract::NetworkMediationSource;
+use openshell_core::grpc_client::GatewayEndpoint;
+
+/// Concrete listener options supplied by trusted supervisor composition.
+/// This is not an isolation-backend capability or a serialized launch contract.
+#[derive(Clone)]
+pub struct ProxyListenerConfig {
+    pub bind_addr: SocketAddr,
+    pub authorization: Arc<str>,
+    pub binary_identity: openshell_isolation_interface::contract::BinaryIdentity,
+}
+
+impl std::fmt::Debug for ProxyListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyListenerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("authorization", &"<redacted>")
+            .field("binary_identity", &self.binary_identity)
+            .finish()
+    }
+}
+
+pub use openshell_core::PolicyDnsIpv6Egress;
+pub use openshell_core::net::nat64::Nat64Prefix;
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -142,6 +167,79 @@ fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) ->
     Ok(epoch)
 }
 
+/// Read an operator-supplied additional destination CA bundle (#3781) and
+/// fold it into `system_ca_bundle`, so it reaches both the sandbox trust
+/// bundle (`write_ca_files`) and the supervisor's own upstream TLS
+/// verification (`build_upstream_client_config`) alongside the system CA
+/// bundle. A no-op when `additional_ca_bundle` is `None`.
+///
+/// # Errors
+///
+/// Fails closed on an unreadable or certificate-free bundle, matching the
+/// corporate-proxy CA bundle's validation.
+fn append_additional_ca_bundle(
+    system_ca_bundle: &mut String,
+    additional_ca_bundle: Option<&str>,
+) -> Result<(), String> {
+    let Some(path) = additional_ca_bundle else {
+        return Ok(());
+    };
+    let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+        path,
+        "--additional-ca-bundle",
+    )?;
+    if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
+        system_ca_bundle.push('\n');
+    }
+    system_ca_bundle.push_str(&pem);
+    Ok(())
+}
+
+/// Identity and authority of the one sandbox a [`run_networking`] call serves.
+///
+/// A process hosting several sandboxes builds one per sandbox instance; no value
+/// is read from the process environment, so instances cannot share gateway
+/// credentials, provider token grants, denial history, or proxy CA files.
+#[derive(Debug, Default)]
+pub struct SandboxInstanceNetwork {
+    pub sandbox_id: Option<String>,
+    pub sandbox_name: Option<String>,
+    /// Gateway access with this instance's credentials.
+    pub gateway: Option<GatewayEndpoint>,
+    /// How this instance obtains provider access tokens.
+    pub provider_identity: ProviderIdentitySource,
+    /// Source served by `policy.local` `/v1/denials`.
+    pub denial_log: DenialLogSource,
+    /// Proxy interception CA and trust-file directory.
+    pub proxy_tls: ProxyTlsFiles,
+}
+
+/// Provisioned proxy CA files and the directory that receives trust files.
+///
+/// Without a provisioned CA the proxy generates an ephemeral one. Without a
+/// directory it writes to the default container TLS root.
+#[derive(Clone, Debug, Default)]
+pub struct ProxyTlsFiles {
+    pub ca_certificate: Option<std::path::PathBuf>,
+    pub ca_private_key: Option<std::path::PathBuf>,
+    pub directory: Option<std::path::PathBuf>,
+}
+
+impl ProxyTlsFiles {
+    /// Files configured for a single-sandbox supervisor through its environment.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self {
+            ca_certificate: std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT)
+                .map(std::path::PathBuf::from),
+            ca_private_key: std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY)
+                .map(std::path::PathBuf::from),
+            directory: std::env::var_os(openshell_core::sandbox_env::PROXY_TLS_DIR)
+                .map(std::path::PathBuf::from),
+        }
+    }
+}
+
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
 ///
@@ -176,50 +274,82 @@ pub struct Networking {
 ///
 /// # Errors
 ///
-/// Returns an error if proxy mode is requested but the proxy configuration,
-/// OPA engine, or identity cache is missing, or if the proxy server fails to
-/// start.
+/// Returns an error if proxy mode is requested but the proxy configuration
+/// or policy engine is missing, or if the proxy server fails to start.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_networking(
     policy: &SandboxPolicy,
     proxy_bind_ip: Option<IpAddr>,
-    opa_engine: Option<&Arc<OpaEngine>>,
+    network_engine: Option<&crate::policy_engine::PolicyEngine>,
     retained_proto: Option<&ProtoSandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
     process_enabled: bool,
     provider_credentials: &ProviderCredentialState,
-    sandbox_id: Option<&str>,
-    sandbox_name: Option<&str>,
-    openshell_endpoint: Option<&str>,
+    instance: SandboxInstanceNetwork,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
-    proxy_tls_dir: Option<&std::path::Path>,
+    additional_ca_bundle: Option<&str>,
+    policy_dns_ipv6_egress: PolicyDnsIpv6Egress,
+    nat64_prefixes: Vec<Nat64Prefix>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
-    network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    network_mediation_source: Option<Arc<NetworkMediationSource>>,
+    proxy_listener: Option<ProxyListenerConfig>,
+    reserved_destination: Option<crate::proxy::ReservedDestination>,
 ) -> Result<Networking> {
+    // The authoritative engine: Cedar for a Cedar-authored policy, otherwise
+    // OPA. It also supplies middleware and per-tunnel evaluators; see
+    // `crate::policy_engine`.
+    let network_engine = network_engine.cloned();
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
-    let policy_local_ctx = Arc::new(PolicyLocalContext::new(
-        retained_proto.cloned(),
-        openshell_endpoint.map(str::to_string),
-        sandbox_name
-            .map(str::to_string)
-            .or_else(|| sandbox_id.map(str::to_string)),
-        agent_proposals.clone(),
-        workspace_rx,
-    ));
+    let SandboxInstanceNetwork {
+        sandbox_id,
+        sandbox_name,
+        gateway,
+        provider_identity,
+        denial_log,
+        proxy_tls,
+    } = instance;
+    // Choose how this instance obtains provider tokens once, for every grant.
+    let token_grants: Arc<dyn TokenGrantResolver> = match (provider_identity, gateway.clone()) {
+        (ProviderIdentitySource::Gateway, Some(gateway)) => {
+            Arc::new(GatewayTokenGrantResolver::new(gateway))
+        }
+        // Nothing can issue this sandbox's tokens without a gateway; a
+        // resolver without a workload identity fails every grant closed.
+        (ProviderIdentitySource::Gateway, None) => Arc::new(SpiffeTokenGrantResolver::new(
+            None,
+            sandbox_id.clone(),
+            None,
+        )),
+        (ProviderIdentitySource::WorkloadApi(socket), gateway) => Arc::new(
+            SpiffeTokenGrantResolver::new(gateway, sandbox_id.clone(), socket),
+        ),
+    };
+    let policy_local_ctx = Arc::new(
+        PolicyLocalContext::new(
+            retained_proto.cloned(),
+            gateway,
+            sandbox_name.or(sandbox_id),
+            agent_proposals.clone(),
+            workspace_rx,
+        )
+        .with_denial_log(denial_log)
+        .with_token_grants(token_grants),
+    );
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP
     // listener immediately (so the OS backlog queues early SYN packets) but
     // defers `accept()` until symlink resolution completes. This eliminates
     // the race where an in-flight request observes a generation transition
-    // during the OPA engine reload.
+    // during the policy engine's symlink resolution.
     let (engine_ready_tx, engine_ready_rx) = tokio::sync::watch::channel(false);
     #[cfg(target_os = "linux")]
     let transparent_engine_ready_rx = engine_ready_rx.clone();
@@ -230,7 +360,7 @@ pub async fn run_networking(
     // namespace becomes accessible via /proc/<pid>/root/. The task starts
     // before run_process spawns the child, so first wait for the orchestrator
     // to publish a non-zero PID, then poll for proc-root readiness.
-    if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
+    if let (Some(engine), Some(proto)) = (network_engine.as_ref(), retained_proto) {
         if process_enabled {
             let resolve_engine = engine.clone();
             let resolve_proto = proto.clone();
@@ -271,21 +401,7 @@ pub async fn run_networking(
                             attempt = attempt,
                             "Container filesystem accessible, resolving policy binary symlinks"
                         );
-                        match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                            Ok(_) => {
-                                info!(
-                                    pid = pid,
-                                    "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                                );
-                            }
-                        }
+                        resolve_policy_binary_symlinks(&resolve_engine, &resolve_proto, pid);
                         let _ = engine_ready_tx.send(true);
                         return;
                     }
@@ -313,22 +429,20 @@ pub async fn run_networking(
         let _ = engine_ready_tx.send(true);
     }
 
-    // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
-    // the proxy, so it's owned here.
-    let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
+    // Identity cache for SHA256 TOFU when a policy engine is active. Only
+    // consumed by the proxy, so it's owned here.
+    let identity_cache = network_engine
+        .as_ref()
+        .map(|_| Arc::new(BinaryIdentityCache::new()));
 
     // Load a provisioned CA when the boundary lifetime outlives this control
     // process; otherwise generate an ephemeral CA.
     // The CA cert is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        let configured_ca = match (
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT),
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY),
-        ) {
-            (Some(certificate), Some(private_key)) => Some(SandboxCa::load_from_paths(
-                std::path::Path::new(&certificate),
-                std::path::Path::new(&private_key),
-            )?),
+        let configured_ca = match (&proxy_tls.ca_certificate, &proxy_tls.ca_private_key) {
+            (Some(certificate), Some(private_key)) => {
+                Some(SandboxCa::load_from_paths(certificate, private_key)?)
+            }
             (None, None) => None,
             _ => {
                 return Err(miette::miette!(
@@ -341,14 +455,9 @@ pub async fn run_networking(
         let durable_ca = configured_ca.is_some();
         match configured_ca.map_or_else(SandboxCa::generate, Ok) {
             Ok(ca) => {
-                let configured_tls_dir =
-                    std::env::var_os(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                        .map(std::path::PathBuf::from);
-                let tls_dir = proxy_tls_dir
-                    .or(configured_tls_dir.as_deref())
-                    .unwrap_or_else(|| {
-                        std::path::Path::new(openshell_core::container_paths::TLS_ROOT)
-                    });
+                let tls_dir = proxy_tls.directory.as_deref().unwrap_or_else(|| {
+                    std::path::Path::new(openshell_core::container_paths::TLS_ROOT)
+                });
                 let mut system_ca_bundle = read_system_ca_bundle();
                 // A TLS-intercepting corporate proxy (issue #1792) re-signs
                 // tunneled server certificates with the corporate CA, so the
@@ -370,6 +479,16 @@ pub async fn run_networking(
                     }
                     system_ca_bundle.push_str(&pem);
                 }
+                // An operator-supplied additional destination CA (#3781):
+                // unlike the corporate proxy CA above, this applies
+                // regardless of whether a proxy is configured, so a private
+                // CA can be trusted for direct, inspected egress without
+                // rebuilding the supervisor image. Folded into the same
+                // bundle for the same reason (sandbox trust + upstream
+                // verification must agree), and validated the same way
+                // (fail closed on an unreadable or certificate-free bundle).
+                append_additional_ca_bundle(&mut system_ca_bundle, additional_ca_bundle)
+                    .map_err(|err| miette::miette!("{err}"))?;
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
                     Ok(paths) => {
                         // /etc/openshell-tls is subsumed by the /etc baseline
@@ -379,7 +498,7 @@ pub async fn run_networking(
                         let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
-                        ocsf_emit!(
+                        crate::telemetry::egress_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)
                                 .status(StatusId::Success)
@@ -398,7 +517,7 @@ pub async fn run_networking(
                         // cannot rewrite credentials, so it fails closed on
                         // TLS-bearing connections (see proxy.rs) rather than
                         // leaking placeholders through a raw tunnel.
-                        ocsf_emit!(
+                        crate::telemetry::egress_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::High)
                                 .status(StatusId::Failure)
@@ -417,7 +536,7 @@ pub async fn run_networking(
                 // rewrite credentials, so it fails closed on TLS-bearing
                 // connections (see proxy.rs) rather than leaking placeholders
                 // through a raw tunnel.
-                ocsf_emit!(
+                crate::telemetry::egress_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::High)
                         .status(StatusId::Failure)
@@ -434,15 +553,33 @@ pub async fn run_networking(
         (None, None)
     };
 
+    // Register NAT64 prefixes before any egress path starts, so SSRF checks
+    // classify translated addresses by their embedded IPv4 address.
+    configure_nat64(nat64_prefixes).await;
+
+    // One decision for every policy DNS runtime this supervisor starts.
+    let ipv6_egress = crate::policy_dns::Ipv6EgressDecision::resolve(
+        policy_dns_ipv6_egress,
+        crate::policy_dns::DefaultRoutes::read(),
+    );
+    #[cfg(target_os = "linux")]
+    let policy_dns_active = network_mediation_source.is_some() || transparent_runtime.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let policy_dns_active = network_mediation_source.is_some();
+    if policy_dns_active {
+        crate::telemetry::egress_emit!(ipv6_egress.event());
+    }
+
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        let engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Mediated DNS requires a network policy engine (OPA or Cedar)")
+        })?;
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,
             host_gateway_ip,
-            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
+            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?
+                .with_ipv6_egress(ipv6_egress.enabled),
             engine_ready_rx.clone(),
         )?)
     } else {
@@ -454,12 +591,10 @@ pub async fn run_networking(
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
 
-        let engine = opa_engine.cloned().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
-        })?;
-
         let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
+            miette::miette!(
+                "Proxy mode requires an identity cache (a policy engine must be configured)"
+            )
         })?;
 
         // If the orchestrator gave us a proxy bind IP (the host-side veth IP
@@ -467,15 +602,24 @@ pub async fn run_networking(
         // originating inside the namespace can reach the proxy. Otherwise the
         // proxy falls back to the policy-declared http_addr (loopback in
         // tests, etc.).
-        let bind_addr = proxy_bind_ip.map(|ip| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ip, port)
-        });
+        let bind_addr = proxy_listener
+            .as_ref()
+            .map(|proxy| proxy.bind_addr)
+            .or_else(|| {
+                proxy_bind_ip.map(|ip| {
+                    let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                    SocketAddr::new(ip, port)
+                })
+            });
+
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires a network policy engine (OPA or Cedar)")
+        })?;
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
-            engine,
+            active_network_engine,
             cache,
             entrypoint_pid.clone(),
             tls_state,
@@ -490,8 +634,14 @@ pub async fn run_networking(
             network_mediation_source,
             mediated_policy_dns
                 .as_ref()
-                .map(|runtime| runtime.store.clone()),
-            None,
+                .map(|runtime| runtime.service.clone()),
+            proxy_listener
+                .as_ref()
+                .map(|proxy| proxy.binary_identity.clone()),
+            proxy_listener
+                .as_ref()
+                .map(|proxy| proxy.authorization.clone()),
+            reserved_destination,
         )
         .await?;
         Some(proxy_handle)
@@ -501,25 +651,25 @@ pub async fn run_networking(
 
     #[cfg(target_os = "linux")]
     let (policy_dns, transparent_tcp) = if let Some(runtime) = transparent_runtime {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("transparent TCP requires an OPA policy engine"))?;
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("transparent TCP requires a network policy engine (OPA or Cedar)")
+        })?;
         let cache = identity_cache
             .clone()
             .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
         let trusted_gateway = crate::proxy::detect_trusted_host_gateway();
         let dns = crate::policy_dns::PolicyDnsRuntime::start(
-            engine.clone(),
+            active_network_engine.clone(),
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,
-            runtime.config,
+            runtime.config.with_ipv6_egress(ipv6_egress.enabled),
             policy_dns_engine_ready_rx,
         )?;
         let transparent = crate::proxy::TransparentTcpHandle::start(
             runtime.listeners,
-            dns.store.clone(),
-            engine,
+            dns.service.clone(),
+            active_network_engine,
             cache,
             entrypoint_pid,
             agent_proposals,
@@ -527,6 +677,7 @@ pub async fn run_networking(
             activity_tx,
             upstream_proxy_args,
             transparent_engine_ready_rx,
+            trusted_gateway,
         )?;
         (Some(dns), Some(transparent))
     } else {
@@ -543,6 +694,25 @@ pub async fn run_networking(
         #[cfg(target_os = "linux")]
         _transparent_tcp: transparent_tcp,
     })
+}
+
+/// Resolves the policy's binary symlinks once the entrypoint process is known.
+///
+/// A YAML sandbox rebuilds its OPA engine from `proto` with symlink
+/// resolution. A Cedar sandbox resolves the binary paths its policies test in
+/// `context.binary_aliases`; it builds no OPA engine. Failures are non-fatal:
+/// binary paths are then matched literally.
+fn resolve_policy_binary_symlinks(
+    engine: &crate::policy_engine::PolicyEngine,
+    proto: &ProtoSandboxPolicy,
+    pid: u32,
+) {
+    match engine.resolve_binary_symlinks(proto, pid) {
+        Ok(()) => info!(pid, "Policy binary symlink resolution complete"),
+        Err(error) => {
+            warn!(%error, "Failed to resolve policy binary symlinks (non-fatal, falling back to literal paths)");
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -566,4 +736,95 @@ mod transparent_runtime_tests {
         let error = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap_err();
         assert!(error.to_string().contains("allocation epoch is invalid"));
     }
+
+    #[test]
+    fn append_additional_ca_bundle_is_noop_when_unset() {
+        let mut bundle = "existing-system-bundle".to_string();
+        append_additional_ca_bundle(&mut bundle, None).unwrap();
+        assert_eq!(bundle, "existing-system-bundle");
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_appends_to_nonempty_system_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        let ca_pem = generate_test_ca_pem();
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let mut bundle = "system-bundle-without-trailing-newline".to_string();
+        append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap();
+
+        // The two bundles must both be present, newline-separated — this is
+        // the exact property build_upstream_client_config and write_ca_files
+        // rely on: a #3781 fix that silently dropped or overwrote the system
+        // bundle instead of appending would pass a naive "contains the CA"
+        // check but break every other destination's upstream verification.
+        assert!(bundle.starts_with("system-bundle-without-trailing-newline\n"));
+        assert!(bundle.trim_end().ends_with(ca_pem.trim_end()));
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_works_with_empty_system_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        let ca_pem = generate_test_ca_pem();
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let mut bundle = String::new();
+        append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap();
+        assert_eq!(bundle.trim_end(), ca_pem.trim_end());
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_fails_closed_on_missing_file() {
+        let mut bundle = String::new();
+        let error =
+            append_additional_ca_bundle(&mut bundle, Some("/nonexistent/additional-ca.pem"))
+                .unwrap_err();
+        assert!(error.contains("--additional-ca-bundle"), "{error}");
+        // Fail closed: the bundle must not be silently left unmodified/partial.
+        assert!(bundle.is_empty());
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_fails_closed_on_certificate_free_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("not-a-cert.pem");
+        std::fs::write(&ca_path, "not a certificate\n").unwrap();
+
+        let mut bundle = String::new();
+        let error =
+            append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap_err();
+        assert!(error.contains("--additional-ca-bundle"), "{error}");
+    }
+
+    /// Generate a real, valid self-signed CA certificate PEM for tests.
+    fn generate_test_ca_pem() -> String {
+        SandboxCa::generate().unwrap().cert_pem().to_string()
+    }
+}
+
+/// Register configured NAT64 prefixes and discover the network's prefix
+/// through the trusted resolver, then report the prefixes in effect.
+async fn configure_nat64(configured: Vec<Nat64Prefix>) {
+    let setup = match crate::policy_dns::trusted_resolver_from_resolv_conf() {
+        Ok(server) => {
+            crate::policy_dns::Nat64Setup::apply(
+                configured,
+                &crate::policy_dns::SocketTrustedResolver::new(server),
+            )
+            .await
+        }
+        Err(error) => {
+            for prefix in &configured {
+                openshell_core::net::nat64::register_network_prefix(*prefix);
+            }
+            crate::policy_dns::Nat64Setup {
+                configured,
+                discovered: Vec::new(),
+                discovery_error: Some(error.to_string()),
+            }
+        }
+    };
+    crate::telemetry::egress_emit!(setup.event());
 }

@@ -243,7 +243,7 @@ impl ContainerHttpServer {
     async fn wait_until_ready(&self) -> Result<(), String> {
         let container_id = self.container_id.clone();
         let engine = self.engine.clone();
-        timeout(Duration::from_secs(60), async move {
+        timeout(Duration::from_mins(1), async move {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -397,6 +397,24 @@ impl HostSupportContainer {
         ready_port: u16,
         capabilities: &[&str],
     ) -> Result<Self, String> {
+        Self::start_python_image_with_host_bindings(
+            E2E_WORKLOAD_IMAGE,
+            script,
+            bindings,
+            ready_port,
+            capabilities,
+        )
+        .await
+    }
+
+    /// Start a multi-port fixture using a caller-built tool image.
+    pub async fn start_python_image_with_host_bindings(
+        image: &str,
+        script: &str,
+        bindings: &[(u16, u16)],
+        ready_port: u16,
+        capabilities: &[&str],
+    ) -> Result<Self, String> {
         let published_ready_port = bindings
             .iter()
             .find_map(|(host_port, container_port)| {
@@ -418,11 +436,7 @@ impl HostSupportContainer {
                 .iter()
                 .map(|capability| format!("--cap-add={capability}")),
         );
-        args.extend([
-            E2E_WORKLOAD_IMAGE.to_string(),
-            "-c".to_string(),
-            script.to_string(),
-        ]);
+        args.extend([image.to_string(), "-c".to_string(), script.to_string()]);
         let output = engine
             .command()
             .args(&args)
@@ -446,7 +460,7 @@ impl HostSupportContainer {
     }
 
     async fn wait_until_listening(&self, container_port: u16) -> Result<(), String> {
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -567,7 +581,7 @@ impl SupportContainer {
         let probe = format!(
             "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
         );
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;

@@ -13,6 +13,35 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Database credential source. The default preserves URL/SQLite behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseAuthMode {
+    #[default]
+    Default,
+    AzureWorkloadIdentity,
+}
+
+impl fmt::Display for DatabaseAuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::AzureWorkloadIdentity => "azure-workload-identity",
+        })
+    }
+}
+
+impl FromStr for DatabaseAuthMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "azure-workload-identity" => Ok(Self::AzureWorkloadIdentity),
+            _ => Err("database authentication must be default or azure-workload-identity"),
+        }
+    }
+}
+
 // ── Public default constants ────────────────────────────────────────────
 //
 // Canonical source for default values used across multiple crates.
@@ -45,6 +74,49 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
+
+/// Default per-sandbox cap for each relay budget (SSH and service forwards).
+pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+/// Default durable mutation admissions one caller identity can hold.
+pub const DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER: u32 = 1000;
+
+/// Accepted per-caller admission limits. The ceiling bounds the rows one caller
+/// can retain.
+pub const MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE: std::ops::RangeInclusive<u32> = 1..=1_000_000;
+
+/// Default replay window for successful durable mutation admissions.
+pub const DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS: u32 = 24 * 60 * 60;
+
+/// Accepted replay windows, from one minute to seven days.
+pub const MUTATION_REPLAY_WINDOW_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 60..=604_800;
+
+/// Gateway delivery path for supervisor configuration.
+///
+/// `Push` sends configuration over the supervisor session to supervisors that
+/// apply streamed configuration, which then stop polling. Other supervisors
+/// keep polling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDeliveryMode {
+    #[default]
+    Poll,
+    Push,
+}
+
+impl FromStr for ConfigDeliveryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "push" => Ok(Self::Push),
+            _ => Err(format!(
+                "invalid config delivery mode '{value}'; expected poll or push"
+            )),
+        }
+    }
+}
 
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,10 +156,10 @@ impl FromStr for PolicyValidationFailureMode {
 }
 
 /// Default OCI repository for the supervisor image (no tag).
-pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "quay.io/ai-openshell/supervisor";
 
 /// Default OCI repository for the sandbox runtime image (no tag).
-pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "quay.io/ai-openshell/sandbox";
 
 /// Process-level default for the trusted sandbox runtime image.
 pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
@@ -178,6 +250,91 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Gateway-owned SPIFFE Broker API issuance for Kubernetes sandbox identities.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeBrokerConfig {
+    pub spiffe_id_prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// Connect to the gateway's node IP supplied through the Downward API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_local_port: Option<std::num::NonZeroU16>,
+    #[serde(default)]
+    pub server_spiffe_id: Option<String>,
+    #[serde(default)]
+    pub server_spiffe_id_prefix: Option<String>,
+    pub workload_api_socket_path: String,
+}
+
+impl SpiffeBrokerConfig {
+    /// Resolve the selected transport without making Kubernetes API calls.
+    /// Node-local mode requires the Pod's trusted Downward API node address.
+    pub fn endpoint_for_node(&self, node_ip: Option<&str>) -> Result<String, String> {
+        match (self.endpoint.is_empty(), self.node_local_port) {
+            (false, None) => Ok(self.endpoint.clone()),
+            (true, Some(port)) => {
+                let ip: std::net::IpAddr = node_ip
+                    .ok_or("spiffe_broker.node_local_port requires OPENSHELL_NODE_IP from status.hostIP")?
+                    .parse()
+                    .map_err(|_| "OPENSHELL_NODE_IP must be an IPv4 or IPv6 address")?;
+                Ok(format!("https://{}", SocketAddr::new(ip, port.get())))
+            }
+            _ => Err("spiffe_broker requires exactly one of endpoint and node_local_port".into()),
+        }
+    }
+
+    /// Validate the identity and authenticated transport before use.
+    pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+            .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        // Validate the mode independently of the startup environment. The
+        // adapter requires and resolves the actual node IP before serving.
+        let endpoint = self.endpoint_for_node(Some("127.0.0.1"))?;
+        let endpoint = url::Url::parse(&endpoint)
+            .map_err(|_| "spiffe_broker.endpoint must be an HTTPS endpoint")?;
+        let socket = std::path::Path::new(&self.workload_api_socket_path);
+        let valid_socket = socket.is_absolute()
+            && !self.workload_api_socket_path.ends_with('/')
+            && socket.file_name().is_some()
+            && socket
+                .parent()
+                .is_some_and(|parent| parent != std::path::Path::new("/"))
+            && self.workload_api_socket_path.trim() == self.workload_api_socket_path
+            && !self
+                .workload_api_socket_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."));
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !valid_socket
+        {
+            return Err(
+                "spiffe_broker requires an HTTPS endpoint and absolute Workload API socket path"
+                    .into(),
+            );
+        }
+        match (&self.server_spiffe_id, &self.server_spiffe_id_prefix) {
+            (Some(id), None) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(id)?;
+            }
+            (None, Some(prefix)) => {
+                openshell_spiffe::SandboxSpiffeIdPrefix::parse(prefix)?;
+                if !prefix.trim_start_matches("spiffe://").contains('/') {
+                    return Err("spiffe_broker.server_spiffe_id_prefix requires an agent path, not a whole trust domain".into());
+                }
+            }
+            _ => return Err("spiffe_broker requires exactly one of server_spiffe_id and server_spiffe_id_prefix".into()),
+        }
+        Ok(())
+    }
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -203,11 +360,21 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
+    /// TLS configuration for the dedicated metrics listener.
+    ///
+    /// When `None`, the metrics listener retains its plaintext HTTP behavior.
+    /// This configuration is intentionally separate from [`Self::tls`] so
+    /// metrics clients can use their own client CA trust boundary.
+    pub metrics_tls: Option<MetricsTlsConfig>,
+
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
+    /// Whether supervisors poll for configuration or receive it over their session.
+    pub config_delivery_mode: ConfigDeliveryMode,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
@@ -222,6 +389,14 @@ pub struct Config {
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
 
+    /// Operator activation after all gateways and outstanding legacy driver
+    /// operations have been drained onto the configuration-update-compatible protocol.
+    /// Disabled by default; not a license to run mixed-version writers.
+    pub enable_sandbox_updates: bool,
+
+    /// Workspace secret activation and reveal settings.
+    pub workspace_secrets: WorkspaceSecretsConfig,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -234,14 +409,40 @@ pub struct Config {
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
     pub mtls_auth: MtlsAuthConfig,
 
+    /// Optional details gateway mutation records capture.
+    pub audit: GatewayAuditConfig,
+
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
+    pub spiffe_broker: Option<SpiffeBrokerConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Explicit database identity mode; independent of provider credentials.
+    pub database_auth: DatabaseAuthMode,
+
+    /// Connection ceiling for the persistence pool.
+    ///
+    /// `None` leaves the backend's built-in default in place. The right
+    /// ceiling depends on the deployment — how many gateway replicas share
+    /// the database, and what `max_connections` a Postgres server itself
+    /// allows — so it cannot be one number baked into the binary. An
+    /// in-memory `SQLite` database ignores it: the database lives in its single
+    /// connection.
+    pub database_max_connections: Option<u32>,
+
+    /// Connection ceiling for the `PostgreSQL` mutation lock pool.
+    ///
+    /// `None` keeps the built-in default of 4. Each mutation guard holds one
+    /// lock connection, so this bounds how many guarded mutations a replica
+    /// runs or waits on in `PostgreSQL` at once. `SQLite` has no lock pool and
+    /// ignores it.
+    pub database_lock_max_connections: Option<u32>,
 
     /// Explicit compute driver configured for the gateway.
     /// `None` enables runtime auto-detection.
@@ -264,9 +465,31 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Maximum concurrent SSH relays per sandbox. Must be at least 1.
+    pub max_ssh_connections_per_sandbox: u32,
+
+    /// Maximum concurrent service forward relays per sandbox. Must be at
+    /// least 1. Kept apart from the SSH budget so open forwards cannot block
+    /// SSH access.
+    pub max_service_connections_per_sandbox: u32,
+
     /// Absolute image preparation and initial supervisor startup budget for new
     /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
     pub image_preparation_timeout_seconds: u32,
+
+    /// Provisioning repair window, in seconds. The first authenticated
+    /// supervisor configuration report starts admission repair, which stays
+    /// armed until Ready. Must be between 1 and 86400, inclusive.
+    pub provisioning_repair_window_seconds: i64,
+
+    /// Durable mutation admissions one caller can hold across every replica
+    /// sharing the database. Replicas must use the same value. Must be within
+    /// [`MUTATION_ADMISSION_LIMIT_PER_CALLER_RANGE`].
+    pub mutation_admission_limit_per_caller: u32,
+
+    /// Seconds a successful mutation admission stays replayable. Must be within
+    /// [`MUTATION_REPLAY_WINDOW_SECONDS_RANGE`].
+    pub mutation_replay_window_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -284,6 +507,7 @@ pub struct Config {
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
+    pub supervisor_app_listener: crate::app_listener::AppListenerConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -291,6 +515,8 @@ pub struct Config {
 /// Part of the programmatically-built [`Config`]; never deserialized directly.
 #[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
+    /// Publish gateway URLs and forward application requests through the gateway.
+    pub enabled: bool,
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
     pub base_domains: Vec<String>,
@@ -298,6 +524,68 @@ pub struct ServiceRoutingConfig {
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
+
+    /// Format used for newly generated service hostnames.
+    ///
+    /// `Readable` (the default) generates
+    /// `<workspace>--<sandbox>[--<service>]` hostnames. `Hashed` generates a
+    /// stable, one-label opaque hash derived from the gateway installation
+    /// name plus the workspace, sandbox, and service — see
+    /// [`Config::service_routing_discriminator`].
+    pub service_hostname_format: ServiceHostnameFormat,
+}
+
+/// Format of exposed-service hostnames minted by the gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHostnameFormat {
+    /// Readable `<workspace>--<sandbox>[--<service>]` hostnames.
+    #[default]
+    Readable,
+    /// Opaque one-label hashed hostnames, discriminated by the gateway
+    /// installation name.
+    Hashed,
+}
+
+impl FromStr for ServiceHostnameFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "readable" => Ok(Self::Readable),
+            "hashed" => Ok(Self::Hashed),
+            _ => Err(format!(
+                "invalid service hostname format '{value}'; expected readable or hashed"
+            )),
+        }
+    }
+}
+
+impl ServiceRoutingConfig {
+    /// Validate the service-routing configuration against the gateway
+    /// installation name.
+    ///
+    /// When [`ServiceHostnameFormat::Hashed`] is selected, the installation
+    /// name becomes the hash discriminator and must be a DNS-1123 label —
+    /// 1–63 ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
+    /// trailing `-`. It must also be unique among all gateways sharing the
+    /// service base domain; that uniqueness is an operational contract the
+    /// deploying platform is responsible for, since a single gateway cannot
+    /// observe its siblings.
+    pub fn validate(&self, installation_name: &str) -> crate::error::Result<()> {
+        if self.service_hostname_format == ServiceHostnameFormat::Hashed
+            && !is_dns_label(installation_name)
+        {
+            return Err(crate::error::Error::Config {
+                message: format!(
+                    "hashed service hostnames require the gateway installation name to be \
+                     a DNS label (1-63 lowercase ASCII alphanumeric or '-' bytes, no \
+                     leading/trailing '-'): {installation_name:?}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// TLS configuration.
@@ -351,6 +639,39 @@ pub struct TlsConfig {
     pub external_server_names: Vec<String>,
 }
 
+/// TLS configuration for the dedicated metrics listener.
+///
+/// Unlike [`TlsConfig`], metrics TLS does not support external certificates
+/// or SNI routing. The metrics listener has one narrow HTTPS/mTLS contract
+/// with an optional, metrics-specific client CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTlsConfig {
+    /// Path to the TLS certificate file served by the metrics listener.
+    pub cert_path: PathBuf,
+
+    /// Path to the TLS private key file served by the metrics listener.
+    pub key_path: PathBuf,
+
+    /// Path to the CA certificate file used to verify metrics clients.
+    pub client_ca_path: Option<PathBuf>,
+
+    /// Whether metrics clients must present a certificate trusted by
+    /// [`Self::client_ca_path`].
+    pub require_client_auth: bool,
+}
+
+/// Workspace secret settings. Both default to off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSecretsConfig {
+    /// Operator activation for creating workspace secrets and referencing them
+    /// from provider refresh configuration. Enable only after every gateway
+    /// that can serve traffic supports workspace secrets.
+    pub enabled: bool,
+    /// Allow `RevealSecret` to return values to mTLS operators. Enable only
+    /// for a control-plane service that needs it.
+    pub reveal_enabled: bool,
+}
+
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
 ///
 /// When configured, the server validates `authorization: Bearer <JWT>`
@@ -365,6 +686,12 @@ pub struct TlsConfig {
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Optional PEM CA bundle for an issuer signed by a private CA. It must be
+    /// a regular file no larger than 1 MiB. These certificates augment the
+    /// platform trust roots for OIDC discovery and JWKS requests only.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
 
     /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
     /// addresses. This is a development-only escape hatch and never permits
@@ -404,6 +731,22 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+/// `[openshell.gateway.audit]`: optional details gateway mutation records
+/// capture. Secrets are never captured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuditConfig {
+    /// Record the values of gateway and sandbox settings that `UpdateConfig`
+    /// sets. Bytes values are never recorded.
+    #[serde(default)]
+    pub capture_setting_values: bool,
+    /// Record the command arguments of `ExecSandbox` and
+    /// `ExecSandboxInteractive` calls. Environment variables and standard
+    /// input are never recorded.
+    #[serde(default)]
+    pub capture_exec_command: bool,
 }
 
 /// mTLS user authentication for gateway users.
@@ -493,20 +836,21 @@ impl GatewayInterceptorConfig {
     }
 }
 
-/// Operator policy for authorizing interceptor manifest bindings.
+/// Operator policy for authorizing bindings advertised by an extension.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayInterceptorBindingPolicy {
-    /// Preserve manifest-controlled binding discovery. Configured bindings
-    /// may narrow or disable manifest declarations.
+    /// Preserve manifest-controlled binding discovery.
     #[default]
     Dynamic,
-    /// Enable only configured RPC selectors and phases. Extra manifest
-    /// declarations are ignored.
+    /// Require and enable only configured bindings. Ignore extra declarations.
     Allowlist,
-    /// Require configured and manifest RPC selectors and phases to match.
+    /// Require configured and manifest bindings to match exactly.
     Exact,
 }
+
+/// The binding policy shared by gateway interceptors and supervisor middleware.
+pub use GatewayInterceptorBindingPolicy as ExtensionBindingPolicy;
 
 /// One configured source in the gateway's effective provider-profile catalog.
 ///
@@ -817,6 +1161,105 @@ impl UpstreamProxyConfig {
     }
 }
 
+/// AAAA handling for the supervisor's mediated policy DNS.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyDnsIpv6Egress {
+    /// Answer AAAA only when the supervisor network namespace has an IPv6
+    /// default route and no IPv4 default route.
+    #[default]
+    Auto,
+    /// Always resolve AAAA through the trusted resolver.
+    Enabled,
+    /// Never resolve AAAA; answer with NOERROR/NODATA.
+    Disabled,
+}
+
+impl PolicyDnsIpv6Egress {
+    /// The value used in configuration and on the supervisor command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl fmt::Display for PolicyDnsIpv6Egress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PolicyDnsIpv6Egress {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown policy_dns_ipv6_egress '{other}'; expected 'auto', 'enabled' or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Supervisor IPv6 egress settings shared by compute drivers.
+///
+/// Like [`UpstreamProxyConfig`], this type is `flatten`ed by driver tables.
+/// The values travel to the supervisor on argv, which sandbox environment
+/// cannot influence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SupervisorIpv6EgressConfig {
+    /// AAAA handling for mediated policy DNS. Unset means the supervisor
+    /// default, `auto`.
+    pub policy_dns_ipv6_egress: Option<PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) used by the sandbox network, for example
+    /// `64:ff9b:1::/96` or a network-specific `/96`. Addresses inside them
+    /// are classified by their embedded IPv4 address for SSRF checks. The
+    /// well-known prefix `64:ff9b::/96` is always recognized; the supervisor
+    /// also discovers the network's prefix through `ipv4only.arpa` (RFC 7050).
+    pub nat64_prefixes: Vec<String>,
+}
+
+impl SupervisorIpv6EgressConfig {
+    /// Validate prefix syntax and RFC 6052 lengths.
+    pub fn validate(&self) -> Result<(), String> {
+        self.parsed_nat64_prefixes().map(|_| ())
+    }
+
+    /// Parse the configured NAT64 prefixes.
+    pub fn parsed_nat64_prefixes(&self) -> Result<Vec<crate::net::nat64::Nat64Prefix>, String> {
+        self.nat64_prefixes
+            .iter()
+            .map(|raw| {
+                raw.parse::<crate::net::nat64::Nat64Prefix>()
+                    .map_err(|error| format!("nat64_prefixes: {error}"))
+            })
+            .collect()
+    }
+
+    /// Supervisor arguments for these settings. Call [`Self::validate`]
+    /// first; invalid prefixes are passed through for the supervisor to
+    /// reject.
+    #[must_use]
+    pub fn supervisor_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(mode) = self.policy_dns_ipv6_egress {
+            args.extend(["--policy-dns-ipv6-egress".to_string(), mode.to_string()]);
+        }
+        for prefix in &self.nat64_prefixes {
+            args.extend(["--nat64-prefix".to_string(), prefix.trim().to_string()]);
+        }
+        args
+    }
+}
+
 /// Gateway-minted sandbox JWT configuration.
 ///
 /// Points the gateway at the Ed25519 signing key (produced by `certgen`)
@@ -881,26 +1324,41 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            metrics_tls: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
+            enable_sandbox_updates: false,
+            workspace_secrets: WorkspaceSecretsConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
+            spiffe_broker: None,
             database_url: String::new(),
+            database_auth: DatabaseAuthMode::default(),
+            database_max_connections: None,
+            database_lock_max_connections: None,
             compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            max_ssh_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
+            max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_seconds: 300,
+            mutation_admission_limit_per_caller: DEFAULT_MUTATION_ADMISSION_LIMIT_PER_CALLER,
+            mutation_replay_window_seconds: DEFAULT_MUTATION_REPLAY_WINDOW_SECONDS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            supervisor_app_listener: crate::app_listener::AppListenerConfig::default(),
         }
     }
 
@@ -930,6 +1388,13 @@ impl Config {
         self
     }
 
+    /// Create a new configuration with TLS for the dedicated metrics listener.
+    #[must_use]
+    pub fn with_metrics_tls(mut self, tls: MetricsTlsConfig) -> Self {
+        self.metrics_tls = Some(tls);
+        self
+    }
+
     /// Create a new configuration with the given log level.
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
@@ -937,10 +1402,38 @@ impl Config {
         self
     }
 
+    /// Select database credentials independently of the connection URL.
+    #[must_use]
+    pub fn with_database_auth(mut self, mode: DatabaseAuthMode) -> Self {
+        self.database_auth = mode;
+        self
+    }
+
     /// Create a new configuration with a database URL.
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with a database pool connection ceiling.
+    ///
+    /// `None` keeps the persistence backend's default.
+    #[must_use]
+    pub const fn with_database_max_connections(mut self, max_connections: Option<u32>) -> Self {
+        self.database_max_connections = max_connections;
+        self
+    }
+
+    /// Create a new configuration with a mutation lock pool connection ceiling.
+    ///
+    /// `None` keeps the built-in default.
+    #[must_use]
+    pub const fn with_database_lock_max_connections(
+        mut self,
+        max_connections: Option<u32>,
+    ) -> Self {
+        self.database_lock_max_connections = max_connections;
         self
     }
 
@@ -1053,6 +1546,43 @@ impl Config {
         self
     }
 
+    /// Select the hostname format for exposed sandbox services.
+    ///
+    /// [`ServiceHostnameFormat::Hashed`] derives its discriminator from the
+    /// gateway installation name ([`Config::name`]); see
+    /// [`Self::service_routing_discriminator`].
+    #[must_use]
+    pub fn with_service_hostname_format(mut self, format: ServiceHostnameFormat) -> Self {
+        self.service_routing.service_hostname_format = format;
+        self
+    }
+
+    /// The discriminator hashed into exposed-service hostnames when
+    /// [`ServiceHostnameFormat::Hashed`] is selected: the gateway
+    /// installation name.
+    ///
+    /// Returns `None` while readable hostnames are in use, in which case no
+    /// hashed service hosts exist. The name is an operator- or
+    /// platform-assigned value; it must be unique among all gateways sharing
+    /// the service base domain, an operational contract enforced by the
+    /// deploying platform rather than the gateway itself. Renaming the
+    /// installation changes every minted hostname.
+    ///
+    /// Unrelated to [`GatewayJwtConfig::gateway_id`], which carries security
+    /// and Kubernetes-ownership semantics.
+    #[must_use]
+    pub fn service_routing_discriminator(&self) -> Option<&str> {
+        (self.service_routing.service_hostname_format == ServiceHostnameFormat::Hashed)
+            .then_some(self.name.as_str())
+    }
+
+    /// Enable gateway-mediated application routing independently of app listeners.
+    #[must_use]
+    pub const fn with_service_routing(mut self, enabled: bool) -> Self {
+        self.service_routing.enabled = enabled;
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1072,8 +1602,10 @@ impl Config {
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
+            service_hostname_format: ServiceHostnameFormat::default(),
         }
     }
 }
@@ -1149,13 +1681,15 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
+        PolicyDnsIpv6Egress, PolicyValidationFailureMode, ServiceHostnameFormat,
+        SupervisorIpv6EgressConfig, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
-    use std::net::SocketAddr;
     use std::time::Duration;
+    use std::{net::SocketAddr, path::PathBuf};
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1170,6 +1704,19 @@ mod tests {
             PolicyValidationFailureMode::RetainLastValid
         );
         assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
+    }
+
+    #[test]
+    fn config_delivery_defaults_to_poll_and_rejects_unknown_modes() {
+        assert_eq!(
+            Config::new(None).config_delivery_mode,
+            ConfigDeliveryMode::Poll
+        );
+        assert_eq!(
+            "push".parse::<ConfigDeliveryMode>().unwrap(),
+            ConfigDeliveryMode::Push
+        );
+        assert!("enabled".parse::<ConfigDeliveryMode>().is_err());
     }
 
     #[test]
@@ -1378,6 +1925,45 @@ mod tests {
                 "{invalid} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_ipv6_egress_config_parses_and_builds_supervisor_args() {
+        let config: SupervisorIpv6EgressConfig = serde_json::from_str(
+            r#"{"policy_dns_ipv6_egress":"enabled","nat64_prefixes":["64:ff9b:1::/96","2001:db8:122:344::/64"]}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "64:ff9b:1::/96",
+                "--nat64-prefix",
+                "2001:db8:122:344::/64",
+            ]
+        );
+        assert!(
+            SupervisorIpv6EgressConfig::default()
+                .supervisor_args()
+                .is_empty()
+        );
+        for bad in ["10.0.0.0/8", "2001:db8::/80", "nonsense"] {
+            let config = SupervisorIpv6EgressConfig {
+                nat64_prefixes: vec![bad.to_string()],
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{bad}");
+        }
+        assert!(
+            serde_json::from_str::<SupervisorIpv6EgressConfig>(
+                r#"{"policy_dns_ipv6_egress":"yes"}"#
+            )
+            .is_err()
+        );
+        assert_eq!("disabled".parse(), Ok(PolicyDnsIpv6Egress::Disabled));
     }
 
     #[test]
@@ -1615,6 +2201,75 @@ mod tests {
     }
 
     #[test]
+    fn service_hostname_format_defaults_to_readable() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Readable
+        );
+        assert_eq!(cfg.service_routing_discriminator(), None);
+        cfg.service_routing
+            .validate("any name")
+            .expect("readable is valid");
+    }
+
+    #[test]
+    fn hashed_format_discriminates_on_the_installation_name() {
+        let cfg = Config::new(None)
+            .with_name("gateway-west")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        assert_eq!(cfg.service_routing_discriminator(), Some("gateway-west"));
+        cfg.service_routing
+            .validate("gateway-west")
+            .expect("DNS-label installation name is valid");
+    }
+
+    #[test]
+    fn hashed_format_requires_a_dns_label_installation_name() {
+        for name in [
+            "",
+            "Gateway-West",
+            "-gateway",
+            "gateway-",
+            "gateway_west",
+            "gateway west",
+            &"g".repeat(64),
+        ] {
+            let cfg = Config::new(None)
+                .with_name(name)
+                .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+            let error = cfg
+                .service_routing
+                .validate(name)
+                .expect_err(&format!("{name:?} must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains("hashed service hostnames require"),
+                "{name:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sans_update_preserves_service_hostname_format() {
+        let cfg = Config::new(None)
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed)
+            .with_server_sans(["*.apps.example.com"]);
+
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Hashed
+        );
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn service_routing_domains_are_derived_from_wildcard_server_sans() {
         let cfg = Config::new(None).with_server_sans([
             "gateway.example.com",
@@ -1639,6 +2294,23 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn metrics_tls_is_disabled_by_default_and_can_be_configured() {
+        assert!(Config::new(None).metrics_tls.is_none());
+
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/etc/openshell-metrics/tls.crt"),
+            key_path: PathBuf::from("/etc/openshell-metrics/tls.key"),
+            client_ca_path: Some(PathBuf::from("/etc/openshell-metrics/ca.crt")),
+            require_client_auth: true,
+        };
+
+        assert_eq!(
+            Config::new(None).with_metrics_tls(tls.clone()).metrics_tls,
+            Some(tls)
+        );
     }
 
     #[test]
@@ -1674,12 +2346,12 @@ mod tests {
     fn default_supervisor_image_is_version_pinned() {
         use super::{compiled_sandbox_runtime_image, compiled_supervisor_image};
         let image = compiled_supervisor_image();
-        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        assert!(image.starts_with("quay.io/ai-openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
 
         let sandbox_image = compiled_sandbox_runtime_image();
-        assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
+        assert!(sandbox_image.starts_with("quay.io/ai-openshell/sandbox:"));
         let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
         assert!(!sandbox_tag.is_empty());
     }
@@ -1697,5 +2369,79 @@ mod tests {
             runtime_image_default(None, "compiled:default".to_string()),
             "compiled:default"
         );
+    }
+    #[test]
+    fn broker_configuration_rejects_ambiguous_transport() {
+        let mut config = super::SpiffeBrokerConfig {
+            spiffe_id_prefix: "spiffe://example.org/openshell".into(),
+            endpoint: "https://spire-broker.spire.svc:8443".into(),
+            node_local_port: None,
+            server_spiffe_id: Some("spiffe://example.org/spire/agent/node".into()),
+            server_spiffe_id_prefix: None,
+            workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock".into(),
+        };
+        config.validate("gw").unwrap();
+        let mut local = config.clone();
+        local.endpoint.clear();
+        local.node_local_port = std::num::NonZeroU16::new(8443);
+        local.validate("gw").unwrap();
+        assert_eq!(
+            local.endpoint_for_node(Some("10.20.0.2")).unwrap(),
+            "https://10.20.0.2:8443"
+        );
+        assert_eq!(
+            local.endpoint_for_node(Some("2001:db8::2")).unwrap(),
+            "https://[2001:db8::2]:8443"
+        );
+        for address in [
+            None,
+            Some(""),
+            Some("agent.example.org"),
+            Some("10.20.0.2:8443"),
+        ] {
+            assert!(local.endpoint_for_node(address).is_err());
+        }
+        local.endpoint.clone_from(&config.endpoint);
+        assert!(local.validate("gw").is_err());
+        local.endpoint.clear();
+        local.node_local_port = None;
+        assert!(local.validate("gw").is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        for port in [0, 65536] {
+            let mut invalid = encoded.clone();
+            invalid["node_local_port"] = port.into();
+            assert!(serde_json::from_value::<super::SpiffeBrokerConfig>(invalid).is_err());
+        }
+        config.server_spiffe_id = None;
+        config.server_spiffe_id_prefix =
+            Some("spiffe://example.org/spire/agent/k8s_psat/cluster".into());
+        config.validate("gw").unwrap();
+        config.server_spiffe_id_prefix = Some("spiffe://example.org".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id = Some("spiffe://example.org/spire/agent/node".into());
+        assert!(config.validate("gw").is_err());
+        config.server_spiffe_id_prefix = None;
+        for endpoint in [
+            "http://broker:8443",
+            "https://user:password@broker",
+            "https://broker/path",
+            "https://broker/?query",
+            "https://broker/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(config.validate("gw").is_err());
+        }
+        config.endpoint = "https://broker:8443".into();
+        for socket in [
+            "tcp:broker:1234",
+            "/",
+            "/agent.sock",
+            "/run/../agent.sock",
+            "/run/spire/",
+            " /run/spire/agent.sock",
+        ] {
+            config.workload_api_socket_path = socket.into();
+            assert!(config.validate("gw").is_err(), "{socket}");
+        }
     }
 }

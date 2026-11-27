@@ -5,8 +5,9 @@
 //!
 //! The wrappers validate notification IDs around every operation and keep raw
 //! UAPI structures private. Production policy and queueing belong to the
-//! sandbox crate; this module owns only the kernel ABI and active conformance
-//! probe.
+//! sandbox crate; this module owns only the kernel ABI, the active conformance
+//! probe, and the workload listener's notification filter, whose per-syscall
+//! narrowing comes from the mediators' tables.
 
 #![allow(unsafe_code)]
 
@@ -134,6 +135,21 @@ pub struct Notification {
     pub syscall: i32,
     /// Raw syscall arguments.
     pub args: [u64; 6],
+}
+
+/// Decode one 32-bit scalar syscall argument the way the kernel does.
+///
+/// Registers arrive as 64-bit words, but an `int` argument such as a PID, a
+/// signal number, or a `PRIO_*` selector is truncated by the kernel. Decoding
+/// the same low 32 bits keeps the inspected value equal to the value the kernel
+/// acts on, so a sign-extended negative PID is recognized as negative here too.
+pub(crate) fn scalar_int(value: u64) -> i32 {
+    let bytes = value.to_ne_bytes();
+    #[cfg(target_endian = "little")]
+    let scalar = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    #[cfg(target_endian = "big")]
+    let scalar = [bytes[4], bytes[5], bytes[6], bytes[7]];
+    i32::from_ne_bytes(scalar)
 }
 
 /// Result of exercising the unprivileged notification API under the active
@@ -307,8 +323,12 @@ impl NotificationListener {
 
 /// Install a non-TSYNC listener filter on the calling thread.
 ///
-/// Only the named syscalls notify. Unexpected architectures are killed, x32
-/// syscalls are killed on x86-64, and all other native syscalls are allowed.
+/// Only the named syscalls notify. Some of them keep a native path for
+/// argument shapes the broker always allows: `sendto` without a destination,
+/// `tgkill`/`rt_tgsigqueueinfo` of any signal but `SIGCONT`, and caller-only
+/// scheduling, priority, and resource-limit calls. Unexpected architectures
+/// are killed, x32 syscalls are killed on x86-64, and all other native
+/// syscalls are allowed.
 pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     if syscalls.is_empty() {
         return Err(io::Error::new(
@@ -326,7 +346,11 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// launcher thread.
 ///
 /// The filter mediates every syscall that can create, select, or materially
-/// reconfigure an INET endpoint. Connected `send()`/null-destination
+/// reconfigure an INET endpoint, and every scheduling, priority, and
+/// resource-limit call whose target must be checked against the caller's
+/// thread group. The same calls with a caller-only target (`pid == 0`, and
+/// `PRIO_PROCESS` for `setpriority`) run natively. Connected
+/// `send()`/null-destination
 /// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
 /// natively: the broker binds every INET socket to loopback before injecting
 /// it, and accepted sockets inherit their listener's binding.
@@ -349,6 +373,11 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_openat,
         libc::SYS_openat2,
     ];
+    syscalls.extend(
+        crate::linux::process_sched::MEDIATED_PROCESS_SCHED_SYSCALLS
+            .iter()
+            .map(|mediated| mediated.number),
+    );
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
     install_listener(&syscalls)
@@ -381,9 +410,9 @@ fn probe_scalar_round_trip() -> io::Result<()> {
         Ok(unsafe { libc::syscall(libc::SYS_getppid) })
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("notification launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "notification"));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -440,9 +469,9 @@ fn probe_addfd_send() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("ADDFD launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "ADDFD"));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -542,9 +571,9 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("sendto launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "sendto"));
+    };
     let destination = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -584,6 +613,24 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         .join()
         .map_err(|_| io::Error::other("sendto launcher panicked"))??;
     Ok(())
+}
+
+/// Recover the real error from a probe launcher that exited before handing its
+/// listener to the broker.
+///
+/// The launcher owns the only `install_listener` result, so a failed install
+/// just closes the handover channel. Join the thread to report the kernel's
+/// refusal, including the errno that identifies a restrictive host. Return
+/// that error unchanged rather than reformatting it, so `raw_os_error` still
+/// reports the kernel's errno to callers that branch on it.
+fn launcher_failure<T>(launcher: thread::JoinHandle<io::Result<T>>, role: &str) -> io::Error {
+    match launcher.join() {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => io::Error::other(format!(
+            "{role} launcher exited before sending its listener"
+        )),
+        Err(_) => io::Error::other(format!("{role} launcher panicked")),
+    }
 }
 
 fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Notification> {
@@ -670,6 +717,10 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
             append_resume_signal_filter(&mut program, syscall)?;
             continue;
         }
+        if let Some(mediated) = crate::linux::process_sched::mediated_syscall(syscall) {
+            append_named_target_filter(&mut program, syscall, mediated.caller_only_arguments())?;
+            continue;
+        }
         let syscall = u32::try_from(syscall)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
         program.extend([
@@ -727,6 +778,42 @@ fn append_resume_signal_filter(
         jump(BPF_JMP_JEQ_K, resume, 0, 1),
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+    ]);
+    Ok(())
+}
+
+/// Notify a scheduling, priority, or resource-limit call only when it names a
+/// target. A call that can reach only the caller, one where every
+/// `(argument, value)` pair in `caller_only` holds, stays in the kernel.
+///
+/// Each compared argument is an `int` the kernel truncates, so the low word
+/// alone decides, exactly as the broker decodes it. The broker allows these
+/// calls unconditionally, so running them natively changes no decision; it
+/// keeps them non-interruptible and off the broker round trip.
+fn append_named_target_filter(
+    program: &mut Vec<libc::sock_filter>,
+    syscall: i64,
+    caller_only: impl Iterator<Item = (u8, u32)>,
+) -> io::Result<()> {
+    let syscall = u32::try_from(syscall)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
+    let conditions: Vec<_> = caller_only.collect();
+    let too_long = || io::Error::new(io::ErrorKind::InvalidInput, "caller-only filter too long");
+    // Two instructions per compared argument, then the allow and the notify.
+    let body = u8::try_from(conditions.len() * 2 + 2).map_err(|_| too_long())?;
+    program.push(jump(BPF_JMP_JEQ_K, syscall, 0, body));
+    for (index, &(argument, value)) in conditions.iter().enumerate() {
+        // A mismatch skips the remaining comparisons and the allow.
+        let to_notify =
+            u8::try_from((conditions.len() - index - 1) * 2 + 1).map_err(|_| too_long())?;
+        program.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(u32::from(argument), 0)),
+            jump(BPF_JMP_JEQ_K, value, 0, to_notify),
+        ]);
+    }
+    program.extend([
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
     ]);
     Ok(())
 }
@@ -813,8 +900,6 @@ fn verify_notification_sizes() -> io::Result<()> {
 }
 
 fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> io::Result<i64> {
-    // SAFETY: every caller supplies the UAPI structure encoded into `request`,
-    // alive and writable for the ioctl duration.
     // `libc::ioctl` models the request as `c_ulong` for glibc and `c_int`
     // for musl. Linux UAPI request values fit both representations.
     #[cfg(target_env = "musl")]
@@ -823,6 +908,8 @@ fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> 
     })?;
     #[cfg(target_env = "musl")]
     let request = libc::c_int::from_ne_bytes(request.to_ne_bytes());
+    // SAFETY: every caller supplies the UAPI structure encoded into `request`,
+    // alive and writable for the ioctl duration.
     let result = unsafe { libc::ioctl(fd, request, argument) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -838,6 +925,7 @@ mod tests {
     use super::*;
 
     const NONDUMPABLE_PROBE_CHILD: &str = "OPENSHELL_NONDUMPABLE_PROBE_CHILD";
+    const REJECTED_INSTALL_PROBE_CHILD: &str = "OPENSHELL_REJECTED_INSTALL_PROBE_CHILD";
 
     #[test]
     fn filter_rejects_empty_syscall_set() {
@@ -888,6 +976,77 @@ mod tests {
             .status()
             .expect("run disposable nondumpable probe process");
         assert!(status.success(), "nondumpable probe child failed: {status}");
+    }
+
+    #[test]
+    fn notification_probe_reports_rejected_listener_install() {
+        if std::env::var_os(REJECTED_INSTALL_PROBE_CHILD).is_some() {
+            // Model a host that refuses the listener install with EPERM.
+            // The install happens on the launcher thread, so the probe must
+            // join that thread to report the kernel's refusal instead of only
+            // observing a closed channel.
+            install_set_mode_filter_eperm_filter().expect("install SET_MODE_FILTER EPERM filter");
+            let error = probe_notification_api().expect_err("rejected install must fail the probe");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            assert!(
+                error.to_string().contains("os error 1"),
+                "probe error must carry the install errno, got: {error}"
+            );
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::seccomp_notify::tests::notification_probe_reports_rejected_listener_install")
+            .arg("--nocapture")
+            .env(REJECTED_INSTALL_PROBE_CHILD, "1")
+            .status()
+            .expect("run disposable rejected-install probe process");
+        assert!(
+            status.success(),
+            "rejected-install probe child failed: {status}"
+        );
+    }
+
+    /// Refuse `seccomp(SECCOMP_SET_MODE_FILTER, ...)` with `EPERM` while the
+    /// notification size query keeps working, so `install_listener` fails the
+    /// way a restrictive host does.
+    fn install_set_mode_filter_eperm_filter() -> io::Result<()> {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let seccomp_number = u32::try_from(libc::SYS_seccomp)
+            .map_err(|_| io::Error::other("syscall number does not fit u32"))?;
+        let mut instructions = [
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+            jump(BPF_JMP_JEQ_K, seccomp_number, 0, 3),
+            stmt(BPF_LD_W_ABS, argument_word_offset(0, 0)),
+            jump(BPF_JMP_JEQ_K, SECCOMP_SET_MODE_FILTER, 0, 1),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs()),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        ];
+        let length = u16::try_from(instructions.len())
+            .map_err(|_| io::Error::other("test seccomp filter is too large"))?;
+        let mut program = libc::sock_fprog {
+            len: length,
+            filter: instructions.as_mut_ptr(),
+        };
+        set_no_new_privileges()?;
+        // SAFETY: program references the complete live test filter. No flags
+        // are required because the disposable process has one calling thread.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::addr_of_mut!(program),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn install_process_vm_enosys_filter() -> io::Result<()> {

@@ -1,7 +1,7 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "NVIDIA OpenShell Developer Guide"
+title: "OpenShell Developer Guide"
 description: "OpenShell is the safe, private runtime for fleets of autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Privacy, Provider Credentials"
 position: 1
@@ -13,12 +13,12 @@ import { CommandTerminal } from "./_components/CommandTerminal";
 <BadgeLinks
   badges={[
     {
-      href: "https://github.com/NVIDIA/OpenShell",
+      href: "https://github.com/ai-openshell/openshell",
       src: "https://img.shields.io/badge/github-repo-green?logo=github",
       alt: "GitHub",
     },
     {
-      href: "https://github.com/NVIDIA/OpenShell/blob/main/LICENSE",
+      href: "https://github.com/ai-openshell/openshell/blob/main/LICENSE",
       src: "https://img.shields.io/badge/License-Apache_2.0-blue",
       alt: "License",
     },
@@ -30,7 +30,7 @@ import { CommandTerminal } from "./_components/CommandTerminal";
   ]}
 />
 
-NVIDIA OpenShell is the safe, private runtime for fleets of autonomous AI agents. It provides sandboxed execution environments
+OpenShell is the safe, private runtime for fleets of autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
@@ -47,14 +47,14 @@ Install OpenShell and create your first sandbox in two commands.
 
 <llms-ignore>
 
-<CommandTerminal command="curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh" />
+<CommandTerminal command="curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh" />
 
 </llms-ignore>
 
 <llms-only>
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/ai-openshell/openshell/main/install.sh | sh
 openshell sandbox create
 ```
 

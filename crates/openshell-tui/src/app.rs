@@ -324,8 +324,7 @@ pub struct CreateSandboxForm {
     /// When the create animation started (for pacman timing).
     pub anim_start: Option<Instant>,
     /// Buffered create result — held until min display time elapses.
-    /// `Ok((name, workspace))` or `Err(message)`.
-    pub create_result: Option<Result<(String, String), String>>,
+    pub create_result: Option<Result<openshell_core::ssh_handoff::SshTarget, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +604,7 @@ pub struct App {
     // Active gateway connection
     pub gateway_name: String,
     pub endpoint: String,
+    pub gateway_insecure: bool,
     pub client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
     pub status_text: String,
 
@@ -870,6 +870,9 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             "aws_sts_assume_role"
         }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::GithubAppInstallation => {
+            "github_app_installation"
+        }
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -994,6 +997,7 @@ impl App {
             splash_start: Some(Instant::now()),
             gateway_name,
             endpoint,
+            gateway_insecure: false,
             client,
             status_text: String::from("connecting..."),
             gateways: Vec::new(),
@@ -1215,11 +1219,16 @@ impl App {
 
     pub fn cycle_workspace(&mut self) {
         if self.all_workspaces {
-            self.all_workspaces = false;
-            self.current_workspace = "default".to_string();
+            // Leaving "all" scope: return to the first known named workspace.
+            // The workspace list is server-provided and membership-scoped, so
+            // it is not guaranteed to contain (or start with) "default"; only
+            // enter named scope when at least one workspace is known.
+            if let Some(first) = self.workspace_names.first() {
+                self.all_workspaces = false;
+                self.current_workspace = first.clone();
+            }
         } else if self.workspace_names.is_empty() {
             self.all_workspaces = true;
-            self.current_workspace = "default".to_string();
         } else {
             let current_idx = self
                 .workspace_names
@@ -1231,7 +1240,6 @@ impl App {
                 }
                 _ => {
                     self.all_workspaces = true;
-                    self.current_workspace = "default".to_string();
                 }
             }
         }
@@ -4175,6 +4183,36 @@ mod tests {
         app.handle_key(key(KeyCode::Char('w')));
         assert!(!app.all_workspaces);
         assert_eq!(app.current_workspace, "default");
+    }
+
+    #[tokio::test]
+    async fn cycle_workspace_without_default_stays_on_real_workspaces() {
+        // The workspace list is server-provided and membership-scoped, so a
+        // non-admin principal may have no "default" workspace visible.
+        let mut app = test_app();
+        app.workspace_names = vec!["team-a".to_string(), "team-b".to_string()];
+        app.current_workspace = "team-a".to_string();
+        app.all_workspaces = false;
+
+        // Collect every named-scope selection across several full cycles. Each
+        // named scope must be a workspace that actually exists in the list;
+        // the cursor must never land on a phantom "default".
+        let mut named_scopes = Vec::new();
+        for _ in 0..8 {
+            if !app.all_workspaces {
+                assert!(
+                    app.workspace_names.contains(&app.current_workspace),
+                    "cycled to '{}', which is not a known workspace",
+                    app.current_workspace
+                );
+                named_scopes.push(app.current_workspace.clone());
+            }
+            app.cycle_workspace();
+        }
+
+        // Both real workspaces must be reachable by repeated cycling.
+        assert!(named_scopes.iter().any(|w| w == "team-a"));
+        assert!(named_scopes.iter().any(|w| w == "team-b"));
     }
 
     // -- selected_sandbox_workspace ----------------------------------------

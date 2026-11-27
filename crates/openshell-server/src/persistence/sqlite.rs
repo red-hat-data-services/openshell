@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
@@ -36,11 +36,26 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::mutation_admission::{
+    self, ADMISSION_OBJECT_TYPE, AdmissionTx, COUNTER_OBJECT_TYPE, CompletedAdmission, Counter,
+    RECOUNT_STATUS, counter_id,
+};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, EXISTING_IDS_BATCH_SIZE, POLICY_OBJECT_TYPE,
+};
+use std::collections::HashSet;
+
+/// Pool ceiling for an on-disk database when the operator has not configured
+/// one.
+///
+/// `SQLite` serializes writers, so raising this mainly buys read concurrency;
+/// a gateway that needs more write throughput wants Postgres, not a larger
+/// `SQLite` pool.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
     /// Pool for writes whose loss after a crash is harmless; see
     /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
     /// `synchronous=NORMAL`; in-memory stores share `pool`.
@@ -201,9 +216,43 @@ impl SqliteStore {
         self.close().await;
     }
 
-    pub async fn connect(url: &str) -> PersistenceResult<Self> {
+    /// Runs raw SQL against the test database.
+    #[cfg(test)]
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .expect("test SQL");
+    }
+
+    /// The pool's effective connection ceiling.
+    pub fn max_connections(&self) -> u32 {
+        self.pool.options().get_max_connections()
+    }
+
+    /// Connect and size the pool, falling back to [`DEFAULT_MAX_CONNECTIONS`]
+    /// for an on-disk database.
+    ///
+    /// An in-memory database is always held by exactly one connection — the
+    /// database lives in that connection, so a second one would see a
+    /// different (empty) database. A configured ceiling is ignored there.
+    pub async fn connect(url: &str, max_connections: Option<u32>) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
-        let max_connections = if is_in_memory { 1 } else { 5 };
+        let max_connections = if is_in_memory {
+            if max_connections.is_some_and(|configured| configured != 1) {
+                tracing::warn!(
+                    "ignoring the configured database pool ceiling: an in-memory SQLite database is held by a single connection"
+                );
+            }
+            1
+        } else {
+            max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        };
+        // Keep the pool eagerly warm up to the built-in size, but let a raised
+        // ceiling grow on demand rather than pinning that many file handles
+        // open for the life of the process.
+        let min_connections = max_connections.min(DEFAULT_MAX_CONNECTIONS);
+        tracing::info!(max_connections, "sizing SQLite connection pool");
 
         let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
@@ -221,7 +270,7 @@ impl SqliteStore {
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(max_connections);
+            .min_connections(min_connections);
 
         if is_in_memory {
             pool_options = pool_options.idle_timeout(None).max_lifetime(None);
@@ -423,12 +472,12 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .await
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
-                // Update with version check
-                let result = sqlx::query(
+                let row = sqlx::query(
                     r#"
 UPDATE "objects"
 SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
 WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -437,37 +486,28 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                 .bind(payload)
                 .bind(labels.unwrap_or("{}"))
                 .bind(now_ms)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                if result.rows_affected() == 0 {
-                    // The version-matched UPDATE matched no row. Distinguish a
-                    // version mismatch (row present, different version) from an
-                    // absent row (deleted / never existed). Both are CAS
-                    // precondition failures, so report them as typed `Conflict`
-                    // rather than a backend-dependent error string: absent rows
-                    // carry `current_resource_version: None`.
-                    let existing = self.get(object_type, id).await?;
-                    return Err(PersistenceError::Conflict {
-                        current_resource_version: existing.map(|record| record.resource_version),
-                    });
+                if let Some(row) = row {
+                    return Ok(write_result_from_row(&row));
                 }
 
-                // Fetch the updated record to get the new resource_version
-                let updated = self.get(object_type, id).await?.ok_or_else(|| {
-                    PersistenceError::Database("object disappeared after update".to_string())
-                })?;
-
-                Ok(WriteResult {
-                    resource_version: updated.resource_version,
-                    created_at_ms: updated.created_at_ms,
-                    updated_at_ms: updated.updated_at_ms,
+                // The version-matched UPDATE matched no row. Distinguish a
+                // version mismatch (row present, different version) from an
+                // absent row (deleted / never existed). Both are CAS
+                // precondition failures, so report them as typed `Conflict`
+                // rather than a backend-dependent error string: absent rows
+                // carry `current_resource_version: None`.
+                let existing = self.get(object_type, id).await?;
+                Err(PersistenceError::Conflict {
+                    current_resource_version: existing.map(|record| record.resource_version),
                 })
             }
             WriteCondition::Unconditional => {
                 // Unconditional upsert by name
-                sqlx::query(
+                let row = sqlx::query(
                     r#"
 INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
@@ -476,6 +516,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
     "updated_at_ms" = excluded."updated_at_ms",
     "labels" = excluded."labels",
     "resource_version" = "objects"."resource_version" + 1
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -485,25 +526,111 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .bind(payload)
                 .bind(now_ms)
                 .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                // Fetch the result to get the resource_version
-                let record = self
-                    .get_by_name(object_type, workspace, name)
-                    .await?
-                    .ok_or_else(|| {
-                        PersistenceError::Database("object disappeared after upsert".to_string())
-                    })?;
-
-                Ok(WriteResult {
-                    resource_version: record.resource_version,
-                    created_at_ms: record.created_at_ms,
-                    updated_at_ms: record.updated_at_ms,
-                })
+                Ok(write_result_from_row(&row))
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let mut results = vec![None; writes.len()];
+        // Dropping the transaction on an early return rolls every write back.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    sqlx::query(
+                        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(WriteResult {
+                        resource_version: 1,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                    });
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r#"
+UPDATE "objects"
+SET "payload" = ?4, "updated_at_ms" = ?5, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(write_result_from_row(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
@@ -677,6 +804,118 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
         }))
     }
 
+    pub async fn create_mutation_admission(
+        &self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        limit: u32,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        mutation_admission::admit(SqliteAdmission(tx), id, name, bucket, payload, limit).await
+    }
+
+    pub async fn list_completed_mutation_admissions(
+        &self,
+        bucket: Option<&str>,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<CompletedAdmission>> {
+        // The object type is a literal so the planner can use the partial indexes
+        // from migration 010, whose predicate it must match exactly.
+        let rows: Vec<(String, Vec<u8>)> = match bucket {
+            None => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND updated_at_ms <= ?1
+ORDER BY updated_at_ms LIMIT ?2",
+                )
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(bucket) => {
+                sqlx::query_as(
+                    "SELECT id, payload FROM objects
+WHERE object_type = 'mutation_admission_v1' AND resource_version > 1 AND workspace = ?1
+  AND updated_at_ms <= ?2
+ORDER BY updated_at_ms LIMIT ?3",
+                )
+                .bind(bucket)
+                .bind(cutoff_ms)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, payload)| CompletedAdmission { id, payload })
+            .collect())
+    }
+
+    pub async fn delete_mutation_admissions(&self, ids: &[String]) -> PersistenceResult<u64> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut mark = QueryBuilder::<Sqlite>::new("UPDATE objects SET status = ");
+            mark.push_bind(RECOUNT_STATUS)
+                .push(" WHERE object_type = ")
+                .push_bind(COUNTER_OBJECT_TYPE)
+                .push(" AND workspace IN (SELECT workspace FROM objects WHERE object_type = ")
+                .push_bind(ADMISSION_OBJECT_TYPE)
+                .push(" AND id IN (");
+            let mut separated = mark.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated("))");
+            mark.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+            let mut delete =
+                QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
+            delete.push_bind(ADMISSION_OBJECT_TYPE).push(" AND id IN (");
+            let mut separated = delete.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            deleted += delete
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub async fn backdate(&self, id: &str, updated_at_ms: i64) -> PersistenceResult<()> {
+        sqlx::query("UPDATE objects SET updated_at_ms = ?1 WHERE id = ?2")
+            .bind(updated_at_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -755,6 +994,32 @@ WHERE "object_type" = ?1 AND "id" = ?2
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        let mut existing = HashSet::with_capacity(ids.len());
+        for ids in ids.chunks(EXISTING_IDS_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("SELECT id FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            existing.extend(rows.iter().map(|row| row.get::<String, _>("id")));
+        }
+        Ok(existing)
     }
 
     pub async fn count_in_workspace(
@@ -1266,6 +1531,36 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         .bind("pending")
         .bind(wrapped_payload)
         .bind(now_ms)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
+)
+SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, ?7
+WHERE EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = 'sandbox' AND "id" = ?3)
+  AND NOT EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = ?1 AND "scope" = ?3)
+ON CONFLICT DO NOTHING
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&record.id)
+        .bind(&record.sandbox_id)
+        .bind(&record.status)
+        .bind(wrapped_payload)
+        .bind(record.created_at_ms)
         .bind(workspace)
         .execute(&self.pool)
         .await
@@ -1913,8 +2208,102 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [with_suffix("-wal"), with_suffix("-shm")]
 }
 
+/// Read the `RETURNING` columns of a write, so the result describes that write
+/// and not whichever one landed last.
+fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
+    WriteResult {
+        resource_version: row_resource_version(row),
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+    }
+}
+
+fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
+    let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+    resource_version.max(1).cast_unsigned()
+}
+
+struct SqliteAdmission(sqlx::Transaction<'static, Sqlite>);
+
+impl AdmissionTx for SqliteAdmission {
+    async fn counter(&mut self, bucket: &str) -> PersistenceResult<Option<Counter>> {
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT hit_count, status, updated_at_ms FROM objects WHERE object_type = ?1 AND id = ?2",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .fetch_optional(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|(count, status, updated_at_ms)| Counter {
+            count,
+            recount: status.is_some(),
+            updated_at_ms,
+        }))
+    }
+
+    async fn count(&mut self, bucket: &str) -> PersistenceResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE object_type = ?1 AND workspace = ?2")
+            .bind(ADMISSION_OBJECT_TYPE)
+            .bind(bucket)
+            .fetch_one(&mut *self.0)
+            .await
+            .map_err(|e| map_db_error(&e))
+    }
+
+    async fn insert(
+        &mut self,
+        id: &str,
+        name: &str,
+        bucket: &str,
+        payload: &[u8],
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)",
+        )
+        .bind(ADMISSION_OBJECT_TYPE)
+        .bind(id)
+        .bind(name)
+        .bind(bucket)
+        .bind(payload)
+        .bind(now_ms)
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn put_counter(
+        &mut self,
+        bucket: &str,
+        counter: &Counter,
+        now_ms: i64,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "INSERT INTO objects (object_type, id, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version, hit_count, status)
+VALUES (?1, ?2, ?3, X'', ?4, ?4, '{}', 1, ?5, ?6)
+ON CONFLICT (id) DO UPDATE SET hit_count = excluded.hit_count, status = excluded.status, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(COUNTER_OBJECT_TYPE)
+        .bind(counter_id(bucket))
+        .bind(bucket)
+        .bind(now_ms)
+        .bind(counter.count)
+        .bind(counter.recount.then_some(RECOUNT_STATUS))
+        .execute(&mut *self.0)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    async fn commit(self) -> PersistenceResult<()> {
+        self.0.commit().await.map_err(|e| map_db_error(&e))
+    }
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -1924,7 +2313,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(&row),
     }
 }
 

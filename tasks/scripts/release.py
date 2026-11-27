@@ -38,7 +38,7 @@ HOMEBREW_CLI_ASSET = f"openshell-{HOMEBREW_TARGET}.tar.gz"
 HOMEBREW_GATEWAY_ASSET = f"openshell-gateway-{HOMEBREW_TARGET}.tar.gz"
 HOMEBREW_DRIVER_VM_ASSET = f"openshell-driver-vm-{HOMEBREW_TARGET}.tar.gz"
 HOMEBREW_PROVER_ASSET = f"openshell-prover-{HOMEBREW_TARGET}.tar.gz"
-GITHUB_RELEASE_DOWNLOADS = "https://github.com/NVIDIA/OpenShell/releases/download"
+GITHUB_RELEASE_DOWNLOADS = "https://github.com/ai-openshell/openshell/releases/download"
 LOCAL_GATEWAY_PORT = 17670
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _RELEASE_TAG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -324,7 +324,7 @@ def render_homebrew_formula(
 
 class Openshell < Formula
   desc "Safe, private runtime for autonomous AI agents"
-  homepage "https://github.com/NVIDIA/OpenShell"
+  homepage "https://github.com/ai-openshell/openshell"
   url "{_asset_url(release_tag, HOMEBREW_CLI_ASSET)}"
   sha256 "{cli_sha256}"
   version "{version}"
@@ -552,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--deb", action="store_true", help="Print Debian package version only."
     )
     get_version_parser.add_argument(
-        "--snap", action="store_true", help="Print Snap package version only."
+        "--snap", action="store_true", help="Print snap package version only."
     )
     get_version_parser.add_argument(
         "--rpm-version", action="store_true", help="Print RPM Version only."

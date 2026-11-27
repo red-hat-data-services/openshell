@@ -13,7 +13,28 @@
     rust_2018_idioms
 )]
 
-include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+pub(crate) mod v1 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+}
+pub use v1::{
+    DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation, StoredDraftChunk,
+    StoredPolicyRevision, StoredProviderProfile, StoredRefreshMaterialDeletion,
+};
+
+mod v2 {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.v2.rs"));
+}
+pub(crate) use v2::StoredProviderCredentialRefreshState;
+
+mod sandbox_image {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
+}
+pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
+mod workspace_secret {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.secret.v1.rs"));
+}
+pub(crate) use workspace_secret::{StoredSecretRefreshUse, StoredWorkspaceSecret};
 
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
@@ -65,25 +86,25 @@ impl ObjectWorkspace for StoredProviderProfile {
     }
 }
 
-impl ObjectId for StoredProviderCredentialRefreshStateV2 {
+impl ObjectId for StoredProviderCredentialRefreshState {
     fn object_id(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
-impl ObjectName for StoredProviderCredentialRefreshStateV2 {
+impl ObjectName for StoredProviderCredentialRefreshState {
     fn object_name(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
-impl ObjectLabels for StoredProviderCredentialRefreshStateV2 {
+impl ObjectLabels for StoredProviderCredentialRefreshState {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
 }
 
-impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl SetResourceVersion for StoredProviderCredentialRefreshState {
     fn set_resource_version(&mut self, version: u64) {
         if let Some(meta) = self.metadata.as_mut() {
             meta.resource_version = version;
@@ -91,13 +112,55 @@ impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
-impl GetResourceVersion for StoredProviderCredentialRefreshStateV2 {
+impl GetResourceVersion for StoredProviderCredentialRefreshState {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }
 }
 
-impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
+impl ObjectWorkspace for StoredProviderCredentialRefreshState {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+impl ObjectId for StoredWorkspaceSecret {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredWorkspaceSecret {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredWorkspaceSecret {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredWorkspaceSecret {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredWorkspaceSecret {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredWorkspaceSecret {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }
@@ -118,12 +181,16 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Existing values and fields
+    // retain their meaning; the set of shared type names is unchanged.
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
+    // inventories; the provider-environment file map and peer configuration
+    // notification are public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
@@ -136,6 +203,10 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // Stable placeholders add a stored credential flag whose absent value is
+    // false. Capability negotiation and delivered key lists are public-only;
+    // the set of shared message and enum types remains unchanged. Delivered
+    // provider snapshots carry the same flag per value and are never stored.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     // Token-grant owner fields add gateway-derived metadata to endpoints and
@@ -143,12 +214,54 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // ListProvidersRequest field 4 adds a public-only label selector. Older
+    // requests decode an empty selector; durable schemas remain unchanged.
+    // Endpoint failure causes add EndpointFailure and EndpointFailureDomain to
+    // both closures through EndpointStatus.last_failure. Stored statuses decode
+    // without a cause, and the next accepted report or reset replaces them.
+    // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
+    // closures and TokenGrantStatus to public reports. Older rows have no grant
+    // record; absent report extensions retain compatibility without a rewrite.
+    // Cedar policies add the explicitly present CedarPolicy message and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode no Cedar message and remain YAML policies.
+    // Cedar endpoint settings add the repeated endpoint_settings field to
+    // SandboxPolicy in both closures. Existing rows decode it empty, so stored
+    // Cedar policies keep their current behavior.
+    // SupervisorHello and GetSandboxConfigRequest negotiate Cedar support with
+    // public-only capability fields; durable schemas remain unchanged.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
+
+    // Image updates add a separate public service/request and a new private
+    // image-state format. Existing public status and frozen storage.v1 stay
+    // unchanged; only the private durable closure grows.
+    // Configuration updates add presence-aware argv/map wrappers shared with
+    // private durable intent. Existing image-only payloads decode with all four
+    // selections absent; storage.v1 remains frozen. Public field 3 retains its
+    // image wire identity, now with explicit presence. Compute configuration
+    // updates use a separate capability/service and add one classified RPC.
+    // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
+    // public-only messages alongside main's public APIs; durable schemas
+    // and the public/durable overlap remain unchanged.
+    // The service backend HTTP version is part of both schemas. Legacy
+    // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "edfc80ad192e77e1a9d1e1d6e3342280e4438f8bf7cb49969f580060df9a056a";
+    // The storage.v2 refresh root adds retired handles and the first mint's
+    // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
+    // Encoded with the schema that omitted stable_placeholder. Keep these
+    // bytes fixed so the current encoder cannot hide a compatibility change.
+    const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -190,6 +303,9 @@ mod tests {
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
+    const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -201,8 +317,10 @@ mod tests {
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
         ".openshell.storage.v1.StoredConfigUpdateOperation",
-        ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
+        ".openshell.storage.v2.StoredProviderCredentialRefreshState",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.secret.v1.StoredWorkspaceSecret",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -445,7 +563,12 @@ mod tests {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
         for file in public.file {
-            assert_ne!(file.package.as_deref(), Some("openshell.storage.v1"));
+            assert!(
+                !file
+                    .package
+                    .as_deref()
+                    .is_some_and(|package| package.starts_with("openshell.storage."))
+            );
             for message in file.message_type {
                 let name = message.name.expect("message name");
                 assert!(
@@ -514,14 +637,46 @@ mod tests {
         let mut methods = Vec::new();
         let mut public_roots = BTreeSet::new();
         let mut compiled_method_count = 0;
+        let mut isolation_methods = BTreeSet::new();
+        let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
+                if package == "openshell.sandbox.backend.v1" {
+                    assert_eq!(service_name, "IsolationBackend");
+                    isolation_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("isolation method name")),
+                    );
+                }
+                if package == "openshell.sandbox.protocol.v1" {
+                    assert_eq!(service_name, "SandboxProtocol");
+                    sandbox_protocol_methods.extend(service.method.iter().map(|method| {
+                        method
+                            .name
+                            .as_deref()
+                            .expect("sandbox protocol method name")
+                    }));
+                }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
+                    }));
+                }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                    (
+                        "openshell.v1",
+                        "OpenShell" | "SandboxUpdates" | "ServiceDiscovery"
+                    ) | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -542,6 +697,20 @@ mod tests {
             }
         }
         methods.sort();
+        assert_eq!(
+            isolation_methods,
+            BTreeSet::from([
+                "Describe",
+                "OpenBoundary",
+                "ResumeBoundary",
+                "SuspendBoundary"
+            ])
+        );
+        assert_eq!(
+            sandbox_protocol_methods,
+            BTreeSet::from(["Exchange", "Mediate"])
+        );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -554,14 +723,27 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_CONFIG_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer config RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            121 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + isolation_methods.len()
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            91 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -569,9 +751,16 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            88 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
@@ -613,9 +802,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (369, 32),
+                (104, 23),
+                (88, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -626,7 +815,9 @@ mod tests {
 
     #[test]
     fn service_endpoint_without_authorization_mode_decodes_as_strip() {
-        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+        use openshell_core::proto::{
+            ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
+        };
 
         let endpoint = ServiceEndpoint::decode(
             legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
@@ -645,6 +836,10 @@ mod tests {
         assert_eq!(
             crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
             ServiceAuthorizationMode::Strip
+        );
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Unspecified
         );
     }
 
@@ -684,6 +879,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_stored_profile_preserves_revision_scoped_credentials() {
+        let bytes = legacy_bytes(LEGACY_STATIC_PROFILE);
+        let stored = StoredProviderProfile::decode(bytes.as_slice())
+            .expect("legacy static profile must decode");
+        assert_eq!(stored.encode_to_vec(), bytes);
+        let profile = stored.profile.expect("profile");
+        assert_eq!(profile.id, "legacy-static");
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "api_key");
+        assert_eq!(credential.env_vars, ["SYNTHETIC_API_KEY"]);
+        assert!(credential.required);
+        assert_eq!(credential.auth_style, "bearer");
+        assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
     fn sandbox_payload_without_endpoint_status_decodes() {
         use openshell_core::proto::{Sandbox, SandboxPhase};
 
@@ -699,6 +911,7 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
         assert_eq!(status.restart_count, 0);
+        assert!(status.last_token_grant_failure.is_none());
         assert!(status.next_restart_time.is_none());
         assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);
@@ -709,7 +922,7 @@ mod tests {
 
     #[test]
     fn pre_move_storage_payloads_decode_after_package_relocation() {
-        let refresh = StoredProviderCredentialRefreshState::decode(
+        let refresh = v1::StoredProviderCredentialRefreshState::decode(
             legacy_bytes(V0_0_116_REFRESH_STATE).as_slice(),
         )
         .expect("legacy refresh state must decode");
@@ -873,7 +1086,7 @@ mod tests {
         }
 
         let refresh = current_store
-            .get_message::<StoredProviderCredentialRefreshStateV2>("legacy-id")
+            .get_message::<StoredProviderCredentialRefreshState>("legacy-id")
             .await
             .expect("decode refresh fixture")
             .expect("refresh fixture must remain present");

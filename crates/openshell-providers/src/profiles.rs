@@ -93,6 +93,10 @@ pub struct CredentialProfile {
     pub env_vars: Vec<String>,
     #[serde(default)]
     pub required: bool,
+    /// Preserve an issued workload reference across external value updates.
+    /// Requires environment aliases and excludes gateway-owned credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stable_placeholder: bool,
     #[serde(default)]
     pub auth_style: String,
     #[serde(default)]
@@ -813,6 +817,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -857,6 +862,17 @@ impl ProviderTypeProfile {
             }
         }
         vars
+    }
+
+    /// GitHub App credential selected by its logical name or an environment alias.
+    #[must_use]
+    pub fn github_app_credential(&self, key: &str) -> Option<&CredentialProfile> {
+        self.credentials.iter().find(|credential| {
+            (credential.name == key || credential.env_vars.iter().any(|alias| alias == key))
+                && credential.refresh.as_ref().is_some_and(|refresh| {
+                    refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation
+                })
+        })
     }
 
     /// Whether this profile can be created without initial static credentials.
@@ -991,6 +1007,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -1143,8 +1160,8 @@ impl CredentialRefreshProfile {
 /// Whether the gateway can mint credentials for this refresh strategy (as
 /// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
 ///
-/// Single source of truth shared with `openshell-server`; keep in sync with the
-/// dispatch in `provider_refresh::mint_credential`.
+/// Profile capability predicate. Gateway parity tests keep this aligned with the
+/// embedded issuer's built-in minter registry without a catalog dependency.
 #[must_use]
 pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
     matches!(
@@ -1153,6 +1170,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
             | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            | ProviderCredentialRefreshStrategy::GithubAppInstallation
     )
 }
 
@@ -1403,6 +1421,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "github_app_installation" => Some(ProviderCredentialRefreshStrategy::GithubAppInstallation),
         _ => None,
     }
 }
@@ -1418,6 +1437,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -2025,7 +2045,7 @@ pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, Prof
 ///
 /// Nothing in a release binary parses a profile *set* from YAML any more: the
 /// gateway validates the sets its configured sources return, through
-/// `validate_profile_set`. This is the loader behind the example profiles in
+/// `validate_catalog_profiles`. This is the loader behind the example profiles in
 /// `providers/`, so it is compiled for tests and for the `example-profiles`
 /// feature only.
 #[cfg(any(test, feature = "example-profiles"))]
@@ -2130,6 +2150,42 @@ fn is_valid_profile_id(id: &str) -> bool {
 
 #[must_use]
 pub fn validate_profile_set(
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Vec<ProfileValidationDiagnostic> {
+    let mut diagnostics = validate_catalog_profiles(profiles);
+    for (source, profile) in profiles {
+        for credential in &profile.credentials {
+            let refresh = credential
+                .refresh
+                .as_ref()
+                .map(|refresh| ("credentials.refresh.token_url", &refresh.token_url));
+            let grant = credential.token_grant.as_ref().map(|grant| {
+                (
+                    "credentials.token_grant.token_endpoint",
+                    &grant.token_endpoint,
+                )
+            });
+            for (field, raw) in [refresh, grant].into_iter().flatten() {
+                if raw.contains('^')
+                    && let Err(reason) = openshell_core::token_endpoint::parse_auth_url(raw)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        &profile.id,
+                        field,
+                        format!("URL {reason}"),
+                    ));
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+/// Validate a loaded catalog without preventing owners from reading and
+/// replacing legacy credential endpoint paths. Minting checks the original URL.
+#[must_use]
+pub fn validate_catalog_profiles(
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Vec<ProfileValidationDiagnostic> {
     let mut diagnostics = Vec::new();
@@ -2293,7 +2349,44 @@ pub fn validate_profile_set(
         ));
 
         let mut env_vars = HashSet::new();
+        let co_minted_credentials = profile.co_minted_credential_names();
         for credential in &profile.credentials {
+            // Each credential has one placeholder owner. Gateway-managed
+            // credentials derive their handle from a refresh authorization
+            // epoch, including outputs declared by a sibling credential.
+            if credential.stable_placeholder
+                && (credential
+                    .refresh
+                    .as_ref()
+                    .is_some_and(CredentialRefreshProfile::is_gateway_mintable)
+                    || co_minted_credentials.contains(credential.name.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with gateway-managed credential refresh",
+                ));
+            }
+            // Stored-name fallback credentials have no workload environment
+            // reference. Accepting this opt-in would silently leave them in
+            // revision mode because stable delivery selects environment aliases.
+            if credential.stable_placeholder && credential.env_vars.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder requires at least one environment variable",
+                ));
+            }
+            if credential.stable_placeholder && credential.token_grant.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with token_grant credentials",
+                ));
+            }
             for env_var in &credential.env_vars {
                 if env_var.trim().is_empty() {
                     diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2334,14 +2427,14 @@ pub fn validate_profile_set(
                         ));
                     }
                 }
-                "path" => {
+                "path" | "path_subtree" => {
                     let path_template = credential.path_template.trim();
                     if path_template.is_empty() {
                         diagnostics.push(ProfileValidationDiagnostic::error(
                             source,
                             profile_id,
                             "credentials.path_template",
-                            "path_template is required for path auth",
+                            format!("path_template is required for {auth_style} auth"),
                         ));
                     } else {
                         let count = path_template
@@ -2378,6 +2471,36 @@ pub fn validate_profile_set(
             }
 
             if let Some(refresh) = credential.refresh.as_ref() {
+                if refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+                    if credential.env_vars.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.env_vars",
+                            "github_app_installation requires at least one environment alias",
+                        ));
+                    }
+                    if let Err(reason) =
+                        openshell_core::token_endpoint::validate_github_app_template(
+                            &refresh.token_url,
+                        )
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.token_url",
+                            format!("token_url {reason}"),
+                        ));
+                    }
+                    if !refresh.scopes.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.scopes",
+                            "github_app_installation uses permissions material instead of scopes",
+                        ));
+                    }
+                }
                 if refresh.strategy == ProviderCredentialRefreshStrategy::Unspecified {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
@@ -2716,6 +2839,7 @@ pub fn validate_profile_set(
             }
 
             let l7_fields = L7EndpointFields {
+                websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
                 protocol: &endpoint.protocol,
                 access: &endpoint.access,
                 has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
@@ -4319,6 +4443,133 @@ credentials:
     }
 
     #[test]
+    fn stable_placeholder_defaults_false_and_round_trips() {
+        let default_profile = parse_profile_yaml(
+            r"
+id: default-placeholder
+display_name: Default Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+",
+        )
+        .expect("profile should parse");
+        assert!(!default_profile.credentials[0].stable_placeholder);
+
+        let stable_profile = parse_profile_yaml(
+            r"
+id: stable-placeholder
+display_name: Stable Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+",
+        )
+        .expect("profile should parse");
+        assert!(stable_profile.credentials[0].stable_placeholder);
+
+        let proto = stable_profile.to_proto();
+        assert!(proto.credentials[0].stable_placeholder);
+        let round_trip = ProviderTypeProfile::from_proto(&proto);
+        assert!(round_trip.credentials[0].stable_placeholder);
+
+        let exported = profile_to_yaml(&round_trip).expect("yaml");
+        assert!(exported.contains("stable_placeholder: true"));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_co_minted_refresh_outputs() {
+        for id in ["aws", "aws-s3"] {
+            for output in ["secret_access_key", "session_token"] {
+                let mut profile = crate::example_profiles::load(id);
+                let credential = profile
+                    .credentials
+                    .iter_mut()
+                    .find(|credential| credential.name == output)
+                    .expect("example profile refresh output");
+                assert!(credential.refresh.is_none());
+                credential.stable_placeholder = true;
+                let diagnostics = validate_profile_set(&[(format!("{id}.yaml"), profile)]);
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == "credentials.stable_placeholder"
+                        && diagnostic.message
+                            == "stable_placeholder is incompatible with gateway-managed credential refresh"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_credentials_without_environment_aliases() {
+        let profile = parse_profile_yaml(
+            r"
+id: stored-name-placeholder
+display_name: Stored Name Placeholder
+credentials:
+  - name: TOKEN
+    stable_placeholder: true
+",
+        )
+        .expect("stored-name profile should parse");
+        assert_eq!(profile.credentials[0].accepted_stored_keys(), vec!["TOKEN"]);
+        let diagnostics = validate_profile_set(&[("stored-name.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder requires at least one environment variable"
+        }));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_runtime_minted_credentials() {
+        let refresh_profile = parse_profile_yaml(
+            r"
+id: refresh-placeholder
+display_name: Refresh Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://auth.example.com/token
+",
+        )
+        .expect("refresh profile should parse");
+        let refresh_diagnostics =
+            validate_profile_set(&[("refresh.yaml".to_string(), refresh_profile)]);
+        assert!(refresh_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with gateway-managed credential refresh"
+        }));
+
+        let token_grant_profile = parse_profile_yaml(
+            r"
+id: token-grant-placeholder
+display_name: Token Grant Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .expect("token grant profile should parse");
+        let token_grant_diagnostics =
+            validate_profile_set(&[("token-grant.yaml".to_string(), token_grant_profile)]);
+        assert!(token_grant_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with token_grant credentials"
+        }));
+    }
+
+    #[test]
     fn profile_discovery_metadata_round_trips_through_proto_and_yaml() {
         let profile = parse_profile_yaml(
             r"
@@ -5151,6 +5402,10 @@ credentials:
     env_vars: [PATH_TOKEN]
     auth_style: path
     path_template: /v1/{credential}/resources
+  - name: bot_cred
+    env_vars: [BOT_TOKEN]
+    auth_style: path_subtree
+    path_template: /bot{credential}
 ",
         )
         .expect("profile should parse");
@@ -5179,6 +5434,8 @@ credentials:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         let reparsed = parse_profile_yaml(&exported).expect("re-parse");
         assert_eq!(reparsed.credentials[1].header_name, "authorization");
+        assert_eq!(reparsed.credentials[4].auth_style, "path_subtree");
+        assert_eq!(reparsed.credentials[4].path_template, "/bot{credential}");
         assert_eq!(reparsed.credentials[2].query_param, "api_key");
         assert_eq!(
             reparsed.credentials[3].path_template,
@@ -5688,7 +5945,7 @@ credentials:
 
     #[test]
     fn validate_profile_set_rejects_token_grant_query_or_path_auth_style() {
-        for auth_style in ["query", "path"] {
+        for auth_style in ["query", "path", "path_subtree"] {
             let profile = parse_profile_yaml(&format!(
                 r"
 id: unsupported-token-grant-style
@@ -6161,6 +6418,42 @@ binaries: ["", /usr/bin/broken]
     }
 
     #[test]
+    fn validate_profile_rejects_rest_websocket_credential_rewrite() {
+        for protocol in ["rest", "REST", "Rest"] {
+            let profile = parse_profile_yaml(
+                r"
+id: rest-rewrite
+display_name: REST rewrite
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    websocket_credential_rewrite: true
+binaries:
+  - /usr/bin/curl
+"
+                .replace("protocol: rest", &format!("protocol: {protocol}"))
+                .as_str(),
+            )
+            .unwrap();
+            let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("use protocol: websocket"))
+            );
+        }
+    }
+
+    #[test]
     fn validate_profile_set_rejects_noncanonical_profile_ids() {
         let profiles = [
             (
@@ -6300,6 +6593,42 @@ binaries:
         assert!(
             matches!(err, ProfileError::ValidationError { ref id, ref message, .. } if id == "bad-l7" && message.contains("mutually exclusive")),
             "expected L7 validation error for access+rules, got: {err}"
+        );
+    }
+
+    #[test]
+    fn github_app_profile_roundtrip_and_runtime_credentials() {
+        let profile = example_profile("github-app");
+        assert!(profile.required_static_credentials().is_empty());
+        assert!(validate_profile_set(&[("github-app.yaml".into(), profile.clone())]).is_empty());
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto.credentials[0].refresh.as_ref().unwrap().strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        );
+        let restored = ProviderTypeProfile::from_proto(&proto);
+        let yaml = serde_yml::to_string(&restored).unwrap();
+        assert!(yaml.contains("github_app_installation"));
+        for endpoint in [
+            "https://api.github.com/token",
+            "/app/installations/{installation_id}/access_tokens",
+            "http://github.example/app/installations/{installation_id}/access_tokens",
+        ] {
+            let mut invalid = profile.clone();
+            invalid.credentials[0].refresh.as_mut().unwrap().token_url = endpoint.into();
+            assert!(
+                validate_profile_set(&[("invalid.yaml".into(), invalid)])
+                    .iter()
+                    .any(|error| error.field == "credentials.refresh.token_url"),
+                "{endpoint}"
+            );
+        }
+        let mut missing_alias = profile.clone();
+        missing_alias.credentials[0].env_vars.clear();
+        assert!(
+            validate_profile_set(&[("invalid.yaml".into(), missing_alias)])
+                .iter()
+                .any(|error| error.field == "credentials.env_vars")
         );
     }
 

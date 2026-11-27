@@ -2,3 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tier 2: medium/low priority positive tests (no time limit).
+
+mod managed_identity;
+mod network_policy;

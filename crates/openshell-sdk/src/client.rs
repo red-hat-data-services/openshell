@@ -12,20 +12,27 @@ use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
-use crate::raw::AuthedGrpcClient;
+use crate::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient, AuthedServiceDiscoveryClient};
 use crate::refresh::{RefreshedToken, TokenSource};
+use crate::routing::OwnerCache;
 use crate::types::{
-    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
-    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
-    SandboxWorkloadTemplate, WorkspaceRef,
+    CreateRetryOptions, DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health,
+    ListOptions, ResumeOptions, SandboxPhase, SandboxRef, SandboxSpec, SandboxTemplateCreateSpec,
+    SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
 };
 use crate::{WatchEvent, WatchOptions, transport};
 use futures::{Stream, StreamExt};
+use openshell_core::create_retry::{
+    AlreadyExistsPlan, CleanupPhase, HolderProvenance, RetryPlan, cleanup_wait_delay,
+    plan_already_exists, plan_retry, retry_stopped_suffix,
+};
 use openshell_core::proto;
+use openshell_core::replica_routing::{owner_replica, retry_unrouted, routed_to, with_owner_hint};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 /// Async client for a single `OpenShell` gateway.
@@ -43,6 +50,7 @@ pub struct OpenShellClient {
     /// Live bearer slot the interceptor reads; refreshed tokens are written
     /// here so rotation reaches in-flight requests. `None` for non-OIDC auth.
     bearer_slot: Option<BearerSlot>,
+    owners: OwnerCache,
 }
 
 impl OpenShellClient {
@@ -60,6 +68,7 @@ impl OpenShellClient {
             interceptor,
             token_source,
             bearer_slot,
+            owners: OwnerCache::default(),
         })
     }
 
@@ -75,12 +84,23 @@ impl OpenShellClient {
             interceptor,
             token_source: None,
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 
     /// Underlying tonic [`Channel`].
     pub fn channel(&self) -> Channel {
         self.channel.clone()
+    }
+
+    /// Clone of the auth interceptor backing [`OpenShellClient::raw_grpc`].
+    ///
+    /// tonic allows a single interceptor per channel, so callers that need
+    /// to stack another concern (e.g. trace-context forwarding) on top of
+    /// authentication can compose around this clone — it shares the same
+    /// live bearer slot, so OIDC refresh still reaches the composed stack.
+    pub fn auth_interceptor(&self) -> EdgeAuthInterceptor {
+        self.interceptor.clone()
     }
 
     /// Authenticated gRPC client for the main `OpenShell` service.
@@ -114,6 +134,40 @@ impl OpenShellClient {
     pub async fn raw_grpc_fresh(&self) -> Result<AuthedGrpcClient> {
         self.ensure_fresh().await?;
         Ok(self.raw_grpc())
+    }
+
+    /// Authenticated client for the optional `SandboxUpdates` service, sharing
+    /// this client's channel and live bearer slot. Like [`Self::raw_grpc`], this
+    /// does not refresh or retry OIDC credentials by itself.
+    pub fn raw_sandbox_updates(&self) -> AuthedSandboxUpdatesClient {
+        proto::sandbox_updates_client::SandboxUpdatesClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Like [`Self::raw_sandbox_updates`], but refreshes the bearer token first
+    /// when needed. Reactive retry remains the raw caller's responsibility.
+    pub async fn raw_sandbox_updates_fresh(&self) -> Result<AuthedSandboxUpdatesClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_sandbox_updates())
+    }
+
+    /// Authenticated client for the separate ingress discovery service.
+    /// Shares the channel and live auth slot; like [`Self::raw_grpc`], does not
+    /// refresh or retry credentials by itself.
+    pub fn raw_service_discovery(&self) -> AuthedServiceDiscoveryClient {
+        proto::service_discovery_client::ServiceDiscoveryClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Like [`Self::raw_service_discovery`], refreshing bearer credentials first.
+    /// Reactive retry remains the raw caller's responsibility.
+    pub async fn raw_service_discovery_fresh(&self) -> Result<AuthedServiceDiscoveryClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_service_discovery())
     }
 
     /// Force an OIDC refresh and write the new token into the live bearer
@@ -160,6 +214,38 @@ impl OpenShellClient {
             })
             .await?;
         sandbox_from_create_response(response)
+    }
+
+    /// Create a new sandbox, retrying while the gateway mutation lock is busy.
+    ///
+    /// Opt-in counterpart of [`OpenShellClient::create_sandbox`], which never
+    /// retries. Only a
+    /// [`MUTATION_LOCK_TIMEOUT`](openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT)
+    /// failure retries; every other failure is terminal, because a create can
+    /// fail after the gateway persisted it. A named create that hits
+    /// `AlreadyExists` waits out a holder that is being deleted, then retries.
+    pub async fn create_sandbox_with_retry(
+        &self,
+        spec: SandboxSpec,
+        options: CreateRetryOptions,
+    ) -> Result<SandboxRef> {
+        let request = create_sandbox_request(spec);
+        self.create_with_retry(request, "default", options).await
+    }
+
+    /// Create a new sandbox from a workload template, retrying while the
+    /// gateway mutation lock is busy.
+    ///
+    /// Template creates issue the same `CreateSandbox` RPC, so they hit the
+    /// same lock timeout and `AlreadyExists` race as
+    /// [`OpenShellClient::create_sandbox_with_retry`].
+    pub async fn create_sandbox_from_template_with_retry(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+        options: CreateRetryOptions,
+    ) -> Result<SandboxRef> {
+        let request = create_sandbox_from_template_request(spec);
+        self.create_with_retry(request, "default", options).await
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -299,16 +385,7 @@ impl OpenShellClient {
 
     /// Fetch a sandbox by name.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.get_sandbox_in("default", name).await
     }
 
     /// List sandboxes.
@@ -400,6 +477,38 @@ impl OpenShellClient {
         sandbox_from_response(response.sandbox)
     }
 
+    /// Suspend a ready sandbox by name, retaining its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support suspend
+    /// and resume. The gateway returns `FAILED_PRECONDITION` otherwise.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name in a new runtime generation.
+    pub async fn resume_sandbox(&self, name: &str, opts: ResumeOptions) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
+                    restart_if_restore_fails: opts.restart_if_restore_fails,
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Poll [`OpenShellClient::get_sandbox`] until the sandbox reaches
     /// [`SandboxPhase::Ready`] or successful [`SandboxPhase::Completed`], or
     /// until the `timeout` elapses.
@@ -407,7 +516,8 @@ impl OpenShellClient {
     /// Returns the terminal sandbox snapshot on success. Returns an
     /// [`SdkError::Connect`] when the timeout expires, or whatever error
     /// the gateway returns if the sandbox transitions into
-    /// [`SandboxPhase::Stopped`] or [`SandboxPhase::Error`].
+    /// [`SandboxPhase::Stopped`], [`SandboxPhase::Error`],
+    /// [`SandboxPhase::Suspending`], or [`SandboxPhase::Suspended`].
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
         self.wait_for(name, timeout, |phase| match phase {
             SandboxPhase::Ready | SandboxPhase::Completed => Some(Ok(())),
@@ -417,6 +527,9 @@ impl OpenShellClient {
             SandboxPhase::Error => Some(Err(SdkError::connect(format!(
                 "sandbox '{name}' entered error phase"
             )))),
+            SandboxPhase::Suspending | SandboxPhase::Suspended => Some(Err(SdkError::connect(
+                format!("sandbox '{name}' is suspended; resume it before waiting for ready"),
+            ))),
             _ => None,
         })
         .await
@@ -625,16 +738,7 @@ impl OpenShellClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        // Open the stream under the same OIDC-aware auth policy as unary RPCs
-        // (proactive refresh, then one reactive retry on `Unauthenticated`).
-        // Mid-stream rotation is out of scope; streaming retry is tracked
-        // separately.
-        let mut stream = self
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.open_exec("default", request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -790,21 +894,101 @@ impl OpenShellClient {
         F: Fn(AuthedGrpcClient) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
     {
+        self.unary_response(call)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// [`OpenShellClient::unary`] that keeps the response metadata.
+    async fn unary_response<T, F, Fut>(&self, call: F) -> Result<tonic::Response<T>>
+    where
+        F: Fn(AuthedGrpcClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
         self.ensure_fresh().await?;
         match call(self.raw_grpc()).await {
-            Ok(resp) => Ok(resp.into_inner()),
+            Ok(resp) => Ok(resp),
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 if self.refresh_on_unauthorized().await? {
-                    call(self.raw_grpc())
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(map_status)
+                    call(self.raw_grpc()).await.map_err(map_status)
                 } else {
                     Err(map_status(status))
                 }
             }
             Err(status) => Err(map_status(status)),
         }
+    }
+
+    /// Errors that exec would hit anyway are returned; any other failed lookup
+    /// leaves the call unrouted.
+    async fn owner_of(&self, workspace: &str, name: &str) -> Result<Option<AsciiMetadataValue>> {
+        if let Some(cached) = self.owners.get(workspace, name) {
+            return Ok(cached.0);
+        }
+        match self.get_sandbox_in(workspace, name).await {
+            Ok(_) => Ok(self.owners.get(workspace, name).and_then(|cached| cached.0)),
+            Err(err)
+                if matches!(
+                    err.grpc_status().map(tonic::Status::code),
+                    Some(tonic::Code::Unauthenticated | tonic::Code::Unavailable)
+                ) =>
+            {
+                Err(err)
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "sandbox owner lookup failed; exec is unrouted");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `GetSandbox` that also caches the owner replica the gateway reports.
+    async fn get_sandbox_in(&self, workspace: &str, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary_response(|mut grpc| {
+                let request = with_owner_hint(proto::GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(workspace)),
+                });
+                async move { grpc.get_sandbox(request).await }
+            })
+            .await?;
+        self.owners
+            .insert(workspace, name, owner_replica(&response));
+        sandbox_from_response(response.into_inner().sandbox)
+    }
+
+    /// Open `ExecSandbox` on the owner replica under the unary auth policy.
+    async fn open_exec(
+        &self,
+        workspace: &str,
+        request: proto::ExecSandboxRequest,
+    ) -> Result<tonic::Streaming<proto::ExecSandboxEvent>> {
+        let owner = self.owner_of(workspace, &request.sandbox).await?;
+        let owners = &self.owners;
+        self.unary(|mut grpc| {
+            let request = request.clone();
+            let owner = owner.clone();
+            async move {
+                match grpc
+                    .exec_sandbox(routed_to(request.clone(), owner.as_ref()))
+                    .await
+                {
+                    Err(status) if retry_unrouted(owner.as_ref(), &status) => {
+                        owners.forget(workspace, &request.sandbox);
+                        grpc.exec_sandbox(request).await
+                    }
+                    Err(status) => {
+                        if owner.is_some() && status.code() == tonic::Code::Unavailable {
+                            owners.forget(workspace, &request.sandbox);
+                        }
+                        Err(status)
+                    }
+                    response => response,
+                }
+            }
+        })
+        .await
     }
 
     /// Proactive refresh: if a token source is wired and the token is within
@@ -864,6 +1048,281 @@ impl OpenShellClient {
             delay = (delay * 2).min(Duration::from_secs(2));
         }
     }
+
+    /// Retrying create shared by every create surface.
+    async fn create_with_retry(
+        &self,
+        request: proto::CreateSandboxRequest,
+        workspace: &str,
+        options: CreateRetryOptions,
+    ) -> Result<SandboxRef> {
+        self.create_with_retry_using(
+            request,
+            workspace,
+            options,
+            create_retry_seed(),
+            tokio::time::sleep,
+        )
+        .await
+    }
+
+    /// [`OpenShellClient::create_with_retry`] with the jitter seed and the
+    /// sleeper injected so tests pin both.
+    ///
+    /// `workspace` is the scope the create request was built for. The
+    /// `AlreadyExists` phase poll reuses it: a poll without it would
+    /// disambiguate the name against the wrong workspace.
+    async fn create_with_retry_using<F, Fut>(
+        &self,
+        request: proto::CreateSandboxRequest,
+        workspace: &str,
+        options: CreateRetryOptions,
+        seed: u64,
+        sleep: F,
+    ) -> Result<SandboxRef>
+    where
+        F: Fn(Duration) -> Fut + Send + Sync,
+        Fut: Future<Output = ()> + Send,
+    {
+        let deadline = deadline_after(options.budget);
+        let name = request.name.clone();
+        let mut create_attempts: u32 = 0;
+        // Dual use: the last lock-timeout error annotates the surfaced failure,
+        // and its presence is how the AlreadyExists wait derives
+        // `HolderProvenance` (a record this call may have left). It is set only
+        // when a retry was actually planned, so a Stop on the first lock
+        // timeout keeps the plain error shape.
+        let mut lock_timeout: Option<SdkError> = None;
+        let mut not_found_retries: u32 = 0;
+        // Identity of the holder observed during the current AlreadyExists
+        // conflict. Reset when a NotFound observation drives a create retry:
+        // that holder is gone, and the next conflict's holder is expected to
+        // have a fresh id (an own re-attempt persists a new record), so the
+        // same-name-replacement guard must not compare against the stale one.
+        let mut holder_id: Option<String> = None;
+
+        loop {
+            create_attempts += 1;
+            let sent = Instant::now();
+            let result = self
+                .unary(|mut grpc| {
+                    let request = request.clone();
+                    async move { grpc.create_sandbox(request).await }
+                })
+                .await;
+            match result {
+                Ok(response) => return sandbox_from_create_response(response),
+                // A lock timeout means different things per gateway step. The
+                // pre-record creation guard rejects before any write ran, so
+                // the request is safely repeatable. The SSH identity step also
+                // reports this reason, but only after the record was
+                // persisted: that failure is compensated server-side, and the
+                // next attempt resolves through the AlreadyExists cleanup wait
+                // below. `request_id` stays empty either way: a non-empty one
+                // would engage mutation replay and surface the recorded
+                // failure instead of retrying. The public create surfaces
+                // never set one (the request builders send it empty), and a
+                // future caller-supplied id must not enter this loop: replay
+                // admission would turn every retry into the recorded failure.
+                Err(err) if err.mutation_lock_timeout() => {
+                    if !sleep_before_retry(
+                        &sleep,
+                        &err,
+                        create_attempts,
+                        sent.elapsed(),
+                        seed,
+                        deadline,
+                    )
+                    .await
+                    {
+                        return Err(annotate_create_retry(
+                            err,
+                            create_attempts,
+                            lock_timeout.as_ref(),
+                        ));
+                    }
+                    lock_timeout = Some(err);
+                }
+                // A named create can lose the name to a sandbox that is still
+                // being deleted, or to a record an earlier attempt of this
+                // call left mid-provisioning. The name frees when cleanup
+                // finishes, so the decision layer below waits, retries, or
+                // stops per phase.
+                Err(err @ SdkError::AlreadyExists { .. }) if !name.is_empty() => {
+                    let poll_delay = err.retry_delay();
+                    let mut wait_attempt: u32 = 0;
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            // The budget is spent before the poll: surface the
+                            // conflict instead of starting a read that cannot
+                            // be bounded.
+                            return Err(annotate_create_retry(
+                                err,
+                                create_attempts,
+                                lock_timeout.as_ref(),
+                            ));
+                        }
+                        // Bound the read itself: a stuck `GetSandbox` must not
+                        // keep the retrying create pending past its budget.
+                        let observed = match tokio::time::timeout(
+                            remaining,
+                            self.get_sandbox_in(workspace, &name),
+                        )
+                        .await
+                        {
+                            Err(_elapsed) => {
+                                return Err(annotate_create_retry(
+                                    err,
+                                    create_attempts,
+                                    lock_timeout.as_ref(),
+                                ));
+                            }
+                            Ok(result) => match result {
+                                Ok(snapshot) => {
+                                    // A different id means the name changed hands;
+                                    // waiting on it would watch the wrong holder. A
+                                    // live replacement keeps the name, so it gets
+                                    // the same terminal conflict as a live holder.
+                                    // A missing gateway id cannot identify the
+                                    // holder, so it neither counts as a change nor
+                                    // replaces the recorded id with an empty
+                                    // string.
+                                    let observed_id =
+                                        (!snapshot.id.is_empty()).then_some(snapshot.id.as_str());
+                                    if let (Some(held), Some(id)) =
+                                        (holder_id.as_deref(), observed_id)
+                                        && held != id
+                                    {
+                                        return Err(stop_create_retry(
+                                            err,
+                                            create_attempts,
+                                            lock_timeout.as_ref(),
+                                        ));
+                                    }
+                                    if let Some(id) = observed_id {
+                                        holder_id = Some(id.to_string());
+                                    }
+                                    if snapshot.phase == SandboxPhase::Deleting {
+                                        CleanupPhase::Deleting
+                                    } else if snapshot.phase == SandboxPhase::Provisioning {
+                                        CleanupPhase::Provisioning
+                                    } else {
+                                        CleanupPhase::Live
+                                    }
+                                }
+                                Err(SdkError::NotFound { .. }) => CleanupPhase::NotFound,
+                                // `get_sandbox_in` only produces an `InvalidConfig`
+                                // without a status when the gateway returned an
+                                // `Ok` response with the sandbox field unset. That
+                                // is the same wire event the CLI maps to NotFound:
+                                // the record is gone or invisible to this caller.
+                                Err(SdkError::InvalidConfig { status: None, .. }) => {
+                                    CleanupPhase::NotFound
+                                }
+                                // A transient read failure says nothing about the
+                                // holder: wait one poll interval and ask again
+                                // while the budget allows.
+                                Err(poll_error) if is_transient_poll_failure(&poll_error) => {
+                                    let delay = cleanup_wait_delay(poll_delay, wait_attempt, seed);
+                                    if delay > deadline.saturating_duration_since(Instant::now()) {
+                                        return Err(annotate_create_retry(
+                                            err,
+                                            create_attempts,
+                                            lock_timeout.as_ref(),
+                                        ));
+                                    }
+                                    sleep(delay).await;
+                                    wait_attempt += 1;
+                                    continue;
+                                }
+                                // Any other read failure says nothing about the
+                                // holder either, but waiting cannot resolve it.
+                                // Surface the name conflict, not the read error, so
+                                // callers keep the `AlreadyExists` contract.
+                                Err(other) => {
+                                    return Err(with_message_suffix(
+                                        stop_create_retry(
+                                            err,
+                                            create_attempts,
+                                            lock_timeout.as_ref(),
+                                        ),
+                                        &format!("; holder status unavailable: {other}"),
+                                    ));
+                                }
+                            },
+                        };
+                        if observed != CleanupPhase::NotFound {
+                            not_found_retries = 0;
+                        }
+                        // A provisioning holder is only waited out when an
+                        // earlier attempt of this call may have left it: a
+                        // lock timeout was already observed.
+                        let provenance = if lock_timeout.is_some() {
+                            HolderProvenance::OwnPriorAttempt
+                        } else {
+                            HolderProvenance::OtherCaller
+                        };
+                        match plan_already_exists(
+                            observed,
+                            not_found_retries,
+                            poll_delay,
+                            wait_attempt,
+                            create_attempts,
+                            seed,
+                            provenance,
+                        ) {
+                            AlreadyExistsPlan::Wait(delay) => {
+                                if delay > deadline.saturating_duration_since(Instant::now()) {
+                                    return Err(annotate_create_retry(
+                                        err,
+                                        create_attempts,
+                                        lock_timeout.as_ref(),
+                                    ));
+                                }
+                                sleep(delay).await;
+                                wait_attempt += 1;
+                            }
+                            AlreadyExistsPlan::RetryCreate => {
+                                if Instant::now() >= deadline {
+                                    return Err(annotate_create_retry(
+                                        err,
+                                        create_attempts,
+                                        lock_timeout.as_ref(),
+                                    ));
+                                }
+                                not_found_retries += 1;
+                                // The observed holder is gone (NotFound drove
+                                // this retry), so the next conflict starts
+                                // without a recorded id to compare against.
+                                holder_id = None;
+                                break;
+                            }
+                            AlreadyExistsPlan::Stop => {
+                                // A Provisioning holder under OwnPriorAttempt
+                                // reaches Stop only through the attempt cap,
+                                // which the attempt-count annotation already
+                                // names; only another caller's provisioning
+                                // holder gets the attribution.
+                                let stopped =
+                                    stop_create_retry(err, create_attempts, lock_timeout.as_ref());
+                                return Err(match (observed, provenance) {
+                                    (CleanupPhase::Provisioning, HolderProvenance::OtherCaller) => {
+                                        with_message_suffix(
+                                            stopped,
+                                            "; the holder is still being created by another caller",
+                                        )
+                                    }
+                                    _ => stopped,
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
 }
 
 /// Workspace-scoped sandbox operations, analogous to `kube::Api::namespaced`.
@@ -911,6 +1370,37 @@ impl WorkspaceScopedClient {
             })
             .await?;
         sandbox_from_create_response(response)
+    }
+
+    /// Create a new sandbox in this workspace, retrying while the gateway
+    /// mutation lock is busy.
+    ///
+    /// Opt-in counterpart of [`WorkspaceScopedClient::create_sandbox`]; see
+    /// [`OpenShellClient::create_sandbox_with_retry`] for the retry contract.
+    pub async fn create_sandbox_with_retry(
+        &self,
+        spec: SandboxSpec,
+        options: CreateRetryOptions,
+    ) -> Result<SandboxRef> {
+        let mut request = create_sandbox_request(spec);
+        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
+        self.client
+            .create_with_retry(request, &self.workspace, options)
+            .await
+    }
+
+    /// Create a new sandbox from a template in this workspace, retrying while
+    /// the gateway mutation lock is busy.
+    pub async fn create_sandbox_from_template_with_retry(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+        options: CreateRetryOptions,
+    ) -> Result<SandboxRef> {
+        let mut request = create_sandbox_from_template_request(spec);
+        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
+        self.client
+            .create_with_retry(request, &self.workspace, options)
+            .await
     }
 
     /// Create a reusable sandbox template in this workspace.
@@ -1014,17 +1504,7 @@ impl WorkspaceScopedClient {
 
     /// Fetch a sandbox by name in this workspace.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.client.get_sandbox_in(&self.workspace, name).await
     }
 
     /// List sandboxes in this workspace.
@@ -1118,6 +1598,40 @@ impl WorkspaceScopedClient {
         sandbox_from_response(response.sandbox)
     }
 
+    /// Suspend a ready sandbox by name in this workspace, retaining its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support suspend
+    /// and resume. The gateway returns `FAILED_PRECONDITION` otherwise.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name in this workspace in a new runtime generation.
+    pub async fn resume_sandbox(&self, name: &str, opts: ResumeOptions) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    restart_if_restore_fails: opts.restart_if_restore_fails,
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or successful
     /// [`SandboxPhase::Completed`], or the timeout elapses.
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
@@ -1137,6 +1651,11 @@ impl WorkspaceScopedClient {
                 SandboxPhase::Error => {
                     return Err(SdkError::connect(format!(
                         "sandbox '{name}' entered error phase"
+                    )));
+                }
+                SandboxPhase::Suspending | SandboxPhase::Suspended => {
+                    return Err(SdkError::connect(format!(
+                        "sandbox '{name}' is suspended; resume it before waiting for ready"
                     )));
                 }
                 _ => {}
@@ -1204,13 +1723,7 @@ impl WorkspaceScopedClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        let mut stream = self
-            .client
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.client.open_exec(&self.workspace, request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1417,6 +1930,8 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
 fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
     let mut sandbox = sandbox_from_response(response.sandbox)?;
     sandbox.service_urls = response.service_urls;
+    sandbox.application_service_urls = response.application_service_urls;
+    sandbox.gateway_service_urls = response.gateway_service_urls;
     Ok(sandbox)
 }
 
@@ -1429,6 +1944,161 @@ fn sandbox_template_from_response(
 
 fn map_status(status: tonic::Status) -> SdkError {
     SdkError::from_status(status)
+}
+
+/// Seed for create-retry jitter, drawn once per retrying call.
+///
+/// `RandomState::new()` mixes a per-process and per-thread counter, so two
+/// clients in one process retrying the same sandbox name pick different
+/// jitter, the way clients in different processes do. Deriving it from the
+/// sandbox name instead would make every contender re-collide in lockstep.
+fn create_retry_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Deadline `budget` from now, saturating rather than panicking when the
+/// budget is larger than an [`Instant`] can represent.
+fn deadline_after(budget: Duration) -> Instant {
+    let now = Instant::now();
+    let mut budget = budget;
+    loop {
+        if let Some(deadline) = now.checked_add(budget) {
+            return deadline;
+        }
+        budget /= 2;
+    }
+}
+
+/// Sleep the delay selected by the shared retry policy.
+///
+/// Returns `false` when the remaining budget cannot cover the delay, or when
+/// the sleep resolves at or past the deadline (a late timer wake); the caller
+/// then surfaces the failure instead of starting an attempt outside its
+/// budget. An attempt that starts inside the budget may still overrun it, per
+/// the retry policy's documented contract.
+async fn sleep_before_retry<F, Fut>(
+    sleep: &F,
+    err: &SdkError,
+    attempts_made: u32,
+    waited: Duration,
+    seed: u64,
+    deadline: Instant,
+) -> bool
+where
+    F: Fn(Duration) -> Fut + Sync,
+    Fut: Future<Output = ()> + Send,
+{
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match plan_retry(err.retry_delay(), attempts_made, waited, seed, remaining) {
+        RetryPlan::Sleep(delay) => {
+            sleep(delay).await;
+            Instant::now() < deadline
+        }
+        RetryPlan::Stop => false,
+    }
+}
+
+/// Whether a phase-poll failure is a transient transport condition that says
+/// nothing about the holder.
+fn is_transient_poll_failure(err: &SdkError) -> bool {
+    err.grpc_status()
+        .is_some_and(|status| status.code() == tonic::Code::Unavailable)
+}
+
+/// Annotate a create failure that ended the retry loop.
+///
+/// The suffix names the attempt count and, when the surfaced failure is not
+/// itself a lock timeout (an `AlreadyExists` cleanup wait), the original lock
+/// timeout. The raw status keeps its message, details, and metadata, so
+/// [`SdkError::error_details`] and [`SdkError::grpc_status`] still describe
+/// the gateway failure.
+fn annotate_create_retry(
+    err: SdkError,
+    attempts: u32,
+    lock_timeout: Option<&SdkError>,
+) -> SdkError {
+    let lock_timeout = lock_timeout.filter(|_| !err.mutation_lock_timeout());
+    let suffix = retry_stopped_suffix(attempts, lock_timeout.and_then(error_message));
+    with_message_suffix(err, &suffix)
+}
+
+/// Stop the retry loop on a terminal decision.
+///
+/// A conflict on the first attempt with no prior lock timeout is the plain
+/// "name taken" failure and stays unannotated. Every other stop names the
+/// attempt count, so a cleanup-wait timeout is never misread as a bare name
+/// conflict.
+fn stop_create_retry(err: SdkError, attempts: u32, lock_timeout: Option<&SdkError>) -> SdkError {
+    let lock_timeout = lock_timeout.filter(|_| !err.mutation_lock_timeout());
+    if attempts <= 1 && lock_timeout.is_none() {
+        return err;
+    }
+    annotate_create_retry(err, attempts, lock_timeout)
+}
+
+/// Message payload of an error that carries one.
+fn error_message(err: &SdkError) -> Option<&str> {
+    match err {
+        SdkError::InvalidConfig { message, .. }
+        | SdkError::Auth { message, .. }
+        | SdkError::NotFound { message, .. }
+        | SdkError::AlreadyExists { message, .. }
+        | SdkError::OutOfRange { message, .. }
+        | SdkError::Rpc { message, .. }
+        | SdkError::Tls { message }
+        | SdkError::Connect { message } => Some(message),
+        SdkError::Io { .. } => None,
+    }
+}
+
+/// Append `suffix` to an error's message, leaving the rest of it untouched.
+fn with_message_suffix(err: SdkError, suffix: &str) -> SdkError {
+    match err {
+        SdkError::InvalidConfig { message, status } => SdkError::InvalidConfig {
+            message: message + suffix,
+            status,
+        },
+        SdkError::Auth {
+            message,
+            retryable,
+            status,
+        } => SdkError::Auth {
+            message: message + suffix,
+            retryable,
+            status,
+        },
+        SdkError::NotFound { message, status } => SdkError::NotFound {
+            message: message + suffix,
+            status,
+        },
+        SdkError::AlreadyExists { message, status } => SdkError::AlreadyExists {
+            message: message + suffix,
+            status,
+        },
+        SdkError::OutOfRange { message, status } => SdkError::OutOfRange {
+            message: message + suffix,
+            status,
+        },
+        SdkError::Rpc {
+            code,
+            message,
+            status,
+        } => SdkError::Rpc {
+            code,
+            message: message + suffix,
+            status,
+        },
+        // Transport failures never carry a create-retry annotation: the loop
+        // only stops on gateway statuses. Listing them keeps this match
+        // exhaustive, so a new variant forces a decision here.
+        SdkError::Tls { message } => SdkError::Tls { message },
+        SdkError::Connect { message } => SdkError::Connect { message },
+        SdkError::Io { source } => SdkError::Io { source },
+    }
 }
 
 /// Convert a wire watch event into the curated [`WatchEvent`], advancing
@@ -1547,6 +2217,7 @@ mod tests {
             interceptor,
             token_source: Some(source),
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 
@@ -1625,6 +2296,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auth_interceptor_clone_sees_refreshed_token() {
+        use tonic::service::Interceptor as _;
+
+        // The clone handed out by `auth_interceptor()` must share the live
+        // bearer slot: callers compose other concerns (e.g. the CLI's
+        // trace-forwarding gateway interceptor) around it, and a forced OIDC
+        // refresh must reach those already-built stacks.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = oidc_client_with_refresher(Arc::clone(&calls));
+        let mut interceptor = client.auth_interceptor();
+
+        assert!(client.force_refresh().await.unwrap());
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token-1"),
+            "refreshed token must reach the cloned interceptor"
+        );
+    }
+
     #[test]
     fn store_bearer_rejects_malformed_token_and_keeps_previous() {
         let slot: BearerSlot = Arc::new(RwLock::new(None));
@@ -1652,6 +2348,165 @@ mod tests {
         assert_eq!(
             spec.restart_policy(),
             proto::SandboxRestartPolicy::OnFailure
+        );
+    }
+
+    fn lock_timeout_error(delay: Duration) -> SdkError {
+        SdkError::from_status(openshell_core::rpc_error::unavailable(
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT,
+            "gateway busy",
+            delay,
+        ))
+    }
+
+    /// Drive one retry sleep through an injected sleeper and report what it
+    /// was asked to wait for. `None` means the policy stopped instead.
+    async fn recorded_sleep(
+        err: &SdkError,
+        attempt: u32,
+        seed: u64,
+        deadline: Instant,
+    ) -> Option<Duration> {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let sleep = |sleep_for: Duration| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                *recorded.lock().unwrap() = Some(sleep_for);
+            }
+        };
+        let slept = sleep_before_retry(&sleep, err, attempt, Duration::ZERO, seed, deadline).await;
+        assert_eq!(slept, recorded.lock().unwrap().is_some());
+        *recorded.lock().unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_retry_sleeper_waits_between_the_floor_and_jitter_bound() {
+        let delay = Duration::from_millis(400);
+        let err = lock_timeout_error(delay);
+        let deadline = Instant::now() + Duration::from_mins(1);
+        for attempts_made in 1..=4 {
+            let floor = delay * (1 << (attempts_made - 1));
+            let wait = recorded_sleep(&err, attempts_made, 11, deadline)
+                .await
+                .expect("a one-minute budget covers the delay");
+            assert!(wait >= floor, "wait {wait:?} must not undercut {floor:?}");
+            assert!(
+                wait <= floor + floor / 2,
+                "wait {wait:?} must stay within the jitter bound of {floor:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_retry_sleeper_stops_at_the_attempt_cap() {
+        let err = lock_timeout_error(Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_mins(1);
+        assert!(
+            recorded_sleep(
+                &err,
+                openshell_core::create_retry::MAX_CREATE_ATTEMPTS,
+                7,
+                deadline,
+            )
+            .await
+            .is_none(),
+            "the attempt cap must stop the retry even with budget left"
+        );
+    }
+
+    #[test]
+    fn create_retry_deadline_saturates_for_a_huge_budget() {
+        let deadline = deadline_after(Duration::MAX);
+        assert!(
+            deadline > Instant::now(),
+            "a budget that overflows Instant must still produce a future deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_retry_honors_the_injected_seed() {
+        let err = lock_timeout_error(Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_mins(1);
+
+        let first = recorded_sleep(&err, 2, 7, deadline).await;
+        let same_seed = recorded_sleep(&err, 2, 7, deadline).await;
+        assert_eq!(first, same_seed, "an injected seed must replay exactly");
+
+        let mut waits = std::collections::BTreeSet::new();
+        for seed in 0..16 {
+            waits.insert(recorded_sleep(&err, 2, seed, deadline).await);
+        }
+        assert!(
+            waits.len() > 1,
+            "distinct seeds produced one jitter value: {waits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_retry_stops_when_the_budget_cannot_cover_the_delay() {
+        let err = lock_timeout_error(Duration::from_secs(1));
+        assert_eq!(recorded_sleep(&err, 0, 7, Instant::now()).await, None);
+    }
+
+    #[test]
+    fn create_retry_seeds_decorrelate_clients_in_one_process() {
+        let seeds: std::collections::BTreeSet<u64> = (0..8).map(|_| create_retry_seed()).collect();
+        assert!(
+            seeds.len() > 1,
+            "per-call seeds must differ so clients do not retry in lockstep"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_annotation_carries_the_attempt_count() {
+        let err = SdkError::from_status(tonic::Status::unavailable("gateway busy"));
+        let annotated = annotate_create_retry(err, 3, None);
+        assert!(
+            annotated
+                .to_string()
+                .contains("create retry stopped after 3 create attempts"),
+            "unexpected message: {annotated}"
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_annotation_names_the_original_lock_timeout() {
+        let cause = lock_timeout_error(Duration::from_secs(1));
+        let conflict = SdkError::from_status(tonic::Status::already_exists("sandbox 'box' exists"));
+        let annotated = annotate_create_retry(conflict, 2, Some(&cause));
+        let message = annotated.to_string();
+        assert!(
+            message.contains("create retry stopped after 2 create attempts"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("last mutation lock timeout: gateway busy"),
+            "unexpected message: {message}"
+        );
+        assert!(matches!(annotated, SdkError::AlreadyExists { .. }));
+    }
+
+    #[test]
+    fn retry_annotation_leaves_a_first_attempt_conflict_alone() {
+        let conflict = SdkError::from_status(tonic::Status::already_exists("sandbox 'box' exists"));
+        let untouched = stop_create_retry(conflict, 1, None);
+        assert_eq!(
+            untouched.to_string(),
+            "already exists: sandbox 'box' exists"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_annotation_always_names_the_attempt_count() {
+        // An exhausted cleanup wait must not read as a bare name conflict,
+        // even on the first create attempt.
+        let conflict = SdkError::from_status(tonic::Status::already_exists("sandbox 'box' exists"));
+        let annotated = annotate_create_retry(conflict, 1, None);
+        assert!(
+            annotated
+                .to_string()
+                .contains("create retry stopped after 1 create attempt"),
+            "unexpected message: {annotated}"
         );
     }
 }

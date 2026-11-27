@@ -3,8 +3,9 @@
 
 name: Release Helm OCI
 description: >
-  Patch chart version/appVersion, refuse duplicate OCI versions on public
-  releases, package the gateway and workspace charts, and push them to GHCR OCI.
+  Patch chart version/appVersion, package the gateway and workspace charts, and
+  push them to oci://quay.io/ai-openshell/charts. Public releases never
+  overwrite published versions.
 
 inputs:
   chart-version:
@@ -33,15 +34,15 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Log in to GHCR
-      uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-
     - name: Install Helm
       uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+    # Needs id-token: write and the release environment on the calling job.
+    - name: Log in to Quay
+      uses: ai-openshell/workflows/quay-login@96e33d5551ba4e706203648eb90710c48466e543 # main
+      with:
+        robot: ai-openshell+openshell_release
+        clients: helm
 
     - name: Stage chart and patch version
       id: prep
@@ -63,22 +64,38 @@ runs:
         echo "workspace_chart_dir=${WORKSPACE_CHART_DIR}" >> "$GITHUB_OUTPUT"
         echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
-    - name: Refuse duplicate chart version
+    # Public chart versions are never overwritten. A rerun keeps both published
+    # charts; a partial publication still fails for manual repair.
+    - name: Check for published chart version
+      id: published
       if: inputs.release-kind == 'public'
       env:
         CHART_VERSION: ${{ steps.prep.outputs.chart_version }}
       shell: bash
       run: |
         set -euo pipefail
-        for chart in helm-chart openshell-workspace; do
-          OCI_CHART="oci://ghcr.io/nvidia/openshell/${chart}"
-          if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
-            echo "::error::Chart ${chart}:${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
+        found=0
+        for chart in openshell openshell-workspace; do
+          OCI_CHART="oci://quay.io/ai-openshell/charts/${chart}"
+          # Only "not found" means unpublished; any other lookup error fails
+          # rather than risk overwriting.
+          if lookup_error=$(helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" 2>&1 >/dev/null); then
+            found=$((found + 1))
+          elif [[ "${lookup_error}" != *"quay.io/ai-openshell/charts/${chart}:${CHART_VERSION}: not found"* ]]; then
+            echo "::error::Could not check whether ${chart}:${CHART_VERSION} is published: ${lookup_error}"
             exit 1
           fi
         done
+        if [ "${found}" -eq 2 ]; then
+          echo "Charts ${CHART_VERSION} are already published; keeping them."
+          echo "published=true" >> "$GITHUB_OUTPUT"
+        elif [ "${found}" -ne 0 ]; then
+          echo "::error::Only one chart is published at ${CHART_VERSION}. Delete it or publish the other chart manually."
+          exit 1
+        fi
 
     - name: Package Helm chart
+      if: steps.published.outputs.published != 'true'
       env:
         GATEWAY_CHART_DIR: ${{ steps.prep.outputs.gateway_chart_dir }}
         WORKSPACE_CHART_DIR: ${{ steps.prep.outputs.workspace_chart_dir }}
@@ -90,12 +107,29 @@ runs:
         helm package "${WORKSPACE_CHART_DIR}" --destination /tmp/helm-charts
         ls /tmp/helm-charts/*.tgz
 
-    - name: Push Helm chart to GHCR OCI
+    - name: Push Helm chart to Quay
+      if: steps.published.outputs.published != 'true'
       shell: bash
       run: |
         set -euo pipefail
+        # Helm pushes the manifest by digest, then fetches it back to tag it.
+        # A registry can briefly return 404 for a manifest it just accepted,
+        # so retry. Re-pushing the same archive is idempotent.
+        push_chart() {
+          local attempt
+          for attempt in 1 2 3 4; do
+            if helm push "$1" oci://quay.io/ai-openshell/charts; then
+              return 0
+            fi
+            if [ "${attempt}" -lt 4 ]; then
+              echo "::warning::helm push of $(basename "$1") failed (attempt ${attempt}); retrying in $((attempt * 10))s."
+              sleep $((attempt * 10))
+            fi
+          done
+          return 1
+        }
         for archive in /tmp/helm-charts/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          push_chart "${archive}"
         done
 
     - name: Push SHA-pinned chart
@@ -107,6 +141,20 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # See "Push Helm chart to Quay" for why pushes retry.
+        push_chart() {
+          local attempt
+          for attempt in 1 2 3 4; do
+            if helm push "$1" oci://quay.io/ai-openshell/charts; then
+              return 0
+            fi
+            if [ "${attempt}" -lt 4 ]; then
+              echo "::warning::helm push of $(basename "$1") failed (attempt ${attempt}); retrying in $((attempt * 10))s."
+              sleep $((attempt * 10))
+            fi
+          done
+          return 1
+        }
         mkdir -p /tmp/sha-pin
         for source_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do
           chart_name="$(basename "${source_dir}")"
@@ -117,5 +165,5 @@ runs:
           helm package "${sha_chart_dir}" --destination /tmp/sha-pin
         done
         for archive in /tmp/sha-pin/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          push_chart "${archive}"
         done

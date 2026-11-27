@@ -5,6 +5,9 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+pub(super) mod access_token;
+
+use crate::compute::MutationScope;
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
 use crate::pagination::Pagination;
@@ -16,10 +19,8 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
-use crate::storage_proto::{
-    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
-};
+use crate::provider_refresh::{RefreshStateReader, clear_refresh_owned_expiries};
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use openshell_core::dynamic_credential_key::DynamicCredentialKey;
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
@@ -31,6 +32,8 @@ use openshell_core::proto::{
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
+use openshell_credential_issuer::refresh::CredentialRefresh;
+use openshell_credential_issuer::refresh::{minter, secret_refs};
 use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -39,9 +42,10 @@ use tonic::Status;
 use tracing::warn;
 
 use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
-use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
+use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
 
 const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
+const EXTERNAL_STABLE_PLACEHOLDER_EPOCH: &str = "external-stable-placeholder-v1";
 
 // ---------------------------------------------------------------------------
 // CRUD helpers
@@ -65,6 +69,44 @@ pub(super) fn redact_provider_credentials(mut provider: Provider) -> Provider {
     provider
 }
 
+/// Provider and grant snapshots are read separately. An older provider revision
+/// can still contain the previous epoch's token.
+pub(super) fn withhold_stale_github_app_outputs<'a>(
+    provider: &mut Provider,
+    version: u64,
+    refreshes: impl IntoIterator<Item = &'a StoredProviderCredentialRefreshState>,
+) {
+    for grant in refreshes {
+        if grant.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32 {
+            continue;
+        }
+        if grant.first_mint_provider_version == 0
+            || version < grant.first_mint_provider_version
+            || grant
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.deletion_time.is_some())
+        {
+            provider.credentials.remove(&grant.credential_key);
+            provider.credential_handles.remove(&grant.credential_key);
+            provider
+                .credential_expiration_times
+                .remove(&grant.credential_key);
+        } else if grant.last_refresh_at_ms != 0 {
+            // Older gateways allowed a provider update to clear or extend this expiry.
+            let cap = openshell_core::time::timestamp_from_millis(grant.expires_at_ms)
+                .unwrap_or_default();
+            let expiry = provider
+                .credential_expiration_times
+                .entry(grant.credential_key.clone())
+                .or_insert(cap);
+            if (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos) {
+                *expiry = cap;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
     /// A closed reason for omitted injectable material. An empty environment
@@ -75,7 +117,13 @@ pub(super) struct ProviderEnvironment {
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
+    pub stable_placeholder_environment_keys: HashSet<String>,
     pub files: HashMap<String, String>,
+    /// Static credential keys withheld because they were already expired at
+    /// resolution time. Excluded from `environment`/`static_credential_keys`
+    /// like any other withheld key, but tracked separately from keys that
+    /// never had an injectable credential.
+    pub expired_static_keys: HashSet<String>,
 }
 
 /// Immutable provider records used to build one provider-environment response.
@@ -312,41 +360,91 @@ pub(super) async fn update_provider_record(
     let catalog = ProviderProfileSources::with_default_sources()
         .snapshot_catalog(store, workspace)
         .await?;
-    update_provider_record_with_catalog(store, &catalog, workspace, provider).await
+    update_provider_record_with_catalog(
+        store,
+        &crate::provider_refresh::test_runtime(store),
+        &catalog,
+        workspace,
+        provider,
+    )
+    .await
 }
 
 pub(super) async fn update_provider_record_with_catalog(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    update_provider_record_validating(store, workspace, catalog, provider, &[], None).await
+    update_provider_record_validating(store, refresh, workspace, catalog, provider, &[], None).await
 }
 
 async fn reject_refresh_owned_credential_updates(
-    store: &Store,
-    provider_id: &str,
-    credential_updates: &HashMap<String, String>,
+    refresh: &dyn CredentialRefresh,
+    provider: &Provider,
+    catalog: &EffectiveProviderProfileCatalog,
+    update: &Provider,
+    clear_expiries: &[String],
 ) -> Result<(), Status> {
-    if credential_updates.is_empty() {
+    if update.credentials.is_empty()
+        && update.credential_expiration_times.is_empty()
+        && clear_expiries.is_empty()
+    {
         return Ok(());
     }
 
     let mut refresh_owned_keys = HashSet::new();
-    for refresh_state in
-        crate::provider_refresh::list_refresh_states_for_provider(store, provider_id).await?
-    {
+    let profile =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace);
+    for refresh_state in refresh.list(Some(provider.object_id())).await? {
         let strategy =
             ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
         if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
             continue;
         }
 
+        if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+            let key = &refresh_state.credential_key;
+            if refresh_state.first_mint_provider_version != 0 {
+                if clear_expiries.contains(key) {
+                    return Err(Status::failed_precondition(format!(
+                        "cannot clear the minted expiry for {key}"
+                    )));
+                }
+                if let Some(expiry) = update.credential_expiration_times.get(key) {
+                    // During publication the provider may already hold the new token
+                    // while the refresh state still describes the previous one.
+                    let cap = if refresh_state.status == "refresh_committing"
+                        || refresh_state.last_refresh_at_ms == 0
+                    {
+                        provider.credential_expiration_times.get(key).copied()
+                    } else {
+                        openshell_core::time::timestamp_from_millis(refresh_state.expires_at_ms)
+                            .ok()
+                    };
+                    if cap
+                        .is_none_or(|cap| (expiry.seconds, expiry.nanos) > (cap.seconds, cap.nanos))
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "expiry for {key} exceeds the minted token lifetime"
+                        )));
+                    }
+                }
+            }
+            if let Some(profile) = &profile {
+                validate_github_app_static_aliases(profile, key, |alias| {
+                    update
+                        .credentials
+                        .get(alias)
+                        .is_some_and(|value| !value.is_empty())
+                })?;
+            }
+        }
         for key in std::iter::once(refresh_state.credential_key)
             .chain(refresh_state.additional_output_keys.into_values())
         {
-            if credential_updates.contains_key(&key) {
+            if update.credentials.contains_key(&key) {
                 refresh_owned_keys.insert(key);
             }
         }
@@ -366,6 +464,7 @@ async fn reject_refresh_owned_credential_updates(
 
 async fn update_provider_record_validating(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
@@ -412,8 +511,14 @@ async fn update_provider_record_validating(
         ));
     }
 
-    reject_refresh_owned_credential_updates(store, existing.object_id(), &provider.credentials)
-        .await?;
+    reject_refresh_owned_credential_updates(
+        refresh,
+        &existing,
+        catalog,
+        &provider,
+        clear_credential_expiration_keys,
+    )
+    .await?;
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
 
@@ -490,7 +595,11 @@ async fn update_provider_record_validating(
             validate_provider_credentials(&profile, &candidate, &updated_credential_values)?;
         }
         validate_provider_update_against_attached_sandboxes_with_catalog(
-            store, catalog, workspace, &candidate,
+            store,
+            RefreshStateReader::Runtime(refresh),
+            catalog,
+            workspace,
+            &candidate,
         )
         .await?;
 
@@ -572,11 +681,19 @@ pub(super) async fn delete_provider_record(
         &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
     )
     .map_err(|err| Status::internal(format!("create test credential runtime failed: {err}")))?;
-    delete_provider_record_with_credentials(store, workspace, &credentials, name).await
+    delete_provider_record_with_credentials(
+        store,
+        &crate::provider_refresh::runtime(&Arc::new(store.clone()), Some(&credentials), None),
+        workspace,
+        &credentials,
+        name,
+    )
+    .await
 }
 
 pub(super) async fn delete_provider_record_with_credentials(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     credentials: &crate::credentials::CredentialRuntime,
     name: &str,
@@ -602,12 +719,19 @@ pub(super) async fn delete_provider_record_with_credentials(
     }
 
     crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
-        store,
-        credentials,
+        refresh,
         provider.object_id(),
     )
     .await?;
 
+    // Refresh deletion may already have unlinked and retired some handles.
+    let Some(provider) = store
+        .get_message::<Provider>(provider.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch remaining provider credentials: {e}")))?
+    else {
+        return Ok(true);
+    };
     credentials
         .delete_provider_credential_handles(
             provider.object_name(),
@@ -1015,46 +1139,108 @@ pub(super) async fn resolve_provider_environment_with_credentials(
     provider_names: &[String],
     credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
-    let records = load_provider_environment_records(store, workspace, provider_names).await?;
-    resolve_provider_environment_from_records_with_credentials(
+    let records = load_provider_environment_records(
         store,
-        catalog,
-        &records,
-        credentials,
+        &crate::provider_refresh::test_runtime(store),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    resolve_provider_environment_from_records_with_credentials(catalog, &records, credentials).await
+}
+
+/// Loads one provider; `Ok(None)` means it does not exist.
+async fn load_provider_environment_record(
+    store: &Store,
+    refresh: &dyn CredentialRefresh,
+    workspace: &str,
+    name: &str,
+) -> Result<Option<ProviderEnvironmentRecord>, Status> {
+    let Some(record) = store
+        .get_by_name(Provider::object_type(), workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+    else {
+        return Ok(None);
+    };
+    let mut provider = Provider::decode(record.payload.as_slice())
+        .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
+    let refresh_states: Vec<_> = refresh
+        .list(Some(&record.id))
+        .await?
+        .iter()
+        .map(Into::into)
+        .collect();
+    withhold_stale_github_app_outputs(&mut provider, record.resource_version, &refresh_states);
+    Ok(Some(ProviderEnvironmentRecord {
+        name: name.to_string(),
+        object_id: record.id,
+        resource_version: record.resource_version,
+        provider,
+        refresh_states,
+    }))
+}
+
+/// Loads providers concurrently, in `provider_names` order; a missing
+/// provider is `None`. Store errors short-circuit.
+async fn load_optional_provider_environment_records(
+    store: &Store,
+    refresh: &dyn CredentialRefresh,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<Vec<Option<ProviderEnvironmentRecord>>, Status> {
+    // Providers are independent, so load them concurrently.
+    futures::future::try_join_all(
+        provider_names
+            .iter()
+            .map(|name| load_provider_environment_record(store, refresh, workspace, name)),
     )
     .await
 }
 
 pub(super) async fn load_provider_environment_records(
     store: &Store,
+    refresh: &dyn CredentialRefresh,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
+    load_optional_provider_environment_records(store, refresh, workspace, provider_names)
+        .await?
+        .into_iter()
+        .zip(provider_names)
+        .map(|(record, name)| {
+            record
+                .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
+        })
+        .collect()
+}
+
+/// Like [`load_provider_environment_records`], but returns the names of
+/// missing providers instead of failing.
+pub(super) async fn load_existing_provider_environment_records<'a>(
+    store: &Store,
+    refresh: &dyn CredentialRefresh,
+    workspace: &str,
+    provider_names: &'a [String],
+) -> Result<(Vec<ProviderEnvironmentRecord>, Vec<&'a str>), Status> {
     let mut records = Vec::with_capacity(provider_names.len());
-    for name in provider_names {
-        let record = store
-            .get_by_name(Provider::object_type(), workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
-        let provider = Provider::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
-        let refresh_states =
-            crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
-        records.push(ProviderEnvironmentRecord {
-            name: name.clone(),
-            object_id: record.id,
-            resource_version: record.resource_version,
-            provider,
-            refresh_states,
-        });
+    let mut missing = Vec::new();
+    for (record, name) in
+        load_optional_provider_environment_records(store, refresh, workspace, provider_names)
+            .await?
+            .into_iter()
+            .zip(provider_names)
+    {
+        match record {
+            Some(record) => records.push(record),
+            None => missing.push(name.as_str()),
+        }
     }
-    Ok(records)
+    Ok((records, missing))
 }
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
 ) -> Result<ProviderEnvironment, Status> {
@@ -1063,7 +1249,6 @@ pub(super) async fn resolve_provider_environment_from_records(
     )
     .map_err(|err| Status::internal(format!("initialize credential runtime failed: {err}")))?;
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         &HashMap::new(),
@@ -1075,13 +1260,11 @@ pub(super) async fn resolve_provider_environment_from_records(
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_credentials(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         &HashMap::new(),
@@ -1093,7 +1276,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
 
 #[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
@@ -1103,7 +1285,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     )
     .map_err(|err| Status::internal(format!("initialize credential runtime failed: {err}")))?;
     resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-        store,
         catalog,
         records,
         policy_bindings,
@@ -1114,7 +1295,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
 }
 
 pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-    store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
@@ -1129,11 +1309,13 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut expires = HashMap::new();
     let mut static_credential_bindings = HashMap::new();
     let mut static_credential_keys = HashSet::new();
+    let mut stable_placeholder_environment_keys = HashSet::new();
     let mut files = HashMap::new();
     let mut file_env_keys = HashSet::new();
     let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
+    let mut expired_static_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
+    validate_provider_environment_records_unique_at(catalog, records, now_ms)?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for record in records {
@@ -1145,6 +1327,31 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             &provider.r#type,
             &provider.profile_workspace,
         );
+        let mut provider = std::borrow::Cow::Borrowed(provider);
+        if let Some(profile) = &profile {
+            for alias in inactive_github_app_aliases(profile, &record.refresh_states) {
+                if provider.credentials.contains_key(alias)
+                    || provider.credential_handles.contains_key(alias)
+                {
+                    let filtered = provider.to_mut();
+                    filtered.credentials.remove(alias);
+                    filtered.credential_handles.remove(alias);
+                    filtered.credential_expiration_times.remove(alias);
+                }
+            }
+        }
+        let provider = provider.as_ref();
+        let profile_stable_placeholder_keys = profile
+            .as_ref()
+            .map(|profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.stable_placeholder)
+                    .flat_map(|credential| credential.env_vars.iter().cloned())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let accepted_stored_credential_keys = profile.as_ref().map(|profile| {
             profile
                 .credentials
@@ -1258,6 +1465,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         );
                         readiness_reason =
                             openshell_core::proto::ProviderReadinessReason::CredentialExpired;
+                        expired_static_keys.insert(key.clone());
                         continue;
                     }
                     expires.entry(key.clone()).or_insert(expires_at_ms);
@@ -1278,6 +1486,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             key,
                             endpoints,
                             refresh_epochs.get(key).map(String::as_str),
+                            profile_stable_placeholder_keys.contains(key),
                         ),
                     );
                 }
@@ -1356,6 +1565,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             &key,
                             endpoints,
                             refresh_epochs.get(&key).map(String::as_str),
+                            profile_stable_placeholder_keys.contains(&key),
                         ),
                     );
                 }
@@ -1368,11 +1578,39 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             }
         }
 
+        // The credential runtime withholds expired handle-backed values. Keep
+        // the identity of otherwise injectable keys in the resolver result.
+        for key in resolved_refs.expired_keys {
+            if accepted_stored_credential_keys
+                .as_ref()
+                .is_some_and(|accepted| !accepted.contains(&key))
+                || is_non_injectable_provider_credential(provider, &key)
+                || broker_only_credential_keys.contains(&key)
+                || has_no_usable_endpoint
+                || !is_valid_env_key(&key)
+            {
+                continue;
+            }
+            expired_static_keys.insert(key);
+        }
+
         // Build each provider's emitted environment independently so another
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
         inject_provider_plugin_environment(catalog, provider, &registry, &mut provider_env);
+        for key in profile_stable_placeholder_keys {
+            // A stable placeholder is emitted only when the binding carries
+            // the opaque handle that binds it to the sandbox, provider,
+            // credential key, and endpoint authorization.
+            if provider_env.contains_key(&key)
+                && static_credential_bindings
+                    .get(&key)
+                    .is_some_and(|binding| !binding.workload_credential_handle.is_empty())
+            {
+                stable_placeholder_environment_keys.insert(key);
+            }
+        }
         if let Some(profile) = profile.as_ref() {
             if !profile.files.is_empty()
                 && (name.is_empty()
@@ -1433,8 +1671,82 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records)?,
         static_credential_bindings,
         static_credential_keys,
+        stable_placeholder_environment_keys,
         files,
+        expired_static_keys,
     })
+}
+
+/// Copy authored request metadata for static values that survived snapshot
+/// filtering. The reserved namespace keeps it separate from endpoint token grants;
+/// older supervisors ignore entries without `token_grant` before parsing selectors.
+pub(super) fn static_credential_request_metadata(
+    sandbox_id: &str,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    environment: &ProviderEnvironment,
+) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
+    use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+    let mut metadata = HashMap::new();
+    for record in records {
+        let provider = &record.provider;
+        let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) else {
+            continue;
+        };
+        let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
+        for credential in &profile.credentials {
+            // Keep malformed explicit metadata distinguishable from a wholly
+            // absent declaration. The supervisor validates authored fields and
+            // fails closed; absence selects its default request placement.
+            if credential.auth_style.is_empty()
+                && credential.header_name.is_empty()
+                && credential.query_param.is_empty()
+                && credential.path_template.is_empty()
+            {
+                continue;
+            }
+            for key in credential.accepted_stored_keys() {
+                if !environment.environment.contains_key(key)
+                    || !environment.static_credential_keys.contains(key)
+                {
+                    continue;
+                }
+                let Some(baseline) = environment.static_credential_bindings.get(key) else {
+                    continue;
+                };
+                // A later optional declaration with the same environment key
+                // must not override metadata belonging to the actual owner.
+                let expected = static_credential_binding(
+                    Some(sandbox_id),
+                    record,
+                    key,
+                    &baseline.endpoints,
+                    refresh_epochs.get(key).map(String::as_str),
+                    credential.stable_placeholder,
+                );
+                if expected != *baseline {
+                    continue;
+                }
+                metadata.insert(
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    ProviderProfileCredential {
+                        name: credential.name.clone(),
+                        env_vars: vec![key.to_string()],
+                        auth_style: credential.auth_style.clone(),
+                        header_name: credential.header_name.clone(),
+                        query_param: credential.query_param.clone(),
+                        path_template: credential.path_template.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    Ok(metadata)
 }
 
 fn refresh_authorization_epochs_by_key(
@@ -1476,9 +1788,15 @@ fn static_credential_binding(
     key: &str,
     endpoints: &[StaticCredentialEndpointBinding],
     authorization_epoch: Option<&str>,
+    stable_external_placeholder: bool,
 ) -> StaticCredentialBinding {
+    // External stable placeholders do not have a refresh authorization epoch.
+    // A fixed domain value keeps their handle stable across value updates while
+    // the remaining handle inputs revoke it on identity or endpoint changes.
+    let handle_epoch = authorization_epoch
+        .or_else(|| stable_external_placeholder.then_some(EXTERNAL_STABLE_PLACEHOLDER_EPOCH));
     let workload_credential_handle = sandbox_id
-        .zip(authorization_epoch)
+        .zip(handle_epoch)
         .map(|(sandbox_id, epoch)| {
             derive_workload_credential_handle(sandbox_id, &record.object_id, key, epoch, endpoints)
         })
@@ -1847,6 +2165,7 @@ pub async fn validate_provider_environment_keys_unique(
         .await?;
     validate_provider_environment_keys_unique_with_catalog(
         store,
+        RefreshStateReader::Runtime(&crate::provider_refresh::test_runtime(store)),
         &catalog,
         workspace,
         provider_names,
@@ -1902,12 +2221,14 @@ pub async fn validate_provider_profiles_present(
 
 pub async fn validate_provider_environment_keys_unique_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
         store,
+        refresh,
         catalog,
         workspace,
         provider_names,
@@ -1919,6 +2240,7 @@ pub async fn validate_provider_environment_keys_unique_with_catalog(
 
 pub async fn validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: &Provider,
@@ -1931,13 +2253,14 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes_w
         .or_insert_with(|| "pending".to_string());
     candidate.credential_expiration_times.remove(credential_key);
     validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, catalog, workspace, &candidate,
+        store, refresh, catalog, workspace, &candidate,
     )
     .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     workspace: &str,
     provider: &Provider,
 ) -> Result<(), Status> {
@@ -1945,13 +2268,14 @@ pub async fn validate_provider_update_against_attached_sandboxes(
         .snapshot_catalog(store, workspace)
         .await?;
     validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, &catalog, workspace, provider,
+        store, refresh, &catalog, workspace, provider,
     )
     .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider: &Provider,
@@ -1964,6 +2288,7 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
         };
         validate_provider_environment_keys_unique_at(
             store,
+            refresh,
             catalog,
                         workspace,
             &spec.providers,
@@ -1983,6 +2308,7 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
 
 async fn validate_provider_environment_keys_unique_at(
     store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
@@ -2008,7 +2334,7 @@ async fn validate_provider_environment_keys_unique_at(
             &mut seen_credentials,
             &mut seen_plugin_config,
             &provider_name,
-            active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
+            active_provider_environment_keys(refresh, catalog, &provider, now_ms).await?,
             provider_plugin_environment_keys(catalog, &provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
@@ -2019,8 +2345,7 @@ async fn validate_provider_environment_keys_unique_at(
     Ok(())
 }
 
-async fn validate_provider_environment_records_unique_at(
-    store: &Store,
+fn validate_provider_environment_records_unique_at(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     now_ms: i64,
@@ -2034,14 +2359,7 @@ async fn validate_provider_environment_records_unique_at(
             &mut seen_credentials,
             &mut seen_plugin_config,
             &record.name,
-            active_provider_environment_keys_for_identity(
-                store,
-                catalog,
-                provider,
-                &record.object_id,
-                now_ms,
-            )
-            .await?,
+            active_keys_with_refresh_states(catalog, provider, &record.refresh_states, now_ms),
             provider_plugin_environment_keys(catalog, provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
@@ -2294,13 +2612,13 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
 }
 
 async fn active_provider_environment_keys(
-    store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
     active_provider_environment_keys_for_identity(
-        store,
+        refresh,
         catalog,
         provider,
         provider.object_id(),
@@ -2310,33 +2628,47 @@ async fn active_provider_environment_keys(
 }
 
 async fn active_provider_environment_keys_for_identity(
-    store: &Store,
+    refresh: RefreshStateReader<'_>,
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     provider_identity: &str,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
+    let refresh_states = if provider_identity.is_empty() {
+        Vec::new()
+    } else {
+        refresh.list(provider_identity).await?
+    };
+    Ok(active_keys_with_refresh_states(
+        catalog,
+        provider,
+        &refresh_states,
+        now_ms,
+    ))
+}
+
+fn active_keys_with_refresh_states(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    refresh_states: &[StoredProviderCredentialRefreshState],
+    now_ms: i64,
+) -> Vec<String> {
     let broker_only_credential_keys =
         broker_only_provider_credential_keys_for_provider(catalog, provider);
     let mut keys = active_provider_credential_keys(provider, now_ms, &broker_only_credential_keys);
-    if !provider_identity.is_empty() {
-        for state in
-            crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity)
-                .await?
-        {
-            // The primary key plus every co-minted output key this refresh owns,
-            // so a configured-but-not-yet-minted refresh reserves all of them.
-            keys.extend(
-                std::iter::once(state.credential_key)
-                    .chain(state.additional_output_keys.into_values())
-                    .filter(|key| !broker_only_credential_keys.contains(key))
-                    .filter(|key| is_valid_env_key(key)),
-            );
-        }
+    for state in refresh_states {
+        // The primary key plus every co-minted output key this refresh owns,
+        // so a configured-but-not-yet-minted refresh reserves all of them.
+        keys.extend(
+            std::iter::once(state.credential_key.clone())
+                .chain(state.additional_output_keys.values().cloned())
+                .filter(|key| !broker_only_credential_keys.contains(key))
+                .filter(|key| is_valid_env_key(key)),
+        );
     }
     keys.sort();
     keys.dedup();
-    Ok(keys)
+    keys
 }
 
 fn active_provider_credential_keys(
@@ -2442,20 +2774,21 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse,
     GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    InlineProviderRefreshSecretsRequest, InlineProviderRefreshSecretsResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ProviderProfileDiagnostic, ProviderProfileImportItem, ProviderProfileResponse,
     ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
-use openshell_core::spiffe::{
-    JwtSvidParseError, SpiffeJwtClaims, parse_unverified_jwt_svid_claims,
-    trust_domain as spiffe_trust_domain, workload_api_endpoint,
-};
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
     validate_profile_set,
+};
+use openshell_spiffe::{
+    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
+    workload_api_endpoint,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -2466,33 +2799,26 @@ use crate::auth::workspace_authz::{
     authorize_workspace, require_platform_admin,
 };
 use openshell_core::oauth::{
-    self, TokenExchangeParams, effective_client_assertion_type, effective_token_type,
+    self, TokenExchangeParams, TokenGrantClient, effective_client_assertion_type,
+    effective_token_type,
+};
+use openshell_core::token_grant_failure::{
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage, WORKLOAD_IDENTITY_CALL_TIMEOUT,
 };
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
 const INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES: usize = 1024;
 
-static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> =
-    LazyLock::new(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| {
-                format!("provider token exchange HTTP client configuration failed: {err}")
-            })
-    });
+static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<TokenGrantClient, TokenGrantFailure>> =
+    LazyLock::new(TokenGrantClient::new);
 static INTERMEDIATE_TOKEN_CACHE: LazyLock<IntermediateTokenCache> =
     LazyLock::new(IntermediateTokenCache::new);
 
-fn token_exchange_http_client() -> Result<&'static reqwest::Client, Status> {
+fn token_exchange_http_client() -> Result<&'static TokenGrantClient, Status> {
     TOKEN_EXCHANGE_HTTP_CLIENT
         .as_ref()
-        .map_err(|err| Status::internal(err.clone()))
+        .map_err(|failure| failure.to_status_with_code(tonic::Code::Internal))
 }
 
 #[derive(Clone)]
@@ -2514,17 +2840,23 @@ impl IntermediateTokenCache {
     }
 
     fn get(&self, key: &str) -> Option<oauth::OAuthTokenResponse> {
+        self.get_until(key).map(|(token, _)| token)
+    }
+
+    /// The unexpired token with the time its entry expires, in milliseconds.
+    fn get_until(&self, key: &str) -> Option<(oauth::OAuthTokenResponse, i64)> {
         let now_ms = crate::persistence::current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(key)?;
         if cached.expires_at_ms <= now_ms {
             return None;
         }
-        Some(oauth::OAuthTokenResponse {
+        let token = oauth::OAuthTokenResponse {
             access_token: cached.access_token.clone(),
             expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
             token_type: cached.token_type.clone(),
-        })
+        };
+        Some((token, cached.expires_at_ms))
     }
 
     fn set(&self, key: String, token: &oauth::OAuthTokenResponse, expires_at_ms: i64) {
@@ -2576,6 +2908,20 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+/// Publish a provider record change to the sandboxes that attach it.
+fn publish_provider_change(state: &Arc<ServerState>, workspace: &str, provider_name: &str) {
+    crate::config_delivery::publish_provider(state, workspace, provider_name);
+}
+
+/// A profile change affects every provider of its type in scope.
+fn publish_provider_profile_change(state: &Arc<ServerState>, workspace: &str) {
+    if workspace.is_empty() {
+        crate::config_delivery::publish_all_connected(state);
+    } else {
+        crate::config_delivery::publish_workspace(state, workspace);
+    }
+}
+
 fn selected_profile_workspace(
     workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
 ) -> Result<&str, Status> {
@@ -2618,9 +2964,13 @@ pub(super) async fn handle_create_provider(
         ));
     }
     let provider_type = provider.r#type.clone();
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire provider mutation lock")
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2645,6 +2995,7 @@ pub(super) async fn handle_create_provider(
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 ..Default::default()
@@ -2692,6 +3043,7 @@ pub(super) async fn handle_list_providers(
 ) -> Result<Response<ListProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    super::validation::validate_label_selector(&request.label_selector)?;
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -2716,12 +3068,18 @@ pub(super) async fn handle_list_providers(
         request.page_size,
         &request.page_token,
         "ListProviders",
-        &[scope_fingerprint],
+        &[scope_fingerprint, &request.label_selector],
     )?;
     let after = pagination.object_cursor()?;
-    let query = workspace
-        .as_deref()
-        .map_or(ObjectListQuery::AllWorkspaces, ObjectListQuery::Workspace);
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), label_selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector,
+        },
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, label_selector) => ObjectListQuery::AllWorkspacesSelector(label_selector),
+    };
     let page = state
         .store
         .list_message_page::<Provider>(query, after.as_ref(), pagination.page_size())
@@ -2847,10 +3205,11 @@ pub(super) async fn handle_import_provider_profiles(
     .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::profiles(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2914,6 +3273,7 @@ pub(super) async fn handle_import_provider_profiles(
             stored.profile.unwrap_or_default(),
             resource_version,
         ));
+        publish_provider_profile_change(state, &workspace);
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -2942,10 +3302,11 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::profiles(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3049,6 +3410,7 @@ pub(super) async fn handle_update_provider_profiles(
     replay_facts.resource(&stored)?;
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+    publish_provider_profile_change(state, &workspace);
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
@@ -3086,6 +3448,7 @@ pub(super) async fn handle_lint_provider_profiles(
     Ok(Response::new(LintProviderProfilesResponse {
         diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
         valid,
+        supports_stable_placeholder: true,
     }))
 }
 
@@ -3105,10 +3468,11 @@ pub(super) async fn handle_delete_provider_profile(
     .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::profiles(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3143,6 +3507,7 @@ pub(super) async fn handle_delete_provider_profile(
         .delete(StoredProviderProfile::object_type(), existing.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+    publish_provider_profile_change(state, &workspace);
 
     Ok(Response::new(DeleteProviderProfileResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -3267,6 +3632,145 @@ fn provider_refresh_defaults(
         .and_then(|credential| credential.refresh.clone())
 }
 
+#[derive(Clone, Copy)]
+enum RefreshCredentialLookup {
+    Resolve,
+    Delete,
+}
+
+/// Existing non-GitHub grants are self-contained, even when a profile source is unavailable.
+async fn existing_refresh_key(
+    state: &ServerState,
+    provider: &Provider,
+    requested_key: &str,
+    lookup: RefreshCredentialLookup,
+) -> Result<String, Status> {
+    let workspace = provider.object_workspace();
+    if let Some(grant) = state
+        .refresh
+        .get(workspace, provider.object_id(), requested_key)
+        .await?
+        && (grant.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            || matches!(lookup, RefreshCredentialLookup::Delete))
+    {
+        return Ok(requested_key.to_string());
+    }
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    resolve_github_app_refresh_key(&state.refresh, &catalog, provider, requested_key, lookup).await
+}
+
+fn validate_github_app_static_aliases(
+    profile: &ProviderTypeProfile,
+    selected: &str,
+    is_stored: impl Fn(&str) -> bool,
+) -> Result<(), Status> {
+    if let Some(credential) = profile.github_app_credential(selected)
+        && let Some(alias) = credential
+            .env_vars
+            .iter()
+            .find(|alias| alias.as_str() != selected && is_stored(alias))
+    {
+        return Err(Status::failed_precondition(format!(
+            "static credential {alias} conflicts with GitHub App refresh on {selected}; clear {alias} with provider update"
+        )));
+    }
+    Ok(())
+}
+
+/// Also enforce the selected alias when reading providers created before write validation.
+pub(super) fn inactive_github_app_aliases<'a>(
+    profile: &'a ProviderTypeProfile,
+    grants: &[StoredProviderCredentialRefreshState],
+) -> HashSet<&'a str> {
+    let mut inactive = HashSet::new();
+    for grant in grants {
+        if grant.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+            && let Some(credential) = profile.github_app_credential(&grant.credential_key)
+        {
+            inactive.extend(
+                credential
+                    .env_vars
+                    .iter()
+                    .filter(|alias| **alias != grant.credential_key)
+                    .map(String::as_str),
+            );
+        }
+    }
+    inactive
+}
+
+/// A GitHub App credential has one refresh grant, stored under the selected
+/// environment alias. Logical names are selectors, never injectable keys.
+/// Configuration callers must hold the sandbox mutation guard through persist.
+async fn resolve_github_app_refresh_key(
+    refresh: &dyn CredentialRefresh,
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    requested_key: &str,
+    lookup: RefreshCredentialLookup,
+) -> Result<String, Status> {
+    let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
+    else {
+        return Ok(requested_key.to_string());
+    };
+    let Some(credential) = profile.github_app_credential(requested_key) else {
+        return Ok(requested_key.to_string());
+    };
+    let is_logical_name = credential.name == requested_key
+        && !credential
+            .env_vars
+            .iter()
+            .any(|alias| alias == requested_key);
+    let states = refresh.list(Some(provider.object_id())).await?;
+    let mut configured_keys: Vec<_> = states
+        .iter()
+        .filter(|state| {
+            state.credential_key == credential.name
+                || credential.env_vars.contains(&state.credential_key)
+        })
+        .map(|state| state.credential_key.as_str())
+        .collect();
+    configured_keys.sort_unstable();
+    // Exact deletion must remain possible even for legacy logical-name states
+    // or multiple aliases. Do not silently migrate or merge their grants.
+    if matches!(lookup, RefreshCredentialLookup::Delete) && configured_keys.contains(&requested_key)
+    {
+        return Ok(requested_key.to_string());
+    }
+    if configured_keys.len() > 1
+        || configured_keys
+            .iter()
+            .any(|key| !credential.env_vars.iter().any(|alias| alias == key))
+    {
+        return Err(Status::failed_precondition(format!(
+            "GitHub App credential '{}' has conflicting or legacy refresh keys: {}; delete the conflicting refresh configurations by exact key before reconfiguring",
+            credential.name,
+            configured_keys.join(", ")
+        )));
+    }
+    if let Some(existing_key) = configured_keys.first() {
+        if is_logical_name || requested_key == *existing_key {
+            return Ok((*existing_key).to_string());
+        }
+        return Err(Status::failed_precondition(format!(
+            "GitHub App credential '{}' already has refresh configured on {existing_key}; update that key or delete its refresh configuration before switching aliases",
+            credential.name
+        )));
+    }
+    if is_logical_name {
+        return credential.env_vars.first().cloned().ok_or_else(|| {
+            Status::failed_precondition(
+                "github_app_installation requires a credential with an environment alias",
+            )
+        });
+    }
+    Ok(requested_key.to_string())
+}
+
 /// Resolve the env keys a refresh co-mints (beyond its primary credential) from
 /// the provider's profile `additional_outputs`. Returns semantic output id ->
 /// env key. Empty when the provider type has no profile or the credential
@@ -3330,6 +3834,154 @@ fn validate_strategy_profile_binding(
         }
     }
     Ok(())
+}
+
+/// Inline material plus a placeholder for each key a workspace secret
+/// supplies, for checks that only need to know which keys are present.
+fn material_with_references(request: &ConfigureProviderRefreshRequest) -> HashMap<String, String> {
+    let mut supplied = request.material.clone();
+    for key in request.material_secrets.keys() {
+        supplied.insert(key.clone(), "workspace-secret".to_string());
+    }
+    supplied
+}
+
+/// Shape checks for `material_secrets` that need no stored state.
+fn validate_material_secret_references(
+    request: &ConfigureProviderRefreshRequest,
+) -> Result<(), Status> {
+    if request.material_secrets.len() > MAX_PROVIDER_CONFIG_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "material_secrets exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
+            request.material_secrets.len()
+        )));
+    }
+    for (key, secret) in &request.material_secrets {
+        if key.is_empty() || key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets key must be 1 to {MAX_MAP_KEY_LEN} bytes"
+            )));
+        }
+        if secret.trim().is_empty() || secret.len() > MAX_NAME_LEN {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets entry '{key}' must name a secret"
+            )));
+        }
+        if request.material.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' cannot be supplied by both material and material_secrets"
+            )));
+        }
+        // Gateways that predate workspace secrets ignore material_secrets but
+        // reject a listed secret key with no inline value.
+        if !request
+            .secret_material_keys
+            .iter()
+            .any(|listed| listed == key)
+        {
+            return Err(Status::invalid_argument(format!(
+                "material_secrets key '{key}' must also be listed in secret_material_keys"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Material keys read when refresh is configured, not when it mints.
+const CONFIGURATION_MATERIAL_KEYS: &[&str] = &[
+    "token_url",
+    "token_uri",
+    "sts_endpoint_url",
+    "tenant_id",
+    "scope",
+    "scopes",
+    "refresh_before_seconds",
+    "max_lifetime_seconds",
+];
+
+/// Only secret minting material may come from a shared workspace secret, and
+/// never material the minter writes back for one provider.
+fn validate_material_secret_keys(
+    strategy: ProviderCredentialRefreshStrategy,
+    refresh_defaults: Option<&CredentialRefreshProfile>,
+    material_secrets: &HashMap<String, String>,
+) -> Result<(), Status> {
+    for key in material_secrets.keys() {
+        // Configure reads these from inline material only, so a reference would
+        // be recorded but silently ignored, even if a profile marks it secret.
+        if CONFIGURATION_MATERIAL_KEYS.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' configures the refresh and cannot come from a workspace secret"
+            )));
+        }
+        if minter::strategy_rotated_material_keys(strategy).contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' is rotated per provider and cannot come from a workspace secret"
+            )));
+        }
+        let strategy_secret = crate::provider_refresh::strategy_secret_material_keys(strategy)
+            .contains(&key.as_str());
+        let profile_secret = refresh_defaults.is_some_and(|refresh| {
+            refresh
+                .material
+                .iter()
+                .any(|item| item.secret && item.name == *key)
+        });
+        if !strategy_secret && !profile_secret {
+            return Err(Status::invalid_argument(format!(
+                "material key '{key}' is not secret material and cannot come from a workspace secret"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve referenced secrets to immutable IDs and check that the token
+/// endpoint this refresh will call is one each secret allows.
+async fn bind_material_secrets(
+    state: &ServerState,
+    workspace: &str,
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+    token_url: &str,
+    material_secrets: &HashMap<String, String>,
+) -> Result<secret_refs::MaterialSecretBindings, Status> {
+    let mut bindings = secret_refs::MaterialSecretBindings::new();
+    if material_secrets.is_empty() {
+        return Ok(bindings);
+    }
+    let endpoint = minter::effective_token_endpoint(&minter::MintRequest {
+        strategy: strategy as i32,
+        material: material.clone(),
+        token_url: token_url.to_string(),
+        ..Default::default()
+    })?;
+    let endpoint = openshell_credential_issuer::endpoint::parse_token_endpoint(&endpoint)
+        .map_err(|reason| Status::failed_precondition(format!("refresh token endpoint {reason}")))?
+        .to_string();
+    for (material_key, name) in material_secrets {
+        let secret = super::secret::get_live_secret(&state.store, workspace, name)
+            .await?
+            .ok_or_else(|| Status::not_found(format!("workspace secret '{name}' not found")))?;
+        let Some(refresh_use) = secret.refresh_use.as_ref() else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{name}' is not enabled for provider refresh"
+            )));
+        };
+        if !refresh_use.allowed_endpoints.contains(&endpoint) {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{name}' does not allow token endpoint {endpoint}"
+            )));
+        }
+        bindings.insert(
+            material_key.clone(),
+            secret_refs::MaterialSecretBinding {
+                id: secret.object_id().to_string(),
+                name: name.clone(),
+            },
+        );
+    }
+    Ok(bindings)
 }
 
 fn validate_refresh_material(
@@ -3715,6 +4367,9 @@ async fn profile_attached_sandbox_diagnostics(
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
+        if super::policy::skip_sandbox_with_unsupported_cedar_policy(&sandbox) {
+            continue;
+        }
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
@@ -3931,10 +4586,15 @@ pub(super) async fn handle_update_provider(
         .name;
     // Provider material contributes to the route-report configuration epoch.
     // Serialize its mutation with route-status validation so a report derived
-    // from the prior revision cannot commit after this update.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire provider mutation lock")
-    })?;
+    // from the prior revision cannot commit after this update. The workspace
+    // key excludes every sandbox mutation in this workspace.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire provider mutation lock")
+        })?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -3963,6 +4623,7 @@ pub(super) async fn handle_update_provider(
         .await?;
     let result = update_provider_record_validating(
         state.store.as_ref(),
+        &state.refresh,
         &workspace,
         &catalog,
         provider,
@@ -3995,6 +4656,7 @@ pub(super) async fn handle_update_provider(
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace, provider.object_name());
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 target_receipts,
@@ -4012,43 +4674,189 @@ pub(super) async fn handle_update_provider(
     }
 }
 
+/// Exchange a supervisor's attached provider credential with safe failure details.
 pub(super) async fn handle_exchange_provider_subject_token(
     state: &Arc<ServerState>,
     request: Request<ExchangeProviderSubjectTokenRequest>,
 ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+    let request_id = canonical_request_id(request.metadata());
+    // A supervisor's failures go to its own authenticated sandbox's log stream,
+    // never to the sandbox named in the request. Other callers are logged on
+    // the gateway only.
+    let log_sandbox_id = match request.extensions().get::<Principal>() {
+        Some(Principal::Sandbox(principal)) => Some(principal.sandbox_id.clone()),
+        _ => None,
+    };
+    exchange_provider_subject_token_inner(state, request, request_id.as_deref())
+        .await
+        .map_err(|status| {
+            let status = sanitize_token_grant_status(status);
+            log_token_grant_failure(
+                log_sandbox_id.as_deref(),
+                request_id.as_deref(),
+                TokenGrantFailure::from_status(&status),
+            );
+            status
+        })
+}
+
+fn sanitize_token_grant_status(status: Status) -> Status {
+    // Rebuild even valid details so foreign metadata, sources and diagnostics
+    // cannot escape an early return from a shared dependency.
+    TokenGrantFailure::from_status(&status).to_status_with_code(status.code())
+}
+
+/// Return the request's `x-request-id` only when it is a canonical UUID.
+///
+/// The supervisor sends the ID of the HTTP exchange that needs the grant. Any
+/// other value is not echoed into logs or a token-service request.
+fn canonical_request_id(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
+    metadata
+        .get("x-request-id")?
+        .to_str()
+        .ok()
+        .filter(|value| openshell_core::endpoint_failure::is_canonical_request_id(value))
+        .map(str::to_owned)
+}
+
+/// Log a grant failure for operators with its bounded classification.
+///
+/// The gateway log stream keeps only an event's message and `sandbox_id`, so
+/// the classification goes into the message. It never contains remote text.
+fn log_token_grant_failure(
+    sandbox_id: Option<&str>,
+    request_id: Option<&str>,
+    failure: TokenGrantFailure,
+) {
+    let upstream_http_status = failure
+        .upstream_status()
+        .map_or_else(|| "none".to_string(), |status| status.to_string());
+    let message = format!(
+        "dynamic token grant failed request_id={} code={} stage={} upstream_http_status={upstream_http_status}",
+        request_id.unwrap_or("none"),
+        failure.code(),
+        failure.stage().code(),
+    );
+    if let Some(sandbox_id) = sandbox_id {
+        warn!(sandbox_id = %sandbox_id, "{message}");
+    } else {
+        warn!("{message}");
+    }
+}
+
+fn token_grant_configuration_status(code: tonic::Code) -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::Configuration,
+        TokenGrantStage::Configuration,
+    )
+    .to_status_with_code(code)
+}
+
+fn token_grant_store_status() -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::Unavailable,
+        TokenGrantStage::GatewayRpc,
+    )
+    .to_status_with_code(tonic::Code::Internal)
+}
+
+fn token_grant_identity_rejected(code: tonic::Code) -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::WorkloadIdentityRejected,
+        TokenGrantStage::WorkloadIdentity,
+    )
+    .to_status_with_code(code)
+}
+
+fn token_grant_workload_api_status(error: spiffe::WorkloadApiError, code: tonic::Code) -> Status {
+    use spiffe::WorkloadApiError;
+    let kind = match error {
+        WorkloadApiError::Endpoint(_) => TokenGrantFailureKind::Configuration,
+        WorkloadApiError::NoIdentityIssued | WorkloadApiError::PermissionDenied(_) => {
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Status(status)) => {
+            match status.code() {
+                tonic::Code::DeadlineExceeded => TokenGrantFailureKind::Timeout,
+                tonic::Code::Unavailable => TokenGrantFailureKind::Unavailable,
+                tonic::Code::InvalidArgument => TokenGrantFailureKind::Configuration,
+                _ => TokenGrantFailureKind::Unclassified,
+            }
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Tonic(_)) => {
+            TokenGrantFailureKind::Unavailable
+        }
+        _ => TokenGrantFailureKind::Unclassified,
+    };
+    TokenGrantFailure::new(kind, TokenGrantStage::WorkloadIdentity).to_status_with_code(code)
+}
+
+fn token_grant_dependency_status(status: Status) -> Status {
+    // Dependency status text is untrusted; only transport codes establish
+    // availability. No provider authorization meaning is inferred from prose.
+    let kind = match status.code() {
+        tonic::Code::DeadlineExceeded => TokenGrantFailureKind::Timeout,
+        tonic::Code::Unavailable => TokenGrantFailureKind::Unavailable,
+        _ => TokenGrantFailureKind::Unclassified,
+    };
+    TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc).to_status_with_code(status.code())
+}
+
+async fn exchange_provider_subject_token_inner(
+    state: &Arc<ServerState>,
+    request: Request<ExchangeProviderSubjectTokenRequest>,
+    request_id: Option<&str>,
+) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
     let req = request.get_ref().clone();
-    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &req.sandbox_id)?;
-    crate::auth::guard::ensure_sandbox_principal_scope(&principal, &req.sandbox_id)?;
+    // This RPC requires the exact sandbox supervisor. Check without emitting
+    // caller-controlled identity fields through the general scope guard's log.
+    let auth_code = match request.extensions().get::<Principal>() {
+        Some(Principal::Sandbox(principal)) if principal.sandbox_id == req.sandbox_id => None,
+        Some(
+            Principal::Sandbox(_)
+            | Principal::User(_)
+            | Principal::Operator(_)
+            | Principal::Peer(_)
+            | Principal::Supervisor(_),
+        ) => Some(tonic::Code::PermissionDenied),
+        Some(Principal::Anonymous) | None => Some(tonic::Code::Unauthenticated),
+    };
+    if let Some(code) = auth_code {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::WorkloadIdentityRejected,
+            TokenGrantStage::GatewayRpc,
+        )
+        .to_status_with_code(code));
+    }
     drop(request);
 
-    if req.provider.trim().is_empty() {
-        return Err(Status::invalid_argument("provider is required"));
-    }
-    if req.credential_key.trim().is_empty() {
-        return Err(Status::invalid_argument("credential_key is required"));
-    }
-    if req.supervisor_jwt_svid.trim().is_empty() {
-        return Err(Status::invalid_argument("supervisor_jwt_svid is required"));
+    if req.provider.trim().is_empty()
+        || req.credential_key.trim().is_empty()
+        || req.supervisor_jwt_svid.trim().is_empty()
+    {
+        return Err(token_grant_configuration_status(
+            tonic::Code::InvalidArgument,
+        ));
     }
 
     let sandbox = state
         .store
         .get_message::<Sandbox>(&req.sandbox_id)
         .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
     let workspace = sandbox.object_workspace().to_string();
     let spec = sandbox
         .spec
         .as_ref()
-        .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::Internal))?;
     if !spec
         .providers
         .iter()
         .any(|provider| provider == &req.provider)
     {
-        return Err(Status::permission_denied(
-            "provider is not attached to this sandbox",
+        return Err(token_grant_configuration_status(
+            tonic::Code::PermissionDenied,
         ));
     }
 
@@ -4056,44 +4864,43 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .store
         .get_message_by_name::<Provider>(&workspace, &req.provider)
         .await
-        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-        .ok_or_else(|| Status::not_found("provider not found"))?;
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await?;
+        .await
+        .map_err(token_grant_dependency_status)?;
     let profile = get_provider_type_profile_for_scope(
         &catalog,
         &provider.r#type,
         &provider.profile_workspace,
     )
-    .ok_or_else(|| Status::failed_precondition("provider profile not found"))?;
+    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let profile_proto = profile.to_proto();
     let credential = profile_proto
         .credentials
         .iter()
         .find(|credential| credential.name == req.credential_key)
-        .ok_or_else(|| {
-            Status::failed_precondition("credential not declared by provider profile")
-        })?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let token_grant = credential
         .token_grant
         .as_ref()
-        .ok_or_else(|| Status::failed_precondition("credential does not declare token_grant"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let grant_type = ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
         .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
     if grant_type != ProviderCredentialTokenGrantType::TokenExchange {
-        return Err(Status::failed_precondition(
-            "credential token_grant is not token_exchange",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
     let subject_token = token_grant
         .subject_token
         .as_ref()
-        .ok_or_else(|| Status::failed_precondition("token_exchange subject_token is missing"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     if subject_token.source != "provider_credential" {
-        return Err(Status::failed_precondition(
-            "unsupported subject_token source",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
     if !profile_proto
@@ -4101,10 +4908,17 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .iter()
         .any(|credential| credential.name == subject_token.credential)
     {
-        return Err(Status::failed_precondition(
-            "subject token credential not declared by provider profile",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
+    // Validate configuration before identity acquisition, cache lookup or any
+    // token exchange; invalid configuration must never trigger an outbound grant.
+    let (cache_ttl, subject_token_expires_at_ms) = validate_intermediate_grant_configuration(
+        token_grant,
+        &provider,
+        &subject_token.credential,
+    )?;
     let stored_subject_token =
         resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
             .await?;
@@ -4146,42 +4960,22 @@ pub(super) async fn handle_exchange_provider_subject_token(
 
     let token_response = perform_intermediate_token_exchange(
         &token_grant.token_endpoint,
-        &gateway_jwt_svid,
-        &token_grant.client_assertion_type,
-        &stored_subject_token,
-        &subject_token.subject_token_type,
-        &supervisor_claims.sub,
-        &token_grant.requested_token_type,
+        &TokenExchangeParams {
+            client_assertion: &gateway_jwt_svid,
+            client_assertion_type: &token_grant.client_assertion_type,
+            subject_token: &stored_subject_token,
+            subject_token_type: &subject_token.subject_token_type,
+            audience: &supervisor_claims.sub,
+            scopes: &[],
+            requested_token_type: &token_grant.requested_token_type,
+        },
+        request_id,
     )
-    .await
-    .inspect_err(|status| {
-        warn!(
-            sandbox_id = %req.sandbox_id,
-            provider = %req.provider,
-            credential_key = %req.credential_key,
-            subject_credential = %subject_token.credential,
-            client_assertion_type = %effective_client_assertion_type(&token_grant.client_assertion_type),
-            gateway_svid_issuer = %gateway_claims.iss,
-            gateway_svid_subject = %gateway_claims.sub,
-            gateway_svid_audience = ?gateway_claims.aud,
-            supervisor_svid_issuer = %supervisor_claims.iss,
-            supervisor_svid_subject = %supervisor_claims.sub,
-            supervisor_svid_audience = ?supervisor_claims.aud,
-            status = ?status.code(),
-            error = %status.message(),
-            "intermediate provider token exchange failed"
-        );
-    })?;
+    .await?;
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
-        token_grant
-            .cache_ttl
-            .as_ref()
-            .map(openshell_core::time::duration_to_std)
-            .transpose()
-            .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        provider_credential_expiration_ms(&provider, &subject_token.credential)?
-            .unwrap_or_default(),
+        cache_ttl,
+        subject_token_expires_at_ms.unwrap_or_default(),
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -4198,24 +4992,43 @@ pub(super) async fn handle_exchange_provider_subject_token(
     }))
 }
 
+fn validate_intermediate_grant_configuration(
+    grant: &openshell_core::proto::ProviderCredentialTokenGrant,
+    provider: &Provider,
+    subject_credential: &str,
+) -> Result<(Option<std::time::Duration>, Option<i64>), Status> {
+    oauth::parse_token_endpoint_url(&grant.token_endpoint).map_err(TokenGrantFailure::to_status)?;
+    let cache_ttl = grant
+        .cache_ttl
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|_| token_grant_configuration_status(tonic::Code::InvalidArgument))?;
+    let subject_expires_at_ms = provider_credential_expiration_ms(provider, subject_credential)?;
+    Ok((cache_ttl, subject_expires_at_ms))
+}
+
 async fn resolve_subject_token_credential(
     credentials: &crate::credentials::CredentialRuntime,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<String, Status> {
+    // Check the provider's expiry before asking a credential driver to resolve
+    // a handle; stale stored material cannot authorize another grant attempt.
+    ensure_subject_token_credential_not_expired(provider, credential_key)?;
     if let Some(value) = provider
         .credentials
         .get(credential_key)
         .filter(|value| !value.is_empty())
     {
-        ensure_subject_token_credential_not_expired(provider, credential_key)?;
         return Ok(value.clone());
     }
 
     if provider.credential_handles.contains_key(credential_key) {
         let resolved = credentials
             .resolve_provider_handles(provider, crate::persistence::current_time_ms())
-            .await?;
+            .await
+            .map_err(token_grant_dependency_status)?;
         if let Some(value) = resolved
             .values
             .get(credential_key)
@@ -4225,9 +5038,7 @@ async fn resolve_subject_token_credential(
         }
     }
 
-    Err(Status::failed_precondition(
-        "subject token credential is not configured",
-    ))
+    Err(token_grant_authorization_required_status())
 }
 
 fn ensure_subject_token_credential_not_expired(
@@ -4236,11 +5047,19 @@ fn ensure_subject_token_credential_not_expired(
 ) -> Result<(), Status> {
     let expires_at_ms = provider_credential_expiration_ms(provider, credential_key)?;
     if expires_at_ms.is_some_and(|value| value <= crate::persistence::current_time_ms()) {
-        return Err(Status::failed_precondition(
-            "subject token credential has expired",
-        ));
+        return Err(token_grant_authorization_required_status());
     }
     Ok(())
+}
+
+/// The user's stored subject credential is absent or expired. Only the user
+/// can restore it, by authorizing the provider again.
+fn token_grant_authorization_required_status() -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::ProviderAuthorizationRequired,
+        TokenGrantStage::GatewayRpc,
+    )
+    .to_status_with_code(tonic::Code::FailedPrecondition)
 }
 
 fn provider_credential_expiration_ms(
@@ -4252,7 +5071,7 @@ fn provider_credential_expiration_ms(
         .get(credential_key)
         .map(openshell_core::time::timestamp_to_millis)
         .transpose()
-        .map_err(|error| Status::failed_precondition(error.to_string()))
+        .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))
 }
 
 struct IntermediateTokenCacheKeyInput<'a> {
@@ -4357,42 +5176,58 @@ fn jwt_exp_ms(token: &str) -> Option<i64> {
 }
 
 async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
-    let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for provider token exchange"
-            ))
-        })?;
+    fetch_gateway_jwt_svid_from(audience, None).await
+}
+
+async fn fetch_gateway_jwt_svid_from(
+    audience: &str,
+    broker_socket: Option<&str>,
+) -> Result<String, Status> {
+    let socket_path = broker_socket
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
-    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
-        .await
-        .map_err(|e| {
-            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
-        })?;
-    client
-        .fetch_jwt_token([audience], None)
-        .await
-        .map_err(|e| Status::failed_precondition(format!("failed to fetch gateway JWT-SVID: {e}")))
+    // A wedged Workload API socket must not hold the grant past its deadline.
+    tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+        let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })?;
+        client
+            .fetch_jwt_token([audience], None)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })
+    })
+    .await
+    .map_err(|_| {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::Timeout,
+            TokenGrantStage::WorkloadIdentity,
+        )
+        .to_status()
+    })?
 }
 
 fn validate_gateway_jwt_svid_claims(
     claims: &SpiffeJwtClaims,
     expected_audience: &str,
 ) -> Result<(), Status> {
-    if !claims.aud.contains(expected_audience) {
-        return Err(Status::failed_precondition(
-            "gateway SVID audience does not match token grant audience",
+    if !claims.aud.contains(expected_audience)
+        || spiffe_trust_domain(&claims.sub).is_none()
+        || (claims.exp > 0
+            && claims.exp.saturating_mul(1000) <= crate::persistence::current_time_ms())
+    {
+        return Err(token_grant_identity_rejected(
+            tonic::Code::FailedPrecondition,
         ));
-    }
-    if spiffe_trust_domain(&claims.sub).is_none() {
-        return Err(Status::failed_precondition(
-            "gateway SVID subject is not a SPIFFE ID",
-        ));
-    }
-    if claims.exp > 0 && claims.exp.saturating_mul(1000) <= crate::persistence::current_time_ms() {
-        return Err(Status::failed_precondition("gateway SVID has expired"));
     }
     Ok(())
 }
@@ -4404,81 +5239,54 @@ async fn validate_supervisor_jwt_svid(
 ) -> Result<SpiffeJwtClaims, Status> {
     let unverified = parse_unverified_spiffe_claims(token)?;
     if unverified.iss != gateway_claims.iss {
-        return Err(Status::permission_denied(
-            "supervisor SVID issuer does not match gateway SVID issuer",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
     if !unverified.aud.contains(expected_audience) {
-        return Err(Status::permission_denied(
-            "supervisor SVID audience does not match token grant audience",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
     let supervisor_trust_domain = spiffe_trust_domain(&unverified.sub)
-        .ok_or_else(|| Status::permission_denied("supervisor SVID subject is not a SPIFFE ID"))?;
+        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::PermissionDenied))?;
     let gateway_trust_domain = spiffe_trust_domain(&gateway_claims.sub)
-        .ok_or_else(|| Status::failed_precondition("gateway SVID subject is not a SPIFFE ID"))?;
+        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::FailedPrecondition))?;
     if supervisor_trust_domain != gateway_trust_domain {
-        return Err(Status::permission_denied(
-            "supervisor SVID trust domain does not match gateway SVID trust domain",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
 
     let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for supervisor JWT-SVID validation"
-            ))
-        })?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
     let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
         .await
-        .map_err(|e| {
-            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
-        })?;
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
     let bundles = client
         .fetch_jwt_bundles()
         .await
-        .map_err(|e| Status::internal(format!("SPIFFE JWT bundle fetch failed: {e}")))?;
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::Internal))?;
     spiffe::JwtSvid::parse_and_validate(token, &bundles, &[expected_audience])
-        .map_err(|e| Status::permission_denied(format!("invalid supervisor JWT-SVID: {e}")))?;
+        .map_err(|_| token_grant_identity_rejected(tonic::Code::PermissionDenied))?;
     Ok(unverified)
 }
 
 fn parse_unverified_spiffe_claims(token: &str) -> Result<SpiffeJwtClaims, Status> {
-    parse_unverified_jwt_svid_claims(token).map_err(jwt_svid_parse_error_status)
-}
-
-fn jwt_svid_parse_error_status(error: JwtSvidParseError) -> Status {
-    Status::permission_denied(error.to_string())
+    parse_unverified_jwt_svid_claims(token)
+        .map_err(|_| token_grant_identity_rejected(tonic::Code::PermissionDenied))
 }
 
 async fn perform_intermediate_token_exchange(
     token_endpoint: &str,
-    gateway_jwt_svid: &str,
-    client_assertion_type: &str,
-    subject_token: &str,
-    subject_token_type: &str,
-    audience: &str,
-    requested_token_type: &str,
+    params: &TokenExchangeParams<'_>,
+    request_id: Option<&str>,
 ) -> Result<oauth::OAuthTokenResponse, Status> {
     let client = token_exchange_http_client()?;
-    oauth::post_oauth_token_exchange(
-        client,
-        token_endpoint,
-        &TokenExchangeParams {
-            client_assertion: gateway_jwt_svid,
-            client_assertion_type,
-            subject_token,
-            subject_token_type,
-            audience,
-            scopes: &[],
-            requested_token_type,
-        },
-    )
-    .await
-    .map_err(|e| Status::failed_precondition(e.to_string()))
+    oauth::post_oauth_token_exchange(client, token_endpoint, params, request_id)
+        .await
+        .map_err(|failure| {
+            failure
+                .at_stage(TokenGrantStage::IntermediateExchange)
+                .to_status()
+        })
 }
 
 fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) -> String {
@@ -4527,27 +5335,27 @@ pub(super) async fn handle_get_provider_refresh_status(
         .ok_or_else(|| Status::not_found("provider not found"))?;
 
     let states = if request.credential_key.trim().is_empty() {
-        crate::provider_refresh::list_refresh_states_for_provider(
-            state.store.as_ref(),
-            provider.object_id(),
-        )
-        .await?
+        state.refresh.list(Some(provider.object_id())).await?
     } else {
-        crate::provider_refresh::get_refresh_state(
-            state.store.as_ref(),
-            &workspace,
-            provider.object_id(),
+        let credential_key = existing_refresh_key(
+            state,
+            &provider,
             request.credential_key.trim(),
+            RefreshCredentialLookup::Resolve,
         )
-        .await?
-        .into_iter()
-        .collect()
+        .await?;
+        state
+            .refresh
+            .get(&workspace, provider.object_id(), &credential_key)
+            .await?
+            .into_iter()
+            .collect()
     };
 
     Ok(Response::new(GetProviderRefreshStatusResponse {
         credentials: states
             .iter()
-            .map(crate::provider_refresh::refresh_status_from_state)
+            .map(|refresh| crate::provider_refresh::refresh_status_from_state(&refresh.into()))
             .collect(),
     }))
 }
@@ -4577,11 +5385,6 @@ pub(super) async fn handle_configure_provider_refresh(
     }
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
-    }
-    if !is_valid_env_key(credential_key) {
-        return Err(Status::invalid_argument(
-            "credential_key must be a valid environment variable name",
-        ));
     }
     let strategy = ProviderCredentialRefreshStrategy::try_from(request.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
@@ -4628,6 +5431,10 @@ pub(super) async fn handle_configure_provider_refresh(
             )));
         }
     }
+    validate_material_secret_references(&request)?;
+    if !request.material_secrets.is_empty() {
+        super::secret::ensure_workspace_secrets_active(state).await?;
+    }
     if request
         .material
         .get("token_url")
@@ -4641,6 +5448,10 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh token endpoints must be defined by the provider profile, not material",
         ));
     }
+    // A key supplied by a workspace secret counts as present, so Basic client
+    // authentication accepts a client_secret that comes from a secret.
+    let supplied_material = material_with_references(&request);
+    crate::provider_refresh::validate_oauth_client_material(strategy as i32, &supplied_material)?;
     // The STS endpoint is always resolved from the region in production. Reject
     // any caller-supplied override so an AWS-signed AssumeRole request cannot be
     // redirected at an arbitrary service (CWE-918). Tests inject a mock endpoint
@@ -4660,7 +5471,10 @@ pub(super) async fn handle_configure_provider_refresh(
     let has_source_secret_key = request
         .material
         .get("aws_secret_access_key")
-        .is_some_and(|value| !value.trim().is_empty());
+        .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .material_secrets
+            .contains_key("aws_secret_access_key");
     if has_source_access_key != has_source_secret_key {
         return Err(Status::invalid_argument(
             "aws_access_key_id and aws_secret_access_key must both be set or both omitted",
@@ -4689,11 +5503,14 @@ pub(super) async fn handle_configure_provider_refresh(
     // persist further down are otherwise separate steps: two concurrent
     // configures of providers attached to the same sandbox could each pass
     // validation before either persisted and both reserve the same key (CWE-362).
-    // This is the same guard sandbox create/attach and profile changes take.
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    // Every provider attached to one sandbox lives in this workspace, so holding
+    // the workspace key exclusively also excludes sandbox create and attach,
+    // which hold it shared.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
 
     let provider = state
         .store
@@ -4705,8 +5522,23 @@ pub(super) async fn handle_configure_provider_refresh(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    let resolved_key = resolve_github_app_refresh_key(
+        &state.refresh,
+        &catalog,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
+    let credential_key = resolved_key.as_str();
+    if !is_valid_env_key(credential_key) {
+        return Err(Status::invalid_argument(
+            "credential_key must resolve to a valid environment variable name",
+        ));
+    }
     validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
+        RefreshStateReader::Runtime(&state.refresh),
         &catalog,
         &workspace,
         &provider,
@@ -4722,6 +5554,7 @@ pub(super) async fn handle_configure_provider_refresh(
     for additional_key in additional_output_keys.values() {
         validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
             state.store.as_ref(),
+            RefreshStateReader::Runtime(&state.refresh),
             &catalog,
             &workspace,
             &provider,
@@ -4736,16 +5569,42 @@ pub(super) async fn handle_configure_provider_refresh(
         refresh_defaults.as_ref(),
         &additional_output_keys,
     )?;
-    validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
+    validate_refresh_material(&supplied_material, refresh_defaults.as_ref())?;
+    if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+        let defaults = refresh_defaults.as_ref().filter(|defaults| defaults.strategy == strategy)
+            .ok_or_else(|| Status::failed_precondition(
+                "github_app_installation requires a matching provider profile refresh declaration",
+            ))?;
+        if let Some(profile) = get_provider_type_profile_for_scope(
+            &catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) {
+            validate_github_app_static_aliases(&profile, credential_key, |alias| {
+                provider.credentials.contains_key(alias)
+                    || provider.credential_handles.contains_key(alias)
+            })?;
+        }
+        crate::provider_refresh::validate_github_app_configuration(
+            &request.material,
+            &defaults.token_url,
+            request.material_secrets.contains_key("private_key"),
+        )?;
+    }
     let mut secret_material_keys: HashSet<String> =
         request.secret_material_keys.iter().cloned().collect();
     for key in &request.secret_material_keys {
-        if !request.material.contains_key(key) {
+        if !supplied_material.contains_key(key) {
             return Err(Status::invalid_argument(format!(
                 "secret_material_keys entry '{key}' is not present in material"
             )));
         }
     }
+    validate_material_secret_keys(
+        strategy,
+        refresh_defaults.as_ref(),
+        &request.material_secrets,
+    )?;
     if let Some(refresh) = refresh_defaults.as_ref() {
         secret_material_keys.extend(
             refresh
@@ -4768,6 +5627,15 @@ pub(super) async fn handle_configure_provider_refresh(
         .as_ref()
         .map(|refresh| refresh.token_url.clone())
         .unwrap_or_default();
+    let material_secret_bindings = bind_material_secrets(
+        state,
+        &workspace,
+        strategy,
+        &request.material,
+        &token_url,
+        &request.material_secrets,
+    )
+    .await?;
     let scopes = if material_scopes.is_empty() {
         refresh_defaults
             .as_ref()
@@ -4808,13 +5676,12 @@ pub(super) async fn handle_configure_provider_refresh(
                 .to_proto(refresh.max_lifetime_seconds)
         }),
     };
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
-        credential_key,
-    )
-    .await?;
+    let existing_refresh_state = state
+        .refresh
+        .get(&workspace, provider.object_id(), credential_key)
+        .await?
+        .as_ref()
+        .map(Into::<StoredProviderCredentialRefreshState>::into);
     if existing_refresh_state.as_ref().is_some_and(|state| {
         state
             .metadata
@@ -4831,16 +5698,17 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
-    let has_expiration = requested_expiration_ms.is_some()
-        || existing_refresh_state
-            .as_ref()
-            .is_some_and(crate::provider_refresh::refresh_has_expiration);
-    let expires_at_ms = requested_expiration_ms.unwrap_or_else(|| {
-        existing_refresh_state
-            .as_ref()
-            .map(|state| state.expires_at_ms)
-            .unwrap_or_default()
-    });
+    let retain_expiry = strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation
+        && existing_refresh_state.as_ref().is_none_or(|s| {
+            s.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        });
+    let previous_expiration = existing_refresh_state
+        .as_ref()
+        .filter(|existing| {
+            retain_expiry && crate::provider_refresh::refresh_has_expiration(existing)
+        })
+        .map(|existing| existing.expires_at_ms);
+    let expiration = requested_expiration_ms.or(previous_expiration);
     let mut persisted_material = request.material;
     let secret_material: HashMap<_, _> = secret_material_keys
         .iter()
@@ -4858,7 +5726,7 @@ pub(super) async fn handle_configure_provider_refresh(
             strategy,
             material: persisted_material,
             secret_material_keys,
-            expires_at_ms,
+            expires_at_ms: expiration.unwrap_or_default(),
             token_url,
             scopes,
             refresh_before,
@@ -4868,7 +5736,16 @@ pub(super) async fn handle_configure_provider_refresh(
     )?;
     if let Some(existing) = existing_refresh_state.as_ref() {
         state_record.metadata.clone_from(&existing.metadata);
-        state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        state_record
+            .retired_output_handles
+            .clone_from(&existing.retired_output_handles);
+        if retain_expiry {
+            state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        } else if let Some(metadata) = state_record.metadata.as_mut() {
+            metadata
+                .annotations
+                .remove(openshell_credential_issuer::refresh::engine::COMPLETED_MINT_ANNOTATION);
+        }
         state_record
             .pending_secret_deletions
             .extend(existing.pending_secret_deletions.clone());
@@ -4880,7 +5757,24 @@ pub(super) async fn handle_configure_provider_refresh(
             );
         }
     }
-    crate::provider_refresh::set_refresh_expiration_presence(&mut state_record, has_expiration);
+    if !retain_expiry {
+        // Workloads cannot use a previous installation token in the new epoch.
+        state_record.next_refresh_at_ms = 0;
+    }
+    crate::provider_refresh::set_refresh_expiration_presence(
+        &mut state_record,
+        expiration.is_some(),
+    );
+    // A reconfiguration replaces every binding and drops endpoint constraints
+    // on copied values: the caller supplied all material again.
+    {
+        let metadata = state_record.metadata.get_or_insert_with(Default::default);
+        secret_refs::set_material_secret_bindings(metadata, &material_secret_bindings);
+        secret_refs::set_material_endpoint_constraints(
+            metadata,
+            &secret_refs::MaterialEndpointConstraints::new(),
+        );
+    }
     let material_staging_id = format!(
         "{}-refresh-config-{}",
         provider.object_id(),
@@ -4897,12 +5791,10 @@ pub(super) async fn handle_configure_provider_refresh(
         .await?;
     state_record.secret_material_handles = staged_material_handles.clone();
     let persist_result = if let Some(expected_version) = existing_refresh_version {
-        match crate::provider_refresh::replace_refresh_state_if_current(
-            state.store.as_ref(),
-            &state_record,
-            expected_version,
-        )
-        .await
+        match state
+            .refresh
+            .replace((&state_record).into(), expected_version)
+            .await
         {
             Ok(true) => Ok(()),
             Ok(false) => Err(Status::aborted(
@@ -4911,7 +5803,7 @@ pub(super) async fn handle_configure_provider_refresh(
             Err(err) => Err(err),
         }
     } else {
-        crate::provider_refresh::create_refresh_state(state.store.as_ref(), &state_record).await
+        state.refresh.create((&state_record).into()).await
     };
     if let Err(err) = persist_result {
         if let Err(cleanup_err) = state
@@ -4955,8 +5847,18 @@ pub(super) async fn handle_configure_provider_refresh(
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
-        update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
-            .await?;
+        let result = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.refresh,
+            &catalog,
+            &workspace,
+            updated,
+        )
+        .await;
+        publish_provider_change(state, &workspace, provider_name);
+        result?;
+    } else {
+        publish_provider_change(state, &workspace, provider_name);
     }
 
     replay_facts.refresh(&state_record)?;
@@ -4993,15 +5895,24 @@ pub(super) async fn handle_rotate_provider_credential(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
-    let refresh_state = crate::provider_refresh::refresh_provider_credential(
-        state.store.as_ref(),
-        &workspace,
-        &state.credentials,
-        Some(&state.compute),
-        provider_name,
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, provider_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
         credential_key,
+        RefreshCredentialLookup::Resolve,
     )
     .await?;
+    let refreshed =
+        CredentialRefresh::rotate(&state.refresh, &workspace, provider_name, &credential_key)
+            .await?;
+    crate::provider_refresh::publish_change(state, &refreshed);
+    let refresh_state = StoredProviderCredentialRefreshState::from(&refreshed);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
@@ -5011,30 +5922,228 @@ pub(super) async fn handle_rotate_provider_credential(
     }))
 }
 
-/// Remove the expiry for each key the refresh still owns — one whose stored
-/// value equals the refresh's `expires_at_ms`. Independently updated expiries (no
-/// longer matching) are left in place.
+/// Copy referenced workspace secrets into provider-owned refresh material.
 ///
-/// This operates on `provider` in place so it can run inside a CAS closure
-/// against the current stored provider. The equality check must see the latest
-/// state, not a snapshot read earlier in the handler: a concurrent rotation or
-/// provider update between the read and the write could otherwise be clobbered
-/// by an unconditional zero (CWE-362).
-fn clear_refresh_owned_expiries(
-    provider: &mut Provider,
-    refresh_expires_at_ms: i64,
-    owned_keys: &[String],
-) {
-    for key in owned_keys {
-        if provider
-            .credential_expiration_times
-            .get(key)
-            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-            .is_some_and(|expires_at_ms| expires_at_ms == refresh_expires_at_ms)
+/// Unlike reconfiguration this keeps every other handle, including a refresh
+/// token the gateway rotated, and the authorization epoch. Each copied value
+/// keeps the endpoint constraint of the secret it came from. Not gated by the
+/// workspace-secrets activation, so it works while rolling back.
+pub(super) async fn handle_inline_provider_refresh_secrets(
+    state: &Arc<ServerState>,
+    request: Request<InlineProviderRefreshSecretsRequest>,
+) -> Result<Response<InlineProviderRefreshSecretsResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
+    let request = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let provider_name = request.provider.trim();
+    let credential_key = request.credential_key.trim();
+    if provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider is required"));
+    }
+    if credential_key.is_empty() {
+        return Err(Status::invalid_argument("credential_key is required"));
+    }
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, provider_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
+        credential_key,
+        RefreshCredentialLookup::Resolve,
+    )
+    .await?;
+    let mut refresh: StoredProviderCredentialRefreshState = state
+        .refresh
+        .get(&workspace, provider.object_id(), &credential_key)
+        .await?
+        .as_ref()
+        .map(Into::into)
+        .ok_or_else(|| Status::not_found("provider refresh not found"))?;
+    if refresh
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "provider refresh is being deleted",
+        ));
+    }
+    // A mint persists this status before contacting the token endpoint and
+    // stages a rotated refresh token only if its version still matches.
+    // Replacing the state now would make it discard that token. A mint that
+    // starts after this read bumps the version, so the write below fails.
+    if matches!(
+        refresh.status.as_str(),
+        "refresh_in_progress" | "refresh_committing"
+    ) {
+        return Err(Status::aborted(
+            "a credential mint is in progress; retry once it finishes, or reconfigure the refresh if its outcome is uncertain",
+        ));
+    }
+    let bindings = secret_refs::material_secret_bindings(refresh.metadata.as_ref())?;
+    if bindings.is_empty() {
+        replay_facts.refresh(&refresh)?;
+        return Ok(Response::new(InlineProviderRefreshSecretsResponse {
+            status: Some(crate::provider_refresh::refresh_status_from_state(&refresh)),
+        }));
+    }
+    let mut constraints = secret_refs::material_endpoint_constraints(refresh.metadata.as_ref())?;
+    let mut values = HashMap::new();
+    for (material_key, binding) in &bindings {
+        let (value, allowed_endpoints) = read_workspace_secret(state, &workspace, binding).await?;
+        values.insert(material_key.clone(), value);
+        constraints.insert(material_key.clone(), allowed_endpoints);
+    }
+
+    let staging_id = format!(
+        "{}-refresh-inline-{}",
+        provider.object_id(),
+        uuid::Uuid::new_v4()
+    );
+    let staged = state
+        .credentials
+        .store_refresh_material_with_object_id(
+            crate::provider_refresh::refresh_material_scope(&refresh),
+            &staging_id,
+            &values,
+            &HashMap::new(),
+        )
+        .await?;
+    for (material_key, handle) in &staged {
+        if let Some(previous) = refresh
+            .secret_material_handles
+            .insert(material_key.clone(), handle.clone())
         {
-            provider.credential_expiration_times.remove(key);
+            crate::provider_refresh::enqueue_pending_secret_deletion(
+                &mut refresh,
+                material_key,
+                previous,
+            );
         }
     }
+    let expected_version = {
+        let metadata = refresh.metadata.get_or_insert_with(Default::default);
+        secret_refs::set_material_secret_bindings(
+            metadata,
+            &secret_refs::MaterialSecretBindings::new(),
+        );
+        secret_refs::set_material_endpoint_constraints(metadata, &constraints);
+        metadata.resource_version
+    };
+    let persisted = state
+        .refresh
+        .replace((&refresh).into(), expected_version)
+        .await;
+    if !matches!(persisted, Ok(true)) {
+        if let Err(cleanup_err) = state
+            .credentials
+            .delete_refresh_material_handles(
+                crate::provider_refresh::refresh_material_scope(&refresh),
+                &staged,
+            )
+            .await
+        {
+            warn!(
+                provider_name = %provider.object_name(),
+                credential_key,
+                error = %cleanup_err,
+                "failed to clean up staged refresh material after inlining failed"
+            );
+        }
+        return Err(persisted.err().unwrap_or_else(|| {
+            Status::aborted("provider refresh was concurrently modified; retry")
+        }));
+    }
+
+    replay_facts.refresh(&refresh)?;
+    Ok(Response::new(InlineProviderRefreshSecretsResponse {
+        status: Some(crate::provider_refresh::refresh_status_from_state(&refresh)),
+    }))
+}
+
+/// Read a referenced workspace secret's value and endpoint constraint. A
+/// concurrent `UpdateSecret` can delete the handle read from the record, so a
+/// failed read re-reads the record once, as minting does.
+async fn read_workspace_secret(
+    state: &ServerState,
+    workspace: &str,
+    binding: &secret_refs::MaterialSecretBinding,
+) -> Result<(String, Vec<String>), Status> {
+    let mut last_error = None;
+    for _ in 0..2 {
+        let secret = state
+            .store
+            .get_message::<crate::storage_proto::StoredWorkspaceSecret>(&binding.id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch workspace secret failed: {e}")))?
+            .filter(|secret| {
+                secret.object_workspace() == workspace
+                    && secret.create_pending_since.is_none()
+                    && secret
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.deletion_time.is_none())
+            });
+        let Some((secret, handle)) = secret.and_then(|secret| {
+            let handle = secret.value_handle.clone()?;
+            Some((secret, handle))
+        }) else {
+            return Err(Status::failed_precondition(format!(
+                "workspace secret '{}' no longer exists; reconfigure the refresh grant",
+                binding.name
+            )));
+        };
+        match state
+            .credentials
+            .resolve_secrets(
+                openshell_credential_issuer::SecretOwner::workspace_secret(workspace, &binding.id),
+                &HashMap::from([(secret_refs::WORKSPACE_SECRET_VALUE_KEY.to_string(), handle)]),
+                0,
+            )
+            .await
+        {
+            Ok(mut resolved) => {
+                if let Some(value) = resolved
+                    .values
+                    .remove(secret_refs::WORKSPACE_SECRET_VALUE_KEY)
+                    .filter(|value| !value.is_empty())
+                {
+                    let allowed_endpoints = secret
+                        .refresh_use
+                        .map(|refresh_use| refresh_use.allowed_endpoints)
+                        .unwrap_or_default();
+                    return Ok((value, allowed_endpoints));
+                }
+                last_error = Some("credential storage returned no value".to_string());
+            }
+            Err(err) => last_error = Some(err.message().to_string()),
+        }
+    }
+    Err(Status::unavailable(format!(
+        "workspace secret '{}' could not be read: {}",
+        binding.name,
+        last_error.unwrap_or_default()
+    )))
 }
 
 pub(super) async fn handle_delete_provider_refresh(
@@ -5068,13 +6177,19 @@ pub(super) async fn handle_delete_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
+    let credential_key = existing_refresh_key(
+        state,
+        &provider,
         credential_key,
+        RefreshCredentialLookup::Delete,
     )
     .await?;
+    let existing_refresh_state = state
+        .refresh
+        .get(&workspace, provider.object_id(), &credential_key)
+        .await?
+        .as_ref()
+        .map(Into::<StoredProviderCredentialRefreshState>::into);
     let Some(refresh_state) = existing_refresh_state else {
         return Ok(Response::new(DeleteProviderRefreshResponse {
             outcome: super::deletion_outcome(
@@ -5085,21 +6200,21 @@ pub(super) async fn handle_delete_provider_refresh(
         }));
     };
     crate::provider_refresh::delete_observed_refresh_state_with_credentials(
-        state.store.as_ref(),
-        &state.credentials,
+        &state.refresh,
         refresh_state.clone(),
     )
     .await?;
-
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
     // independently updated ones in place. The equality check and removal run
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if crate::provider_refresh::refresh_has_expiration(&refresh_state) {
+    if refresh_state.strategy != ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        && crate::provider_refresh::refresh_has_expiration(&refresh_state)
+    {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
-        let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
+        let owned_keys: Vec<String> = std::iter::once(credential_key)
             .chain(refresh_state.additional_output_keys.into_values())
             .collect();
         state
@@ -5112,8 +6227,10 @@ pub(super) async fn handle_delete_provider_refresh(
                 Status::internal(format!(
                     "clear refresh-owned credential expiries failed: {e}"
                 ))
-            })?;
+            })
+            .map(|_| ())?;
     }
+    publish_provider_change(state, &workspace, provider_name);
 
     Ok(Response::new(DeleteProviderRefreshResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -5134,13 +6251,27 @@ pub(super) async fn handle_delete_provider(
         MinWorkspaceRole::Admin,
     )
     .await?;
+    // Reject after authorization but before taking the workspace lock, which
+    // a request that can never succeed should not wait for.
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // A sandbox create or attach in this workspace holds the workspace key
+    // shared, so no sandbox can start referencing the provider between the
+    // attached-sandbox check and the delete.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "acquire provider mutation lock"))?;
     let name = req.name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
         state.store.as_ref(),
+        &state.refresh,
         &workspace,
         &state.credentials,
         &name,
@@ -5154,6 +6285,9 @@ pub(super) async fn handle_delete_provider(
                 LifecycleOperation::Delete,
                 outcome,
             );
+            if deleted {
+                publish_provider_change(state, &workspace, &name);
+            }
             Ok(Response::new(DeleteProviderResponse {
                 outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
             }))
@@ -5217,12 +6351,16 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
     }
 }
 
+#[cfg(test)]
+#[path = "provider_refresh_routing_tests.rs"]
+mod refresh_routing_tests;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
@@ -5297,6 +6435,366 @@ mod tests {
         assert_eq!(error.code(), Code::FailedPrecondition);
         ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
             .expect("an absent expiration remains non-expiring");
+    }
+
+    mod token_grant_failures {
+        use super::*;
+        use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const SECRET: &str = "GRANT_SECRET_CANARY_3319";
+        const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
+
+        #[derive(Clone, Default)]
+        struct GrantTraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for GrantTraceBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn assert_generic(status: &Status, code: Code) -> TokenGrantFailure {
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), "dynamic token grant failed");
+            assert!(!format!("{status:?} {status}").contains(SECRET));
+            assert!(!String::from_utf8_lossy(status.details()).contains(SECRET));
+            assert!(status.metadata().is_empty());
+            TokenGrantFailure::from_status(status)
+        }
+
+        #[test]
+        fn residual_status_drops_message_details_metadata_and_source() {
+            let mut raw =
+                Status::with_details(Code::Internal, SECRET, SECRET.as_bytes().to_vec().into());
+            raw.metadata_mut()
+                .insert("x-upstream-secret", SECRET.parse().unwrap());
+            raw.set_source(Arc::new(std::io::Error::other(SECRET)));
+            let status = sanitize_token_grant_status(raw);
+            let failure = assert_generic(&status, Code::Internal);
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
+            assert!(std::error::Error::source(&status).is_none());
+        }
+
+        #[test]
+        fn strict_typed_failure_survives_final_boundary() {
+            let failure = TokenGrantFailure::new(
+                TokenGrantFailureKind::ProviderAuthorizationRequired,
+                TokenGrantStage::IntermediateExchange,
+            )
+            .with_upstream_status(409);
+            let raw = failure.to_status();
+            let code = raw.code();
+            let status = sanitize_token_grant_status(raw);
+            assert_eq!(assert_generic(&status, code), failure);
+        }
+
+        #[test]
+        fn only_canonical_request_ids_are_echoed() {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            assert_eq!(canonical_request_id(&metadata), None);
+            metadata.insert("x-request-id", REQUEST_ID.parse().unwrap());
+            assert_eq!(canonical_request_id(&metadata).as_deref(), Some(REQUEST_ID));
+            for rejected in [
+                "2F3E4D5C-6B7A-4891-A0B1-C2D3E4F5A6B7",
+                "2f3e4d5c6b7a4891a0b1c2d3e4f5a6b7",
+                "request code=provider_authorization_required",
+            ] {
+                metadata.insert("x-request-id", rejected.parse().unwrap());
+                assert_eq!(canonical_request_id(&metadata), None, "{rejected}");
+            }
+        }
+
+        #[tokio::test]
+        async fn handler_failure_log_names_request_and_classification_without_secrets() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(ExchangeProviderSubjectTokenRequest {
+                sandbox_id: "grant-sandbox".to_string(),
+                provider: SECRET.to_string(),
+                credential_key: SECRET.to_string(),
+                supervisor_jwt_svid: SECRET.to_string(),
+            });
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "grant-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                        auth_epoch: None,
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = handle_exchange_provider_subject_token(&state, request)
+                .await
+                .unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::NotFound);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={} upstream_http_status=none",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=grant-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
+        async fn broker_failure_log_names_authenticated_sandbox() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(
+                openshell_core::proto::GetSandboxProviderAccessTokenRequest {
+                    credential_key: SECRET.to_string(),
+                },
+            );
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "broker-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                        auth_epoch: None,
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = access_token::handle(&state, request).await.unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::Unauthenticated);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={}",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=broker-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
+        async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
+            let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+            let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+            let mut provider = provider_with_values("grant-provider", "custom");
+            provider.credentials.clear();
+            let missing = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            let failure = assert_generic(&missing, Code::FailedPrecondition);
+            assert_eq!(
+                failure.kind(),
+                TokenGrantFailureKind::ProviderAuthorizationRequired
+            );
+            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
+
+            // Driver diagnostics name the unknown driver; the gateway drops them.
+            provider.credential_handles.insert(
+                "subject".to_string(),
+                CredentialHandle {
+                    driver: SECRET.to_string(),
+                    handle: SECRET.to_string(),
+                    metadata: HashMap::new(),
+                },
+            );
+            let unresolvable = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            assert_generic(&unresolvable, Code::InvalidArgument);
+
+            // Expiry is checked before the driver is asked.
+            provider
+                .credential_expiration_times
+                .insert("subject".to_string(), ts(0));
+            let expired = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                assert_generic(&expired, Code::FailedPrecondition).kind(),
+                TokenGrantFailureKind::ProviderAuthorizationRequired
+            );
+        }
+
+        #[test]
+        fn invalid_grant_configuration_fails_before_acquisition() {
+            let valid = token_grant_credential("access_token").token_grant.unwrap();
+            let provider = provider_with_values("grant-provider", "custom");
+            let mut bad_expiry = provider.clone();
+            bad_expiry.credential_expiration_times.insert(
+                "subject".to_string(),
+                prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: -1,
+                },
+            );
+            let negative_ttl = ProviderCredentialTokenGrant {
+                cache_ttl: Some(prost_types::Duration {
+                    seconds: -1,
+                    nanos: 0,
+                }),
+                ..valid.clone()
+            };
+            let bad_endpoint = ProviderCredentialTokenGrant {
+                token_endpoint: format!("ftp://example.com/{SECRET}"),
+                ..valid.clone()
+            };
+            for (grant, provider, code) in [
+                (&negative_ttl, &provider, Code::InvalidArgument),
+                (&valid, &bad_expiry, Code::FailedPrecondition),
+                (&bad_endpoint, &provider, Code::FailedPrecondition),
+            ] {
+                let status = validate_intermediate_grant_configuration(grant, provider, "subject")
+                    .unwrap_err();
+                assert_eq!(
+                    assert_generic(&status, code).kind(),
+                    TokenGrantFailureKind::Configuration,
+                );
+            }
+        }
+
+        #[test]
+        fn workload_api_status_classifies_and_discards_diagnostics() {
+            use spiffe::WorkloadApiError;
+            for (error, kind) in [
+                (
+                    WorkloadApiError::from(Status::permission_denied(SECRET)),
+                    TokenGrantFailureKind::WorkloadIdentityRejected,
+                ),
+                (
+                    WorkloadApiError::NoIdentityIssued,
+                    TokenGrantFailureKind::WorkloadIdentityRejected,
+                ),
+                (
+                    WorkloadApiError::from(Status::deadline_exceeded(SECRET)),
+                    TokenGrantFailureKind::Timeout,
+                ),
+                (
+                    WorkloadApiError::from(Status::unavailable(SECRET)),
+                    TokenGrantFailureKind::Unavailable,
+                ),
+                (
+                    WorkloadApiError::from(Status::invalid_argument(SECRET)),
+                    TokenGrantFailureKind::Configuration,
+                ),
+                (
+                    WorkloadApiError::HintNotFound(SECRET.to_string()),
+                    TokenGrantFailureKind::Unclassified,
+                ),
+            ] {
+                let status = token_grant_workload_api_status(error, Code::FailedPrecondition);
+                let failure = assert_generic(&status, Code::FailedPrecondition);
+                assert_eq!(failure.kind(), kind);
+                assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_svid_and_claim_denials_are_generic() {
+            let malformed = parse_unverified_spiffe_claims(SECRET).unwrap_err();
+            let failure = assert_generic(&malformed, Code::PermissionDenied);
+            assert_eq!(
+                failure.kind(),
+                TokenGrantFailureKind::WorkloadIdentityRejected
+            );
+            assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
+            let claims = SpiffeJwtClaims {
+                iss: SECRET.to_string(),
+                sub: SECRET.to_string(),
+                aud: openshell_spiffe::AudienceClaim::One(SECRET.to_string()),
+                exp: 0,
+            };
+            let gateway =
+                validate_gateway_jwt_svid_claims(&claims, "expected-audience").unwrap_err();
+            assert_generic(&gateway, Code::FailedPrecondition);
+            let supervisor = validate_supervisor_jwt_svid(SECRET, &claims, "expected-audience")
+                .await
+                .unwrap_err();
+            assert_generic(&supervisor, Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn intermediate_http_failure_keeps_stage_status_and_request_id_without_body() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0, "request headers ended early");
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let body = format!(
+                    "{{\"error\":\"provider_authorization_required\",\"openshell_error_contract\":\"openshell.token-grant.v1\",\"error_description\":\"{SECRET}\"}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8_lossy(&request).to_ascii_lowercase()
+            });
+            let params = TokenExchangeParams {
+                client_assertion: SECRET,
+                client_assertion_type: "",
+                subject_token: SECRET,
+                subject_token_type: "",
+                audience: SECRET,
+                scopes: &[],
+                requested_token_type: "",
+            };
+            let result =
+                perform_intermediate_token_exchange(&endpoint, &params, Some(REQUEST_ID)).await;
+            let headers = server.await.unwrap();
+            assert!(
+                headers.contains(&format!("x-openshell-request-id: {REQUEST_ID}")),
+                "{headers}"
+            );
+            let status = result.unwrap_err();
+            let failure = assert_generic(&status, status.code());
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.stage(), TokenGrantStage::IntermediateExchange);
+            assert_eq!(failure.upstream_status(), Some(409));
+        }
     }
 
     #[test]
@@ -5400,6 +6898,7 @@ mod tests {
             description: String::new(),
             env_vars: Vec::new(),
             required: false,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "Authorization".to_string(),
             query_param: String::new(),
@@ -5527,16 +7026,21 @@ mod tests {
             .snapshot_catalog(store, "default")
             .await
             .unwrap();
-        let mut records = load_provider_environment_records(store, "default", &["provider".into()])
-            .await
-            .unwrap();
-        let valid = resolve_provider_environment_from_records(store, &catalog, &records)
+        let mut records = load_provider_environment_records(
+            store,
+            &crate::provider_refresh::test_runtime(store),
+            "default",
+            &["provider".into()],
+        )
+        .await
+        .unwrap();
+        let valid = resolve_provider_environment_from_records(&catalog, &records)
             .await
             .expect("valid dynamic environment");
         assert_eq!(valid.dynamic_credentials.len(), 1);
         for malformed_name in ["provider\tother", "provider\n", "provider:other"] {
             records[0].name = malformed_name.into();
-            let error = resolve_provider_environment_from_records(store, &catalog, &records)
+            let error = resolve_provider_environment_from_records(&catalog, &records)
                 .await
                 .expect_err("invalid record key must reject the whole environment");
             assert_eq!(error.code(), Code::FailedPrecondition);
@@ -5904,10 +7408,65 @@ mod tests {
         }));
     }
 
+    /// A sandbox a Cedar-enabled gateway created must not fail profile imports
+    /// for its whole workspace on a gateway built without Cedar.
+    #[cfg(not(feature = "experimental"))]
     #[tokio::test]
-    async fn import_provider_profile_waits_for_sandbox_sync_guard() {
+    async fn import_provider_profile_skips_attached_cedar_sandbox_without_cedar_support() {
         let state = test_server_state().await;
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("provider-cedar", "cedar-attached"),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-cedar-id".to_string(),
+                    name: "sandbox-cedar".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-cedar".to_string()],
+                    policy: Some(crate::grpc::test_support::cedar_policy()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("cedar-attached")),
+                    source: "cedar-attached.yaml".to_string(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .expect("a stored Cedar sandbox must not fail the import")
+        .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_waits_for_sandbox_mutation_in_workspace() {
+        let state = test_server_state().await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "profile-import-guard"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_import_provider_profiles(
@@ -5929,7 +7488,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "profile import should wait for sandbox sync guard"
+            "profile import should wait for a sandbox mutation in its workspace"
         );
         drop(guard);
 
@@ -5940,6 +7499,121 @@ mod tests {
             .expect("import should succeed")
             .into_inner();
         assert!(response.imported);
+    }
+
+    #[tokio::test]
+    async fn import_platform_provider_profile_waits_for_sandbox_mutation_in_any_workspace() {
+        let state = test_server_state().await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("team-a", "platform-import-guard"))
+            .await
+            .unwrap();
+        let task_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            handle_import_provider_profiles(
+                &task_state,
+                authed_request(ImportProviderProfilesRequest {
+                    request_id: String::new(),
+                    profiles: vec![ProviderProfileImportItem {
+                        profile: Some(custom_profile("platform-guarded-import")),
+                        source: "platform-guarded-import.yaml".to_string(),
+                    }],
+                    workspace_scope: None,
+                }),
+            )
+            .await
+        });
+
+        // An import that does not wait finishes well within this window.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+                .await
+                .is_err(),
+            "platform profile import should wait for a sandbox mutation in any workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("import should finish after guard release")
+            .expect("join import task")
+            .expect("import should succeed")
+            .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
+    }
+
+    #[tokio::test]
+    async fn legacy_credential_endpoints_remain_visible_and_can_be_repaired() {
+        let state = test_server_state().await;
+        let id = "legacy-endpoints";
+        let profile = |prefix: &str| {
+            let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+            profile.id = id.into();
+            let base = format!("https://auth.example.com/{prefix}");
+            profile.credentials[0].refresh.as_mut().unwrap().token_url =
+                format!("{base}/app/installations/{{installation_id}}/access_tokens");
+            let mut grant = token_grant_credential("dynamic");
+            grant.token_grant.as_mut().unwrap().token_endpoint = format!("{base}/exchange");
+            profile.credentials.push(grant);
+            let mut oauth = refreshable_credential("oauth", "OAUTH_TOKEN");
+            oauth.refresh.as_mut().unwrap().token_url = format!("{base}/oauth");
+            profile.credentials.push(oauth);
+            profile
+        };
+        let legacy = profile("a^b");
+        state
+            .store
+            .put_message(&stored_provider_profile(legacy.clone()))
+            .await
+            .unwrap();
+
+        let listed = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 100,
+                workspace_scope: Some(default_workspace_selector()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+        assert!(listed.iter().any(|profile| profile.id == "github"));
+        let fetched = listed.into_iter().find(|profile| profile.id == id).unwrap();
+        assert_eq!(fetched.credentials, legacy.credentials);
+
+        let update = |profile: ProviderProfile| {
+            authed_request(UpdateProviderProfilesRequest {
+                id: id.into(),
+                workspace_scope: Some(default_workspace_selector()),
+                expected_resource_version: fetched.resource_version,
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "repair.yaml".into(),
+                }),
+                ..Default::default()
+            })
+        };
+        let rejected = handle_update_provider_profiles(&state, update(legacy))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!rejected.updated);
+        assert_eq!(rejected.diagnostics.len(), 3, "{:?}", rejected.diagnostics);
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .all(|d| d.message.contains("literal caret"))
+        );
+
+        let repaired = handle_update_provider_profiles(&state, update(profile("a%5Eb")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(repaired.updated, "{:?}", repaired.diagnostics);
     }
 
     #[tokio::test]
@@ -6499,6 +8173,7 @@ mod tests {
             description: String::new(),
             env_vars: vec![env_var.to_string()],
             required: true,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -6569,6 +8244,7 @@ mod tests {
             description: String::new(),
             env_vars: vec![env_var.to_string()],
             required,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -6585,6 +8261,7 @@ mod tests {
             description: String::new(),
             env_vars: Vec::new(),
             required: true,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -6644,6 +8321,7 @@ mod tests {
                 "cursor",
                 "deepinfra",
                 "github",
+                "github-app",
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
@@ -7402,6 +9080,7 @@ mod tests {
         .into_inner();
 
         assert!(!response.valid);
+        assert!(response.supports_stable_placeholder);
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.profile_id == "lint-bad"
                 && diagnostic.field == "endpoints[0]"
@@ -7640,6 +9319,870 @@ mod tests {
         assert!(err.message().contains("default/global-provider"));
     }
 
+    pub(in crate::grpc) async fn github_app_refresh_fixture() -> (
+        Arc<ServerState>,
+        wiremock::MockServer,
+        Provider,
+        ConfigureProviderRefreshRequest,
+    ) {
+        let state = test_server_state().await;
+        let server = wiremock::MockServer::start().await;
+        let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+        profile.id = "test-github-app".into();
+        profile.credentials[0].refresh.as_mut().unwrap().token_url = format!(
+            "{}/app/installations/{{installation_id}}/access_tokens",
+            server.uri()
+        );
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "test.yaml".into(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "{:?}", imported.diagnostics);
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "github-app-test".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: "test-github-app".into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let configure = ConfigureProviderRefreshRequest {
+            provider: "github-app-test".into(),
+            credential_key: "GITHUB_TOKEN".into(),
+            strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+            material: HashMap::from([
+                ("client_id".into(), "Iv1.test".into()),
+                ("installation_id".into(), "123".into()),
+                (
+                    "private_key".into(),
+                    crate::provider_refresh::TEST_RSA_PRIVATE_KEY.into(),
+                ),
+                ("repository_ids".into(), "[42]".into()),
+                ("permissions".into(), r#"{"contents":"read"}"#.into()),
+            ]),
+            // The strategy itself must classify the signing key as secret.
+            secret_material_keys: Vec::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        };
+        (state, server, provider, configure)
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_uses_workspace_private_key() {
+        use openshell_core::proto::{CreateSecretRequest, SecretRefreshUse};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (mut state, server, _, mut configure) = github_app_refresh_fixture().await;
+        configure.credential_key = "GH_TOKEN".into();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .workspace_secrets
+            .enabled = true;
+        let endpoint = format!("{}/app/installations/123/access_tokens", server.uri());
+        super::super::secret::handle_create_secret(
+            &state,
+            authed_request(CreateSecretRequest {
+                name: "app-key".into(),
+                value: configure.material.remove("private_key").unwrap(),
+                refresh_use: Some(SecretRefreshUse {
+                    allowed_endpoints: vec![endpoint],
+                }),
+                workspace_scope: configure.workspace_scope.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        configure
+            .material_secrets
+            .insert("private_key".into(), "app-key".into());
+        configure.secret_material_keys.push("private_key".into());
+
+        // Binding must use the concrete installation endpoint, not its template.
+        configure
+            .material
+            .insert("installation_id".into(), "456".into());
+        let error = handle_configure_provider_refresh(&state, authed_request(configure.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("does not allow token endpoint"));
+        configure
+            .material
+            .insert("installation_id".into(), "123".into());
+        handle_configure_provider_refresh(&state, authed_request(configure))
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/123/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "installation-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        handle_rotate_provider_credential(
+            &state,
+            authed_request(RotateProviderCredentialRequest {
+                provider: "github-app-test".into(),
+                credential_key: "GH_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let inlined = handle_inline_provider_refresh_secrets(
+            &state,
+            authed_request(InlineProviderRefreshSecretsRequest {
+                provider: "github-app-test".into(),
+                credential_key: "api_token".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+        assert_eq!(inlined.credential_key, "GH_TOKEN");
+        assert!(inlined.material_secrets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_aliases_resolve_through_management_and_injection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        for (requested_key, expected_key) in [
+            ("api_token", "GITHUB_TOKEN"),
+            ("GH_TOKEN", "GH_TOKEN"),
+            ("GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ] {
+            server.reset().await;
+            let mut configure = request.clone();
+            configure.credential_key = requested_key.into();
+            let configured =
+                handle_configure_provider_refresh(&state, authed_request(configure.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(configured.status.unwrap().credential_key, expected_key);
+            // A logical-name update retains the explicitly selected alias.
+            configure.credential_key = "api_token".into();
+            let updated = handle_configure_provider_refresh(&state, authed_request(configure))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(updated.status.unwrap().credential_key, expected_key);
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": "installation-token",
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rotated = handle_rotate_provider_credential(
+                &state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(rotated.status.unwrap().credential_key, expected_key);
+            let catalog = state
+                .provider_profile_sources
+                .snapshot_catalog(state.store.as_ref(), "default")
+                .await
+                .unwrap();
+            let environment = resolve_provider_environment_with_credentials(
+                state.store.as_ref(),
+                &catalog,
+                "default",
+                &[provider.object_name().into()],
+                &state.credentials,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                environment.get(expected_key).map(String::as_str),
+                Some("installation-token")
+            );
+            assert!(!environment.contains_key("api_token"));
+            let binding = &environment.static_credential_bindings[expected_key];
+            assert!(!binding.endpoints.is_empty());
+            for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+                assert_eq!(environment.contains_key(key), key == expected_key);
+            }
+            let status = handle_get_provider_refresh_status(
+                &state,
+                authed_request(GetProviderRefreshStatusRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(status.credentials.len(), 1);
+            assert_eq!(status.credentials[0].credential_key, expected_key);
+            handle_delete_provider_refresh(
+                &state,
+                authed_request(DeleteProviderRefreshRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                crate::provider_refresh::list_refresh_states_for_provider(
+                    state.store.as_ref(),
+                    provider.object_id(),
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    async fn update_github_app_static_token(
+        state: &Arc<ServerState>,
+        provider: &Provider,
+        key: &str,
+        value: &str,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        handle_update_provider(
+            state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    provider.object_name(),
+                    &provider.r#type,
+                    key,
+                    value,
+                )),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn mock_github_installation_token(server: &wiremock::MockServer) {
+        use wiremock::{Mock, ResponseTemplate, matchers::method};
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "installation-token",
+                "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn github_app_first_mint_is_due_despite_previous_token_expiry() {
+        let (state, server, provider, mut config) = github_app_refresh_fixture().await;
+        let future = crate::persistence::current_time_ms() + 3_600_000;
+        config.expiration_time = Some(openshell_core::time::timestamp_from_millis(future).unwrap());
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        let mut grant = crate::provider_refresh::get_refresh_state(
+            &state.store,
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(grant.next_refresh_at_ms, 0);
+
+        // An installation configured before upgrade may already have a future first mint.
+        grant.next_refresh_at_ms = future;
+        crate::provider_refresh::put_refresh_state(&state.store, &grant)
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let changes = state.refresh.sweep().await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].completed_mint.is_some());
+    }
+
+    #[tokio::test]
+    async fn github_app_expiry_update_cannot_outlive_minted_token() {
+        let (state, server, provider, config) = github_app_refresh_fixture().await;
+        handle_configure_provider_refresh(&state, authed_request(config))
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        let key = "GITHUB_TOKEN";
+        let grant = state
+            .refresh
+            .rotate("default", provider.object_name(), key)
+            .await
+            .unwrap();
+        let update = |expires_at: Option<i64>| UpdateProviderRequest {
+            provider: Some(Provider {
+                metadata: Some(openshell_core::proto::ObjectMeta {
+                    name: provider.object_name().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            credential_expiration_times: expires_at
+                .into_iter()
+                .map(|ms| {
+                    (
+                        key.into(),
+                        openshell_core::time::timestamp_from_millis(ms).unwrap(),
+                    )
+                })
+                .collect(),
+            clear_credential_expiration_keys: if expires_at.is_none() {
+                vec![key.into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        for expiry in [None, Some(grant.expires_at_ms + 1)] {
+            assert_eq!(
+                handle_update_provider(&state, authed_request(update(expiry)))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+        }
+        let shorter = grant.expires_at_ms - 60_000;
+        let updated = handle_update_provider(&state, authed_request(update(Some(shorter))))
+            .await
+            .unwrap()
+            .into_inner()
+            .provider
+            .unwrap();
+        assert_eq!(
+            updated.credential_expiration_times[key],
+            openshell_core::time::timestamp_from_millis(shorter).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_rejects_static_sibling_before_and_after_configuration() {
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "static-token")
+            .await
+            .unwrap();
+        let err = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("GH_TOKEN"));
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "")
+            .await
+            .unwrap();
+        handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap();
+        let err = update_github_app_static_token(&state, &provider, "GH_TOKEN", "static-token")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        mock_github_installation_token(&server).await;
+        state
+            .refresh
+            .rotate("default", provider.object_name(), "GITHUB_TOKEN")
+            .await
+            .unwrap();
+
+        // Existing providers can already contain the conflicting alias after an upgrade.
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+                current
+                    .credentials
+                    .insert("GH_TOKEN".into(), "legacy-token".into());
+            })
+            .await
+            .unwrap();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(&state.store, "default")
+            .await
+            .unwrap();
+        let environment = resolve_provider_environment_with_credentials(
+            &state.store,
+            &catalog,
+            "default",
+            &[provider.object_name().into()],
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            environment.get("GITHUB_TOKEN").map(String::as_str),
+            Some("installation-token")
+        );
+        assert!(!environment.contains_key("GH_TOKEN"));
+        update_github_app_static_token(&state, &provider, "GH_TOKEN", "")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_app_deletion_after_failed_first_publication_preserves_static_token() {
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        update_github_app_static_token(&state, &provider, "GITHUB_TOKEN", "original-static-token")
+            .await
+            .unwrap();
+        handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap();
+        mock_github_installation_token(&server).await;
+        state.credentials.fail_next_store();
+        let err = handle_rotate_provider_credential(
+            &state,
+            authed_request(RotateProviderCredentialRequest {
+                provider: provider.object_name().into(),
+                credential_key: "GITHUB_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        let grant = state
+            .refresh
+            .get("default", provider.object_id(), "GITHUB_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.first_mint_provider_version, 0);
+        assert_eq!(grant.last_refresh_at_ms, 0);
+        assert!(!openshell_credential_issuer::refresh::refresh_has_expiration(&grant));
+        handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: provider.object_name().into(),
+                credential_key: "GITHUB_TOKEN".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let current = state
+            .store
+            .get_message::<Provider>(provider.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved = state
+            .credentials
+            .resolve_provider_handles(&current, crate::persistence::current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(resolved.values["GITHUB_TOKEN"], "original-static-token");
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_rejects_sibling_alias_including_failed_grants() {
+        for (selected, sibling) in [("GITHUB_TOKEN", "GH_TOKEN"), ("GH_TOKEN", "GITHUB_TOKEN")] {
+            let (state, _server, provider, mut request) = github_app_refresh_fixture().await;
+            request.credential_key = selected.into();
+            handle_configure_provider_refresh(&state, authed_request(request.clone()))
+                .await
+                .unwrap();
+            for status in ["pending", "error"] {
+                let mut original = crate::provider_refresh::get_refresh_state(
+                    state.store.as_ref(),
+                    "default",
+                    provider.object_id(),
+                    selected,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                original.status = status.into();
+                crate::provider_refresh::put_refresh_state(state.store.as_ref(), &original)
+                    .await
+                    .unwrap();
+                let before = crate::provider_refresh::get_refresh_state(
+                    state.store.as_ref(),
+                    "default",
+                    provider.object_id(),
+                    selected,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut conflicting = request.clone();
+                conflicting.credential_key = sibling.into();
+                conflicting
+                    .material
+                    .insert("installation_id".into(), "456".into());
+                conflicting
+                    .material
+                    .insert("repository_ids".into(), "[43]".into());
+                let err = handle_configure_provider_refresh(&state, authed_request(conflicting))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), Code::FailedPrecondition);
+                assert!(err.message().contains(selected));
+                let after = crate::provider_refresh::list_refresh_states_for_provider(
+                    state.store.as_ref(),
+                    provider.object_id(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(after, vec![before]);
+            }
+            // Updating the chosen alias is still allowed.
+            handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_concurrent_alias_configuration_has_one_winner() {
+        let (state, _server, provider, first) = github_app_refresh_fixture().await;
+        let mut second = first.clone();
+        second.credential_key = "GH_TOKEN".into();
+        second
+            .material
+            .insert("installation_id".into(), "456".into());
+        let (first, second) = tokio::join!(
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                authed_request(first)
+            )),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                authed_request(second)
+            )),
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let err = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            crate::provider_refresh::list_refresh_states_for_provider(
+                state.store.as_ref(),
+                provider.object_id(),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_legacy_conflicts_remain_inspectable_and_deletable() {
+        for legacy_keys in [vec!["api_token"], vec!["GITHUB_TOKEN", "GH_TOKEN"]] {
+            let (state, server, provider, request) = github_app_refresh_fixture().await;
+            // Seed records that the old configure handler allowed. No shared
+            // secret handles: cleanup must target only the selected record.
+            for key in &legacy_keys {
+                let legacy = crate::provider_refresh::new_refresh_state(
+                    &provider,
+                    "default",
+                    key,
+                    crate::provider_refresh::NewRefreshStateConfig {
+                        strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation,
+                        material: request.material.clone(),
+                        secret_material_keys: vec!["private_key".into()],
+                        expires_at_ms: 0,
+                        token_url: format!(
+                            "{}/app/installations/{{installation_id}}/access_tokens",
+                            server.uri()
+                        ),
+                        scopes: Vec::new(),
+                        refresh_before: None,
+                        max_lifetime: None,
+                        additional_output_keys: HashMap::new(),
+                    },
+                )
+                .unwrap();
+                crate::provider_refresh::put_refresh_state(state.store.as_ref(), &legacy)
+                    .await
+                    .unwrap();
+            }
+            let err = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(err.message().contains("exact key"));
+            let err = handle_rotate_provider_credential(
+                &state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: provider.object_name().into(),
+                    credential_key: "api_token".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let status_request = GetProviderRefreshStatusRequest {
+                provider: provider.object_name().into(),
+                credential_key: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            };
+            let listed =
+                handle_get_provider_refresh_status(&state, authed_request(status_request.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(listed.credentials.len(), legacy_keys.len());
+            let err = handle_get_provider_refresh_status(
+                &state,
+                authed_request(GetProviderRefreshStatusRequest {
+                    credential_key: "api_token".into(),
+                    ..status_request
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            for key in &legacy_keys {
+                handle_delete_provider_refresh(
+                    &state,
+                    authed_request(DeleteProviderRefreshRequest {
+                        provider: provider.object_name().into(),
+                        credential_key: (*key).into(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    crate::provider_refresh::get_refresh_state(
+                        state.store.as_ref(),
+                        "default",
+                        provider.object_id(),
+                        key,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            handle_configure_provider_refresh(&state, authed_request(request))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_stores_key_rotates_token_and_expires_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server, provider, request) = github_app_refresh_fixture().await;
+        let configure = || request.clone();
+        let mut invalid = configure();
+        invalid
+            .material
+            .insert("repository_ids".into(), "[]".into());
+        assert_eq!(
+            handle_configure_provider_refresh(&state, authed_request(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        handle_configure_provider_refresh(&state, authed_request(configure()))
+            .await
+            .unwrap();
+        let initial = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!initial.material.contains_key("private_key"));
+        assert!(initial.secret_material_handles.contains_key("private_key"));
+
+        for token in ["installation-token-first", "installation-token-second"] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": token,
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rotated = crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN",
+            )
+            .await
+            .unwrap();
+            assert_eq!(rotated.authorization_epoch, initial.authorization_epoch);
+            assert!(rotated.next_refresh_at_ms < rotated.expires_at_ms);
+            let stored = state
+                .store
+                .get_message_by_name::<Provider>("default", "github-app-test")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.credentials.is_empty());
+            assert_eq!(stored.credential_handles.len(), 1);
+            let resolved = state
+                .credentials
+                .resolve_provider_handles(&stored, crate::persistence::current_time_ms())
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.values.get("GITHUB_TOKEN").map(String::as_str),
+                Some(token)
+            );
+            let expired = state
+                .credentials
+                .resolve_provider_handles(&stored, rotated.expires_at_ms + 1)
+                .await
+                .unwrap();
+            assert!(expired.values.is_empty());
+        }
+        // Replacing a valid signing key starts a new authorization epoch and
+        // stores new secret material; no old key should be reused for the mint.
+        let new_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut invalid = configure();
+        invalid
+            .material
+            .insert("private_key".into(), new_key.public_key_pem());
+        let error = handle_configure_provider_refresh(&state, authed_request(invalid))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        let preserved = state
+            .refresh
+            .get("default", provider.object_id(), "GITHUB_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.authorization_epoch, initial.authorization_epoch);
+        assert_eq!(
+            preserved.secret_material_handles,
+            initial.secret_material_handles
+        );
+        let mut replacement = configure();
+        replacement
+            .material
+            .insert("private_key".into(), new_key.serialize_pem().unwrap());
+        handle_configure_provider_refresh(&state, authed_request(replacement))
+            .await
+            .unwrap();
+        let updated = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(updated.authorization_epoch, initial.authorization_epoch);
+        assert_ne!(
+            updated.secret_material_handles,
+            initial.secret_material_handles
+        );
+        assert!(!updated.material.contains_key("private_key"));
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("secret echoed by issuer"))
+            .mount(&server)
+            .await;
+        assert!(
+            crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN"
+            )
+            .await
+            .is_err()
+        );
+        let failed = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.failure_code, "github_app_authentication_failed");
+        assert!(!failed.last_error.contains("secret echoed"));
+        let public = new_key.public_key_pem();
+        let requests = server.received_requests().await.unwrap();
+        let jwt = requests[0].headers["authorization"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap();
+        jsonwebtoken::decode::<serde_json::Value>(
+            jwt,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn configure_provider_refresh_stores_scoped_status_and_provider_expiry() {
         let state = test_server_state().await;
@@ -7694,6 +10237,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -7787,6 +10331,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -7927,6 +10472,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         handle_configure_provider_refresh(&state, authed_request(request("original-secret")))
             .await
@@ -8000,6 +10546,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configure_refresh_rejects_basic_auth_without_client_secret() {
+        let state = test_server_state().await;
+        let request = ConfigureProviderRefreshRequest {
+            request_id: String::new(),
+            provider: "any".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+            material: HashMap::from([
+                ("client_id".to_string(), "client-id".to_string()),
+                ("refresh_token".to_string(), "refresh".to_string()),
+                (
+                    "token_endpoint_auth_method".to_string(),
+                    "client_secret_basic".to_string(),
+                ),
+            ]),
+            secret_material_keys: vec!["refresh_token".to_string()],
+            expiration_time: None,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            material_secrets: HashMap::new(),
+        };
+        let status = handle_configure_provider_refresh(&state, authed_request(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("requires client_secret"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_refresh_configure_keeps_only_winner_material() {
         let first_state = test_server_state().await;
@@ -8024,17 +10600,20 @@ mod tests {
         // Model a second gateway replica: it shares the durable database and
         // credential backend, but owns an independent sandbox synchronization
         // guard, so process-local serialization cannot hide this race.
-        let second_state = Arc::new(ServerState::new_with_credentials(
-            first_state.config.clone(),
-            Arc::clone(&first_state.store),
-            crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-            first_state.credentials.clone(),
-        ));
+        let second_state = Arc::new(
+            ServerState::new_with_credentials(
+                first_state.config.clone(),
+                Arc::clone(&first_state.store),
+                crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                None,
+                first_state.credentials.clone(),
+            )
+            .unwrap(),
+        );
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
             request_id: String::new(),
             provider: "configure-create-race".to_string(),
@@ -8050,6 +10629,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         let (first_store_hit, release_first_store) = first_state.credentials.gate_next_store();
 
@@ -8067,7 +10647,10 @@ mod tests {
             release_first_store.send(()).unwrap();
             result
         };
-        let (first_result, second_result) = tokio::join!(first, second);
+        let (first_result, second_result) = tokio::join!(
+            crate::persistence::lock_order::branch(first),
+            crate::persistence::lock_order::branch(second)
+        );
 
         assert_eq!(first_result.unwrap_err().code(), Code::Aborted);
         second_result.unwrap();
@@ -8178,6 +10761,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8225,10 +10809,15 @@ mod tests {
             .snapshot_catalog(state.store.as_ref(), "default")
             .await
             .unwrap();
-        let provider =
-            update_provider_record_with_catalog(state.store.as_ref(), &catalog, "default", updated)
-                .await
-                .unwrap();
+        let provider = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.refresh,
+            &catalog,
+            "default",
+            updated,
+        )
+        .await
+        .unwrap();
         let refresh_state = crate::provider_refresh::new_refresh_state(
             &provider,
             "default",
@@ -8332,6 +10921,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8402,6 +10992,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8516,6 +11107,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8768,6 +11360,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8851,6 +11444,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8873,6 +11467,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8939,6 +11534,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -8959,6 +11555,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -9016,6 +11613,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    material_secrets: HashMap::new(),
                 }),
             )
             .await
@@ -9087,7 +11685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_provider_profile_waits_for_sandbox_sync_guard() {
+    async fn delete_provider_profile_waits_for_sandbox_mutation_in_workspace() {
         let state = test_server_state().await;
         state
             .store
@@ -9095,7 +11693,11 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "profile-delete-guard"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_delete_provider_profile(
@@ -9115,7 +11717,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "profile delete should wait for sandbox sync guard"
+            "profile delete should wait for a sandbox mutation in its workspace"
         );
         drop(guard);
 
@@ -9150,7 +11752,11 @@ mod tests {
         .await
         .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             let mut provider = provider_with_values("guarded-provider", "guarded-create");
@@ -9186,6 +11792,234 @@ mod tests {
             response.provider.expect("provider").object_name(),
             "guarded-provider"
         );
+    }
+
+    fn default_workspace_selector() -> openshell_core::proto::WorkspaceSelector {
+        openshell_core::proto::workspace_selector("default".to_string())
+    }
+
+    async fn create_openai_provider(state: &Arc<ServerState>, name: &str) -> Provider {
+        let provider = provider_with_credential_value(name, "openai", "OPENAI_API_KEY", "sk-test");
+        handle_create_provider(
+            state,
+            authed_request(CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider),
+                workspace_scope: Some(default_workspace_selector()),
+            }),
+        )
+        .await
+        .expect("create provider")
+        .into_inner()
+        .provider
+        .expect("created provider")
+    }
+
+    fn provider_config_update(current: &Provider) -> Request<UpdateProviderRequest> {
+        let mut provider = current.clone();
+        provider.credential_handles.clear();
+        provider
+            .config
+            .insert("NEW_CONFIG".to_string(), "new-value".to_string());
+        authed_request(UpdateProviderRequest {
+            request_id: String::new(),
+            provider: Some(provider),
+            credential_expiration_times: HashMap::new(),
+            clear_credential_expiration_keys: Vec::new(),
+            workspace_scope: Some(default_workspace_selector()),
+        })
+    }
+
+    fn delete_provider_request(name: &str) -> Request<DeleteProviderRequest> {
+        authed_request(DeleteProviderRequest {
+            request_id: String::new(),
+            allow_missing: false,
+            name: name.to_string(),
+            workspace_scope: Some(default_workspace_selector()),
+        })
+    }
+
+    fn sandbox_in_default_workspace(id: &str, providers: Vec<String>) -> Sandbox {
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                providers,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_provider_waits_for_sandbox_mutation_in_workspace() {
+        let state = test_server_state().await;
+        create_openai_provider(&state, "guarded-delete-provider").await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let mut delete = tokio::spawn(async move {
+            handle_delete_provider(
+                &task_state,
+                delete_provider_request("guarded-delete-provider"),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "provider delete should wait for a sandbox mutation in its workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+            .await
+            .expect("delete should finish after guard release")
+            .expect("join delete task")
+            .expect("delete should succeed")
+            .into_inner();
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_rejects_empty_name_without_waiting_for_workspace() {
+        let state = test_server_state().await;
+        let _guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_delete_provider(&state, delete_provider_request("")),
+        )
+        .await
+        .expect("an empty name should not wait for the workspace lock")
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn delete_provider_rejects_provider_attached_while_waiting() {
+        let state = test_server_state().await;
+        create_openai_provider(&state, "raced-provider").await;
+        let sandbox = sandbox_in_default_workspace("raced-sandbox", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        // An attach to this sandbox holds its sandbox scope while it writes
+        // the provider into the spec.
+        let attach_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let mut delete = tokio::spawn(async move {
+            handle_delete_provider(&task_state, delete_provider_request("raced-provider")).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "provider delete should wait for the in-flight attach"
+        );
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
+                sandbox
+                    .spec
+                    .get_or_insert_with(Default::default)
+                    .providers
+                    .push("raced-provider".to_string());
+            })
+            .await
+            .unwrap();
+        drop(attach_guard);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+            .await
+            .expect("delete should finish after the attach")
+            .expect("join delete task")
+            .expect_err("a provider attached while the delete waited must not be deleted");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("attached to sandbox"), "{error}");
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Provider>("default", "raced-provider")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_waits_for_sandbox_mutation_in_same_workspace() {
+        let state = test_server_state().await;
+        let current = create_openai_provider(&state, "guarded-update-provider").await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let request = provider_config_update(&current);
+        let mut update =
+            tokio::spawn(async move { handle_update_provider(&task_state, request).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut update)
+                .await
+                .is_err(),
+            "provider update should wait for a sandbox mutation in its workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), update)
+            .await
+            .expect("update should finish after guard release")
+            .expect("join update task")
+            .expect("update should succeed")
+            .into_inner();
+        assert!(response.provider.unwrap().config.contains_key("NEW_CONFIG"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_does_not_wait_for_sandbox_mutation_in_other_workspace() {
+        let state = test_server_state().await;
+        let current = create_openai_provider(&state, "unguarded-update-provider").await;
+        // The "team-a" workspace row is not needed to hold its keys.
+        let other_workspace_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("team-a", "x")),
+        )
+        .await
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_update_provider(&state, provider_config_update(&current)),
+        )
+        .await
+        .expect("provider update should not wait for another workspace")
+        .expect("update should succeed")
+        .into_inner();
+        assert!(response.provider.unwrap().config.contains_key("NEW_CONFIG"));
+        drop(other_workspace_guard);
     }
 
     #[tokio::test]
@@ -9396,8 +12230,10 @@ mod tests {
             .clone();
 
         let (store_hit, release_store) = credentials.gate_next_store();
+        let refresh = crate::provider_refresh::test_runtime(&store);
         let update = update_provider_record_validating(
             &store,
+            &refresh,
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
@@ -9496,6 +12332,7 @@ mod tests {
 
         let error = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-failed"),
@@ -9559,8 +12396,10 @@ mod tests {
 
         // Pause one writer after it reads the provider version. A second writer
         // publishes while it waits, so only a database CAS can reject the loser.
+        let refresh = crate::provider_refresh::test_runtime(&store);
         let loser = update_provider_record_validating(
             &store,
+            &refresh,
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-loser"),
@@ -9571,6 +12410,7 @@ mod tests {
             store_hit.await.unwrap();
             let result = update_provider_record_validating(
                 &store,
+                &crate::provider_refresh::test_runtime(&store),
                 "default",
                 &catalog,
                 provider_with_credential_value(
@@ -9865,6 +12705,7 @@ mod tests {
 
         let updated = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -9907,6 +12748,7 @@ mod tests {
 
         let updated = update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -9973,6 +12815,7 @@ mod tests {
 
         update_provider_record_validating(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &catalog,
             Provider {
@@ -10696,6 +13539,7 @@ mod tests {
                             env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
                             token_grant_owners: Vec::new(),
                             required: true,
+                            stable_placeholder: false,
                             auth_style: "bearer".to_string(),
                             header_name: "authorization".to_string(),
                             query_param: String::new(),
@@ -11273,6 +14117,202 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn static_request_metadata_is_minimal_owner_bound_and_tracks_delivered_values() {
+        use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+        let store = test_store().await;
+        let mut owned = custom_profile("metadata-owner");
+        owned.credentials = vec![static_credential("token", "TOKEN", true)];
+        owned.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "rest".into(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        }];
+        let mut optional = owned.clone();
+        optional.id = "metadata-optional".into();
+        optional.credentials[0].required = false;
+        optional.credentials[0].header_name = "x-wrong-owner".into();
+        let sources = ProviderProfileSources::from_test_profiles(vec![owned.clone(), optional]);
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+        let record = |name: &str, id: &str, profile: &str| ProviderEnvironmentRecord {
+            name: name.into(),
+            object_id: id.into(),
+            resource_version: 1,
+            provider: Provider {
+                r#type: profile.into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+            refresh_states: Vec::new(),
+        };
+        let mut records = [
+            record("owner", "owner-id", "metadata-owner"),
+            record("optional", "optional-id", "metadata-optional"),
+        ];
+        records[0]
+            .provider
+            .credentials
+            .insert("TOKEN".into(), "synthetic-sensitive-token".into());
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".into(),
+            port: 443,
+            path: "/**".into(),
+        }];
+        let baseline = static_credential_binding(
+            Some("sandbox"),
+            &records[0],
+            "TOKEN",
+            &endpoints,
+            None,
+            false,
+        );
+        let mut environment = ProviderEnvironment {
+            environment: HashMap::from([("TOKEN".into(), "synthetic-sensitive-token".into())]),
+            static_credential_keys: HashSet::from(["TOKEN".into()]),
+            static_credential_bindings: HashMap::from([("TOKEN".into(), baseline.clone())]),
+            ..Default::default()
+        };
+        let metadata =
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap();
+        let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}TOKEN");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata[&key],
+            ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                auth_style: "bearer".into(),
+                header_name: "authorization".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            environment.static_credential_bindings["TOKEN"], baseline,
+            "legacy handles and identities must not change"
+        );
+        let encoded = metadata[&key].encode_to_vec();
+        assert!(
+            !encoded
+                .windows(b"synthetic-sensitive-token".len())
+                .any(|window| window == b"synthetic-sensitive-token")
+        );
+        // Preserve malformed authored fields for the supervisor to reject;
+        // silently dropping them would incorrectly select its default location.
+        for (style, header, query, path, explicit, valid) in [
+            ("", "", "", "", false, true),
+            (" ", "", "", "", true, false),
+            ("", "x-api-key", "", "", true, false),
+            ("header", "Bad Header", "", "", true, false),
+            ("bearer", "authorization", "api_key", "", true, true),
+            (
+                "bearer",
+                "authorization",
+                "api_key",
+                "/v1/{credential}/resources",
+                true,
+                true,
+            ),
+            ("query", "", "api?key", "", true, false),
+            ("basic", "x-custom", "", "", true, true),
+            ("basic", "Authorization", "", "", true, true),
+        ] {
+            let mut declared = owned.clone();
+            declared.credentials[0].auth_style = style.into();
+            declared.credentials[0].header_name = header.into();
+            declared.credentials[0].query_param = query.into();
+            declared.credentials[0].path_template = path.into();
+            let sources = ProviderProfileSources::from_test_profiles(vec![declared]);
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            let metadata =
+                static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                    .unwrap();
+            assert_eq!(
+                metadata.contains_key(&key),
+                explicit,
+                "style {style:?}, header {header:?}"
+            );
+            let installed = openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                1, environment.environment.clone(), HashMap::new(), metadata,
+                environment.static_credential_bindings.clone(), vec![],
+            );
+            assert_eq!(
+                installed.is_ok(),
+                valid,
+                "style {style:?}, header {header:?}, query {query:?}"
+            );
+        }
+        environment.environment.remove("TOKEN");
+        assert!(
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap()
+                .is_empty(),
+            "expired or withheld material must not leave request metadata behind"
+        );
+    }
+
+    #[test]
+    fn external_stable_placeholder_binding_preserves_only_value_changes() {
+        let mut record = ProviderEnvironmentRecord {
+            name: "external-provider".to_string(),
+            object_id: "provider-instance-a".to_string(),
+            resource_version: 1,
+            provider: Provider::default(),
+            refresh_states: Vec::new(),
+        };
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+        }];
+        let external_binding =
+            |sandbox, record: &ProviderEnvironmentRecord, key, endpoints: &[_]| {
+                static_credential_binding(Some(sandbox), record, key, endpoints, None, true)
+            };
+        let initial = external_binding("sandbox-a", &record, "API_KEY", &endpoints);
+        assert!(!initial.workload_credential_handle.is_empty());
+        record.resource_version = 2;
+        record
+            .provider
+            .credentials
+            .insert("API_KEY".to_string(), "synthetic-new".to_string());
+        assert!(initial == external_binding("sandbox-a", &record, "API_KEY", &endpoints));
+        assert!(initial != external_binding("sandbox-b", &record, "API_KEY", &endpoints));
+        assert!(initial != external_binding("sandbox-a", &record, "OTHER_KEY", &endpoints));
+
+        for (host, port, path) in [
+            ("other.example.com", 443, "/v1/**"),
+            ("api.example.com", 8443, "/v1/**"),
+            ("api.example.com", 443, "/v2/**"),
+        ] {
+            let changed_endpoints = vec![StaticCredentialEndpointBinding {
+                host: host.to_string(),
+                port,
+                path: path.to_string(),
+            }];
+            assert!(
+                initial.workload_credential_handle
+                    != external_binding("sandbox-a", &record, "API_KEY", &changed_endpoints)
+                        .workload_credential_handle
+            );
+        }
+        record.object_id = "provider-instance-b".to_string();
+        assert!(
+            initial.workload_credential_handle
+                != external_binding("sandbox-a", &record, "API_KEY", &endpoints)
+                    .workload_credential_handle,
+            "recreating the same provider name must revoke the original handle"
+        );
+        assert!(
+            static_credential_binding(None, &record, "API_KEY", &endpoints, None, true)
+                .workload_credential_handle
+                .is_empty(),
+            "an external handle requires an authenticated sandbox binding"
+        );
+    }
+
     #[test]
     fn workload_handle_derivation_is_order_independent_and_boundary_bound() {
         let endpoints = vec![
@@ -11417,6 +14457,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            material_secrets: HashMap::new(),
         };
         handle_configure_provider_refresh(&state, authed_request(configure()))
             .await
@@ -11428,9 +14469,14 @@ mod tests {
             .await
             .unwrap();
         let names = vec!["stable-refresh".to_string()];
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let revision_1 = crate::grpc::policy::compute_provider_env_revision_with_catalog(
             state.store.as_ref(),
             &catalog,
@@ -11440,7 +14486,6 @@ mod tests {
         .await
         .unwrap();
         let first = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            state.store.as_ref(),
             &catalog,
             &records,
             &HashMap::new(),
@@ -11502,13 +14547,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.credentials["ACCESS_TOKEN"], "token-1");
-        let unchanged_records =
-            load_provider_environment_records(state.store.as_ref(), "default", &names)
-                .await
-                .unwrap();
+        let unchanged_records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let unchanged_environment =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                state.store.as_ref(),
                 &catalog,
                 &unchanged_records,
                 &HashMap::new(),
@@ -11531,6 +14579,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-1")
         );
@@ -11547,9 +14598,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
         let revision_2 = crate::grpc::policy::compute_provider_env_revision_with_catalog(
             state.store.as_ref(),
             &catalog,
@@ -11560,7 +14616,6 @@ mod tests {
         .unwrap();
         let second =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                state.store.as_ref(),
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -11587,6 +14642,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -11604,6 +14662,9 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -11620,11 +14681,15 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(revision_2, revision_3);
-        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
-            .await
-            .unwrap();
-        let third = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+        let records = load_provider_environment_records(
             state.store.as_ref(),
+            &state.refresh,
+            "default",
+            &names,
+        )
+        .await
+        .unwrap();
+        let third = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             &catalog,
             &records,
             &HashMap::new(),
@@ -11651,6 +14716,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             None
         );
@@ -11799,6 +14867,7 @@ mod tests {
 
         let records = load_provider_environment_records(
             &store,
+            &crate::provider_refresh::test_runtime(&store),
             "default",
             &["legacy-openai-handle".to_string()],
         )
@@ -11814,7 +14883,6 @@ mod tests {
 
         let result =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                &store,
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -11901,9 +14969,14 @@ mod tests {
             .snapshot_catalog(&store, "default")
             .await
             .unwrap();
-        let records = load_provider_environment_records(&store, "default", &provider_names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
         let policy_bindings = HashMap::from([(
             "my-google-cloud".to_string(),
             vec![StaticCredentialEndpointBinding {
@@ -11914,7 +14987,6 @@ mod tests {
         )]);
 
         let result = resolve_provider_environment_from_records_with_policy_bindings(
-            &store,
             &catalog,
             &records,
             &policy_bindings,
@@ -11932,6 +15004,94 @@ mod tests {
                 .get("GCP_ADC_ACCESS_TOKEN")
                 .map(|binding| binding.endpoints.as_slice()),
             Some(policy_bindings["my-google-cloud"].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_placeholder_resolve_provider_env_marks_only_bound_profile_credentials() {
+        let store = test_store().await;
+        let mut profile = custom_profile("stable-placeholder-test");
+        let mut credential = static_credential("assertion", "EXTERNAL_ASSERTION", true);
+        credential.stable_placeholder = true;
+        profile.credentials = vec![credential];
+        profile.files = vec![openshell_core::proto::ProviderProfileFile {
+            path: "client.toml".to_string(),
+            content: "endpoint = 'https://tools.example.com/mcp'".to_string(),
+            env_var: "CLIENT_CONFIG_FILE".to_string(),
+        }];
+        let sources = ProviderProfileSources::from_test_profiles(vec![profile]);
+        let catalog = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("test profile catalog");
+        create_provider_record_with_catalog(
+            &store,
+            &catalog,
+            "default",
+            provider_with_credential_value(
+                "stable-provider",
+                "stable-placeholder-test",
+                "EXTERNAL_ASSERTION",
+                "assertion-v1",
+            ),
+        )
+        .await
+        .expect("provider with stable credential");
+
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &["stable-provider".to_string()],
+        )
+        .await
+        .expect("provider records");
+        let policy_bindings = HashMap::from([(
+            "stable-provider".to_string(),
+            vec![StaticCredentialEndpointBinding {
+                host: "tools.example.com".to_string(),
+                port: 443,
+                path: "/mcp/**".to_string(),
+            }],
+        )]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(
+            &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .expect("test credential runtime");
+        let result =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                &catalog,
+                &records,
+                &policy_bindings,
+                &credentials,
+                Some("sandbox-id"),
+            )
+            .await
+            .expect("provider environment");
+
+        assert_eq!(
+            result.environment.get("CLIENT_CONFIG_FILE"),
+            Some(&"/run/openshell/providers/stable-provider/client.toml".to_string()),
+        );
+        assert_eq!(
+            result
+                .files
+                .get("/run/openshell/providers/stable-provider/client.toml"),
+            Some(&"endpoint = 'https://tools.example.com/mcp'".to_string()),
+        );
+        assert_eq!(
+            result
+                .stable_placeholder_environment_keys
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["EXTERNAL_ASSERTION".to_string()]
+        );
+        assert_eq!(
+            result.static_credential_bindings["EXTERNAL_ASSERTION"]
+                .workload_credential_handle
+                .len(),
+            64,
+            "external stable placeholders must use an identity-bound handle",
         );
     }
 
@@ -11963,9 +15123,14 @@ mod tests {
         .unwrap();
 
         let provider_names = ["my-google-cloud".to_string()];
-        let records = load_provider_environment_records(&store, "default", &provider_names)
-            .await
-            .unwrap();
+        let records = load_provider_environment_records(
+            &store,
+            &crate::provider_refresh::test_runtime(&store),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
         assert!(records[0].provider.credentials.is_empty());
         assert!(
             records[0]
@@ -11976,7 +15141,6 @@ mod tests {
 
         let unbound =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-                &store,
                 &catalog,
                 &records,
                 &HashMap::new(),
@@ -12001,7 +15165,6 @@ mod tests {
             }],
         )]);
         let bound = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            &store,
             &catalog,
             &records,
             &policy_bindings,
@@ -12129,6 +15292,49 @@ mod tests {
                 .get("GITHUB_TOKEN")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_preserves_expired_handle_key_for_create_time_rejection() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        let mut provider = provider_with_credential_value(
+            "github-expired",
+            "github",
+            "GITHUB_TOKEN",
+            "github-token",
+        );
+        provider.credential_expiration_times.insert(
+            "GITHUB_TOKEN".to_string(),
+            ts(crate::persistence::current_time_ms() - 1),
+        );
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider,
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &catalog,
+            "default",
+            &["github-expired".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.contains_key("GITHUB_TOKEN"));
+        assert!(result.expired_static_keys.contains("GITHUB_TOKEN"));
     }
 
     #[tokio::test]
@@ -13777,6 +16983,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -13842,6 +17049,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -13919,6 +17127,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -13978,6 +17187,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14031,6 +17241,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14112,6 +17323,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14209,6 +17421,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14264,6 +17477,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14340,9 +17554,14 @@ mod tests {
             .snapshot_catalog(state.store.as_ref(), "default")
             .await
             .unwrap();
-        let keys = active_provider_environment_keys(state.store.as_ref(), &catalog, &provider, 0)
-            .await
-            .unwrap();
+        let keys = active_provider_environment_keys(
+            RefreshStateReader::Runtime(&state.refresh),
+            &catalog,
+            &provider,
+            0,
+        )
+        .await
+        .unwrap();
         assert!(keys.contains(&"AWS_ACCESS_KEY_ID".to_string()));
         assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
         assert!(keys.contains(&"AWS_SESSION_TOKEN".to_string()));
@@ -14445,6 +17664,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             }),
         )
         .await
@@ -14523,12 +17743,19 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                material_secrets: HashMap::new(),
             })
         };
 
         let (result_a, result_b) = tokio::join!(
-            handle_configure_provider_refresh(&state, configure("aws-a")),
-            handle_configure_provider_refresh(&state, configure("aws-b")),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                configure("aws-a")
+            )),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                configure("aws-b")
+            )),
         );
 
         // Exactly one configuration wins; the other is rejected as a collision
@@ -14839,6 +18066,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14855,6 +18083,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14891,6 +18120,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14948,6 +18178,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
@@ -14957,6 +18188,140 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(listed.providers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_providers_filters_labels_before_pagination_and_redacts_secrets() {
+        let state = test_server_state().await;
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "beta".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        for (workspace, name, env, team) in [
+            ("default", "prod", "prod", "ml"),
+            ("default", "dev-one", "dev", "ml"),
+            ("default", "other-team", "dev", "platform"),
+            ("default", "dev-two", "dev", "ml"),
+            ("beta", "beta-dev", "dev", "ml"),
+        ] {
+            let labels = HashMap::from([("env".into(), env.into()), ("team".into(), team.into())]);
+            let created = handle_create_provider(
+                &state,
+                authed_request(CreateProviderRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                    provider: Some(Provider {
+                        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                            name: name.into(),
+                            labels: labels.clone(),
+                            ..Default::default()
+                        }),
+                        r#type: "github".into(),
+                        credentials: HashMap::from([(
+                            "GITHUB_TOKEN".into(),
+                            "secret-token".into(),
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner()
+            .provider
+            .unwrap();
+            assert_eq!(created.metadata.unwrap().labels, labels);
+        }
+
+        for (all_workspaces, expected) in [(false, 2), (true, 3)] {
+            let scope = if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
+            } else {
+                openshell_core::proto::workspace_selector("default")
+            };
+            let mut request = ListProvidersRequest {
+                workspace_scope: Some(scope),
+                page_size: 1,
+                label_selector: "env=dev,team=ml".into(),
+                ..Default::default()
+            };
+            let mut names = HashSet::new();
+            loop {
+                let response = handle_list_providers(&state, authed_request(request.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(
+                    response.providers.len(),
+                    1,
+                    "filtering must precede pagination"
+                );
+                let provider = &response.providers[0];
+                assert_eq!(provider.metadata.as_ref().unwrap().labels["env"], "dev");
+                assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
+                assert_eq!(provider.credentials["GITHUB_TOKEN"], "REDACTED");
+                assert!(provider.credential_handles.is_empty());
+                if !all_workspaces {
+                    assert_eq!(provider.object_workspace(), "default");
+                }
+                assert!(
+                    names.insert(provider.object_name().to_string()),
+                    "pages must not repeat objects"
+                );
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                let changed_selector = ListProvidersRequest {
+                    label_selector: "env=prod".into(),
+                    page_token: response.next_page_token.clone(),
+                    ..request.clone()
+                };
+                let err = handle_list_providers(&state, authed_request(changed_selector))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), Code::InvalidArgument);
+                request.page_token = response.next_page_token;
+            }
+            assert_eq!(names.len(), expected);
+        }
+
+        let empty = handle_list_providers(
+            &state,
+            authed_request(ListProvidersRequest {
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                label_selector: "env=missing".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(empty.providers.is_empty());
+        assert!(empty.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_providers_rejects_invalid_label_selectors() {
+        let state = test_server_state().await;
+        for selector in ["=no-key", "no-equals-sign", "env=bad value"] {
+            let err = handle_list_providers(
+                &state,
+                authed_request(ListProvidersRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    label_selector: selector.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "selector: {selector}");
+        }
     }
 
     #[tokio::test]
@@ -15938,6 +19303,7 @@ mod tests {
             &state,
             non_member_request(ListProvidersRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
+                label_selector: "env=dev".into(),
                 ..Default::default()
             }),
         )
@@ -15948,6 +19314,18 @@ mod tests {
             Code::PermissionDenied,
             "handle_list_providers should reject non-members"
         );
+
+        let err = handle_list_providers(
+            &state,
+            non_member_request(ListProvidersRequest {
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                label_selector: "env=dev".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
 
         let err = handle_update_provider(
             &state,

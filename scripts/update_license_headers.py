@@ -66,9 +66,7 @@ SIDECAR_LICENSE_FILES: set[str] = {
     "deploy/deb/control.in",
     "scripts/keycloak-realm.json",
     "sdk/conformance/oauth-client-credentials.json",
-    "sdk/typescript/biome.json",
-    "sdk/typescript/tsconfig.build.json",
-    "sdk/typescript/tsconfig.json",
+    "sdk/conformance/oidc-token-bundle.json",
 }
 
 # Directories to skip entirely (relative to repo root).
@@ -77,6 +75,7 @@ EXCLUDE_DIRS: set[str] = {
     ".agentic-ci",
     ".tekton",
     "deploy/konflux",
+    "deploy/rhoai",
     "target",
     "e2e/rust/target",
     "plans",
@@ -86,7 +85,6 @@ EXCLUDE_DIRS: set[str] = {
     ".git",
     ".cache",
     "python/openshell/_proto",
-    "sdk/typescript/src/gen",
 }
 
 # Individual filenames to skip.

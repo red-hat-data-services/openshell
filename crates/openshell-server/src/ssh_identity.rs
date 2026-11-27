@@ -5,12 +5,13 @@
 //! the credential driver owns private keys and this internal row owns handles.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use openshell_core::jwt::{SandboxLaunchAuthentication, SecretSshHostKey};
 use openshell_core::proto::Sandbox;
-use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
-use openshell_core::{ObjectId as _, ObjectName as _, ObjectWorkspace as _};
+use openshell_core::proto::datamodel::v1::CredentialHandle;
+use openshell_core::{ObjectId as _, ObjectWorkspace as _};
+use openshell_credential_issuer::SecretOwner;
 use prost::Message as _;
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,8 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use crate::credentials::CredentialRuntime;
-use crate::persistence::{PersistenceError, Store};
+use crate::gateway_metrics::{self, LockScope};
+use crate::persistence::{PersistenceError, SshIdentityMutationGuard, Store};
 
 const OBJECT_TYPE: &str = "sandbox_ssh_identity_v1";
 const CANDIDATE_TYPE: &str = "sandbox_ssh_identity_candidate_v1";
@@ -28,14 +30,22 @@ const CREDENTIAL_KEY: &str = "SSH_HOST_PRIVATE_KEY";
 pub struct SshIdentityStore {
     store: Arc<Store>,
     credentials: CredentialRuntime,
-    mutation: Arc<Mutex<()>>,
+    /// One local mutex per sandbox id, so steps for different sandboxes run at
+    /// once. Weak values let entries disappear after the last step using a
+    /// sandbox's mutex completes.
+    mutations: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+    /// Test-only failure for the next identity lock acquisition.
+    #[cfg(test)]
+    lock_failure: Arc<StdMutex<Option<PersistenceError>>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionRotation, SupervisorAuthBundle};
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::{SandboxSessionId, sandbox_generation::SandboxGenerationId};
+    use std::time::Duration;
 
     async fn fixture() -> SshIdentityStore {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
@@ -49,10 +59,14 @@ mod tests {
     }
 
     fn sandbox(id: &str) -> Sandbox {
+        named_sandbox(id, "same-name")
+    }
+
+    fn named_sandbox(id: &str, name: &str) -> Sandbox {
         Sandbox {
             metadata: Some(ObjectMeta {
                 id: id.to_string(),
-                name: "same-name".to_string(),
+                name: name.to_string(),
                 workspace: "default".to_string(),
                 ..Default::default()
             }),
@@ -72,6 +86,13 @@ mod tests {
                 sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
                 sandbox_expires_at: 0,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
+                ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             gateway_id: "gateway".to_string(),
             verification_keys: Vec::new(),
@@ -96,6 +117,84 @@ mod tests {
             .prepare(&mut sb.clone(), &mut authentication())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepare_for_different_sandboxes_does_not_wait() {
+        let identities = fixture().await;
+        let other = named_sandbox("sandbox-b", "other-name");
+        identities.store.put_message(&other).await.unwrap();
+        let (entered, release) = identities.credentials.gate_next_store();
+        let spawn_prepare = |id: &'static str| {
+            let identities = identities.clone();
+            tokio::spawn(async move {
+                let mut sb = sandbox(id);
+                identities
+                    .prepare(&mut sb, &mut authentication())
+                    .await
+                    .map(|()| sb)
+            })
+        };
+        let gated = spawn_prepare("sandbox-a");
+        entered.await.unwrap();
+
+        let mut other = other;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            identities.prepare(&mut other, &mut authentication()),
+        )
+        .await
+        .expect("another sandbox's SSH identity must not wait for sandbox-a's")
+        .unwrap();
+        let same = spawn_prepare("sandbox-a");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !same.is_finished(),
+            "the same sandbox's SSH identity still waits"
+        );
+
+        release.send(()).unwrap();
+        let first = gated.await.unwrap().unwrap();
+        let second = same.await.unwrap().unwrap();
+        assert_eq!(first.host_key_fingerprint, second.host_key_fingerprint);
+        assert_ne!(first.host_key_fingerprint, other.host_key_fingerprint);
+
+        // The next step prunes every finished sandbox's entry, keeping only
+        // its own until the step after it.
+        identities
+            .prepare(&mut sandbox("sandbox-a"), &mut authentication())
+            .await
+            .unwrap();
+        assert_eq!(identities.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_for_another_sandbox_does_not_wait_for_prepare() {
+        let identities = fixture().await;
+        let mut other = named_sandbox("sandbox-b", "other-name");
+        identities.store.put_message(&other).await.unwrap();
+        identities
+            .prepare(&mut other, &mut authentication())
+            .await
+            .unwrap();
+        let (entered, release) = identities.credentials.gate_next_store();
+        let preparing = identities.clone();
+        let gated = tokio::spawn(async move {
+            preparing
+                .prepare(&mut sandbox("sandbox-a"), &mut authentication())
+                .await
+        });
+        entered.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), identities.delete(&other))
+            .await
+            .expect("deleting another sandbox's SSH identity must not wait for sandbox-a's")
+            .unwrap();
+        assert!(identities.load(&other).await.unwrap().is_none());
+
+        release.send(()).unwrap();
+        gated.await.unwrap().unwrap();
+        assert_eq!(identities.credentials.stored_credential_count(), Some(1));
     }
 
     #[tokio::test]
@@ -287,6 +386,89 @@ mod tests {
         assert_eq!(fingerprint, sb.host_key_fingerprint);
         next.delete(&sb).await.unwrap();
     }
+
+    /// Fail the next identity lock acquisition with `error`.
+    fn fail_next_lock(identities: &SshIdentityStore, error: PersistenceError) {
+        *identities
+            .lock_failure
+            .lock()
+            .expect("forced SSH identity lock failure lock poisoned") = Some(error);
+    }
+
+    fn assert_mutation_lock_timeout(status: &Status) {
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        let details = openshell_core::rpc_error::decode_details(status)
+            .expect("a lost lock budget keeps its error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            openshell_core::rpc_error::MUTATION_LOCK_TIMEOUT
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_reports_a_lost_lock_budget_as_retryable() {
+        let identities = fixture().await;
+        fail_next_lock(
+            &identities,
+            PersistenceError::LockTimeout("lock timeout".into()),
+        );
+        let mut sb = sandbox("sandbox-a");
+        let error = identities
+            .prepare(&mut sb, &mut authentication())
+            .await
+            .expect_err("a lost identity lock fails the step");
+        assert_mutation_lock_timeout(&error);
+    }
+
+    #[tokio::test]
+    async fn delete_reports_a_lost_lock_budget_as_retryable() {
+        let identities = fixture().await;
+        let mut sb = sandbox("sandbox-a");
+        identities
+            .prepare(&mut sb, &mut authentication())
+            .await
+            .unwrap();
+        fail_next_lock(
+            &identities,
+            PersistenceError::LockTimeout("lock timeout".into()),
+        );
+        let error = identities
+            .delete(&sb)
+            .await
+            .expect_err("a lost identity lock fails the step");
+        assert_mutation_lock_timeout(&error);
+    }
+
+    #[tokio::test]
+    async fn other_identity_lock_failures_stay_bare_unavailable() {
+        let identities = fixture().await;
+        fail_next_lock(&identities, PersistenceError::Database("gone".into()));
+        let error = identities
+            .delete(&sandbox("sandbox-a"))
+            .await
+            .expect_err("an unavailable database fails the step");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "lock sandbox SSH identity failed");
+        assert!(openshell_core::rpc_error::decode_details(&error).is_none());
+    }
+
+    #[test]
+    fn identity_lock_timeouts_count_in_the_mutation_lock_metric() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let series = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+
+        let _ = identity_lock_status(PersistenceError::LockTimeout("lock timeout".into()));
+
+        assert_eq!(
+            metrics.value(series),
+            Some(1),
+            "a retryable identity lock timeout must count like every other producer"
+        );
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -296,18 +478,86 @@ struct StoredIdentity {
     credential_handle: Vec<u8>,
 }
 
+/// Map an identity lock failure to the status the client sees.
+///
+/// A lost mutation lock budget means the guarded writes never ran, so it is
+/// the one failure a client may retry; every other persistence failure keeps
+/// the bare `UNAVAILABLE` this step has always returned. The timeout counts in
+/// `openshell_server_mutation_lock_timeouts_total` like every other producer of
+/// `MUTATION_LOCK_TIMEOUT`, because clients retry on it.
+fn identity_lock_status(error: PersistenceError) -> Status {
+    if matches!(error, PersistenceError::LockTimeout(_)) {
+        gateway_metrics::record_lock_timeout(LockScope::Sandbox);
+        crate::grpc::persistence_error_to_status(error, "lock sandbox SSH identity")
+    } else {
+        Status::unavailable("lock sandbox SSH identity failed")
+    }
+}
+
 impl SshIdentityStore {
     pub(crate) fn new(store: Arc<Store>, credentials: CredentialRuntime) -> Self {
         Self {
             store,
             credentials,
-            mutation: Arc::new(Mutex::new(())),
+            mutations: Arc::default(),
+            #[cfg(test)]
+            lock_failure: Arc::default(),
         }
     }
 
+    /// Acquire the durable per-sandbox identity lock.
+    ///
+    /// A lost mutation lock budget is the one failure a client may retry: the
+    /// guarded writes never ran, so the status carries the shared
+    /// `MUTATION_LOCK_TIMEOUT` reason and delay. Every other persistence
+    /// failure keeps the bare `UNAVAILABLE` this step has always returned.
+    async fn lock_identity(&self, sandbox_id: &str) -> Result<SshIdentityMutationGuard, Status> {
+        #[cfg(test)]
+        let forced_error = self
+            .lock_failure
+            .lock()
+            .expect("forced SSH identity lock failure lock poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(error) = forced_error {
+            return Err(identity_lock_status(error));
+        }
+        self.store
+            .acquire_ssh_identity_mutation_guard(sandbox_id)
+            .await
+            .map_err(identity_lock_status)
+    }
+
+    /// The local mutex of one sandbox's SSH identity. Pruning dead entries on
+    /// every call keeps the map bounded by the sandboxes in use.
+    fn mutation_for(&self, sandbox_id: &str) -> Arc<Mutex<()>> {
+        let mut mutations = self
+            .mutations
+            .lock()
+            .expect("sandbox SSH identity mutex registry lock poisoned");
+        mutations.retain(|_, mutation| mutation.strong_count() > 0);
+
+        if let Some(mutation) = mutations.get(sandbox_id).and_then(Weak::upgrade) {
+            return mutation;
+        }
+
+        let mutation = Arc::new(Mutex::new(()));
+        mutations.insert(sandbox_id.to_string(), Arc::downgrade(&mutation));
+        mutation
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.mutations
+            .lock()
+            .expect("sandbox SSH identity mutex registry lock poisoned")
+            .len()
+    }
+
     /// Keep credential staging and publication alive if the calling RPC is
-    /// cancelled. The independent identity lock fences parent deletion on
-    /// every replica without nesting the creation cross-object lock.
+    /// cancelled. The independent per-sandbox identity lock fences parent
+    /// deletion on every replica without nesting the creation mutation guard,
+    /// and steps for other sandboxes don't wait on it.
     pub(crate) async fn prepare(
         &self,
         sandbox: &mut Sandbox,
@@ -316,12 +566,8 @@ impl SshIdentityStore {
         let identities = self.clone();
         let id = sandbox.object_id().to_string();
         let (updated, private_key) = tokio::spawn(async move {
-            let _local = identities.mutation.clone().lock_owned().await;
-            let _distributed = identities
-                .store
-                .acquire_ssh_identity_mutation_guard()
-                .await
-                .map_err(|_| Status::unavailable("lock sandbox SSH identity failed"))?;
+            let _local = identities.mutation_for(&id).lock_owned().await;
+            let _distributed = identities.lock_identity(&id).await?;
             let mut current = identities
                 .store
                 .get_message::<Sandbox>(&id)
@@ -354,13 +600,13 @@ impl SshIdentityStore {
         }
         let handle = CredentialHandle::decode(identity.credential_handle.as_slice())
             .map_err(|_| Status::internal("invalid SSH identity credential handle"))?;
-        let provider = Self::owner(
-            sandbox,
-            HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
-        );
         let mut resolved = self
             .credentials
-            .resolve_provider_handles(&provider, 0)
+            .resolve_secrets(
+                Self::owner(sandbox),
+                &HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
+                0,
+            )
             .await?;
         let private_key = resolved
             .values
@@ -390,17 +636,8 @@ impl SshIdentityStore {
         format!("sandbox-ssh:{}", sandbox.object_id())
     }
 
-    fn owner(sandbox: &Sandbox, handles: HashMap<String, CredentialHandle>) -> Provider {
-        Provider {
-            metadata: Some(ObjectMeta {
-                id: sandbox.object_id().to_string(),
-                name: format!("sandbox-ssh-{}", sandbox.object_id()),
-                workspace: sandbox.object_workspace().to_string(),
-                ..Default::default()
-            }),
-            credential_handles: handles,
-            ..Default::default()
-        }
+    fn owner(sandbox: &Sandbox) -> SecretOwner<'_> {
+        SecretOwner::sandbox(sandbox.object_workspace(), sandbox.object_id())
     }
 
     async fn load(&self, sandbox: &Sandbox) -> Result<Option<StoredIdentity>, Status> {
@@ -429,16 +666,14 @@ impl SshIdentityStore {
         let private_key = key
             .to_openssh(russh::keys::ssh_key::LineEnding::default())
             .map_err(|_| Status::internal("encode sandbox SSH host key failed"))?;
-        let owner = Self::owner(sandbox, HashMap::new());
+        let owner = Self::owner(sandbox);
         // A distinct candidate path is essential for K8s/Vault: losing a CAS
         // must never overwrite or delete the winning candidate's credential.
         let candidate_id = uuid::Uuid::new_v4().to_string();
         let handles = self
             .credentials
-            .store_provider_credentials_with_object_id(
-                owner.object_name(),
-                sandbox.object_workspace(),
-                sandbox.object_id(),
+            .store_secrets_with_object_id(
+                owner,
                 &candidate_id,
                 &HashMap::from([(CREDENTIAL_KEY.to_string(), private_key.to_string())]),
                 &HashMap::new(),
@@ -469,14 +704,7 @@ impl SshIdentityStore {
             .await
             .is_err()
         {
-            self.credentials
-                .delete_provider_credential_handles(
-                    owner.object_name(),
-                    sandbox.object_workspace(),
-                    sandbox.object_id(),
-                    &handles,
-                )
-                .await?;
+            self.credentials.delete_secrets(owner, &handles).await?;
             return Err(Status::unavailable("stage sandbox SSH identity failed"));
         }
         match self
@@ -502,14 +730,7 @@ impl SshIdentityStore {
                 Ok(identity)
             }
             Err(error) => {
-                self.credentials
-                    .delete_provider_credential_handles(
-                        owner.object_name(),
-                        sandbox.object_workspace(),
-                        sandbox.object_id(),
-                        &handles,
-                    )
-                    .await?;
+                self.credentials.delete_secrets(owner, &handles).await?;
                 self.store
                     .delete(CANDIDATE_TYPE, &candidate_id)
                     .await
@@ -528,17 +749,17 @@ impl SshIdentityStore {
     }
 
     /// Credential deletion precedes row deletion so failure retains ownership
-    /// and can be retried by the normal sandbox deletion controller.
+    /// and can be retried by the normal sandbox deletion controller. It takes
+    /// the same per-sandbox identity lock as [`Self::prepare`].
     pub(crate) async fn delete(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let identities = self.clone();
         let sandbox = sandbox.clone();
         tokio::spawn(async move {
-            let _local = identities.mutation.clone().lock_owned().await;
-            let _distributed = identities
-                .store
-                .acquire_ssh_identity_mutation_guard()
-                .await
-                .map_err(|_| Status::unavailable("lock sandbox SSH identity failed"))?;
+            let _local = identities
+                .mutation_for(sandbox.object_id())
+                .lock_owned()
+                .await;
+            let _distributed = identities.lock_identity(sandbox.object_id()).await?;
             identities.delete_locked(&sandbox).await
         })
         .await
@@ -585,12 +806,9 @@ impl SshIdentityStore {
     ) -> Result<(), Status> {
         let handle = CredentialHandle::decode(identity.credential_handle.as_slice())
             .map_err(|_| Status::internal("invalid SSH identity credential handle"))?;
-        let owner = Self::owner(sandbox, HashMap::new());
         self.credentials
-            .delete_provider_credential_handles(
-                owner.object_name(),
-                sandbox.object_workspace(),
-                sandbox.object_id(),
+            .delete_secrets(
+                Self::owner(sandbox),
                 &HashMap::from([(CREDENTIAL_KEY.to_string(), handle)]),
             )
             .await?;

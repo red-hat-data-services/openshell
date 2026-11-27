@@ -43,10 +43,15 @@ pub struct PodmanComputeConfig {
     /// When empty, the driver selects loopback on Linux or
     /// `host.containers.internal` with Podman Machine, using `gateway_port`.
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     /// Port the gateway server is actually listening on.
     ///
     /// Used by the driver's auto-detection fallback when `grpc_endpoint`
@@ -178,6 +183,39 @@ pub struct PodmanComputeConfig {
     /// and upstream verification. Only meaningful with `https_proxy` set; the
     /// bundle must exist and contain at least one certificate.
     pub proxy_ca_bundle: Option<String>,
+    /// Path (on the gateway host) to a PEM CA bundle trusted for direct
+    /// (non-proxied), policy-inspected HTTPS egress to destinations signed by
+    /// a private CA.
+    ///
+    /// Unlike [`proxy_ca_bundle`](Self::proxy_ca_bundle), this applies
+    /// regardless of whether `https_proxy` is configured: it addresses
+    /// supervisors that run as their own container, separate from the
+    /// workload image, and therefore cannot inherit a private CA baked into
+    /// the workload's system trust store. The gateway bind-mounts this file
+    /// read-only into the supervisor container (at
+    /// [`ADDITIONAL_CA_MOUNT_PATH`](openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH))
+    /// and passes its path via `--additional-ca-bundle`. The supervisor folds
+    /// it into its upstream TLS trust store alongside (not instead of) the
+    /// system CA bundle. The bundle must exist and contain at least one
+    /// certificate; this is validated on the gateway host at sandbox-create
+    /// time, not deferred until the supervisor container starts.
+    ///
+    /// Populated only from the `--sandbox-additional-ca-bundle` CLI argument
+    /// (or `OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE`) for standalone drivers.
+    /// Deliberately excluded from driver JSON config (`#[serde(skip)]` +
+    /// `deny_unknown_fields`): gateway-managed deployments must use the
+    /// global `[openshell.supervisor.network]` setting so every driver
+    /// receives the same staged bundle, and a per-driver path in operator
+    /// JSON is rejected instead of silently diverging from it.
+    #[serde(skip)]
+    pub additional_ca_bundle: Option<String>,
+    /// AAAA handling for the supervisor's mediated policy DNS (`auto`,
+    /// `enabled` or `disabled`). Unset means the supervisor default, `auto`.
+    pub policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) of the sandbox network. The supervisor
+    /// classifies addresses inside them by their embedded IPv4 address.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
     pub userns: Option<String>,
@@ -237,6 +275,9 @@ impl PodmanComputeConfig {
         self.validate_runtime_limits()?;
         self.validate_host_gateway_ip()?;
         self.validate_proxy_config()?;
+        self.ipv6_egress_config()
+            .validate()
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         self.validate_app_armor_profile()?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             let raw = socket.to_str().ok_or_else(|| {
@@ -253,6 +294,15 @@ impl PodmanComputeConfig {
         }
         self.canonicalize_userns()?;
         self.validate_userns_mappings()
+    }
+
+    /// Supervisor IPv6 egress settings in their shared form.
+    #[must_use]
+    pub fn ipv6_egress_config(&self) -> openshell_core::SupervisorIpv6EgressConfig {
+        openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
+        }
     }
 
     /// Returns `true` when the gateway CA is configured.
@@ -331,6 +381,21 @@ impl PodmanComputeConfig {
                     "proxy_ca_bundle is set but no https_proxy is configured".to_string(),
                 ));
             }
+        }
+        // additional_ca_bundle is independent of the corporate proxy setting
+        // above: it applies to direct, inspected egress and has no
+        // https_proxy dependency. Read and validate the actual host file
+        // here (this path is not yet mounted into any container), rather
+        // than only checking it is non-empty: an operator with a mistyped
+        // path or a certificate-free bundle should see a config-validation
+        // error when the driver starts, not a failed/crash-looping sandbox
+        // once the supervisor container starts and tries to read it.
+        if let Some(path) = self.additional_ca_bundle.as_deref() {
+            openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+                path,
+                "additional_ca_bundle",
+            )
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         }
         Ok(())
     }
@@ -497,7 +562,8 @@ impl Default for PodmanComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
+            supervisor_gateway_name: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
@@ -519,6 +585,9 @@ impl Default for PodmanComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            additional_ca_bundle: None,
+            policy_dns_ipv6_egress: None,
+            nat64_prefixes: Vec::new(),
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
@@ -561,6 +630,8 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
             .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field("policy_dns_ipv6_egress", &self.policy_dns_ipv6_egress)
+            .field("nat64_prefixes", &self.nat64_prefixes)
             .field("userns", &self.userns)
             .field("uidmap", &self.uidmap)
             .field("gidmap", &self.gidmap)
@@ -603,6 +674,15 @@ mod tests {
         }))
         .expect_err("legacy sandbox_ssh_socket_path must be rejected");
         assert!(error.to_string().contains("sandbox_ssh_socket_path"));
+    }
+
+    #[test]
+    fn config_rejects_driver_specific_destination_ca_setting() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "additional_ca_bundle": ["/operator/ca.crt"]
+        }))
+        .expect_err("destination trust is global, not a Podman driver setting");
+        assert!(error.to_string().contains("additional_ca_bundle"));
     }
 
     #[test]
@@ -833,6 +913,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_configuration_accepts_additional_ca_bundle_without_proxy() {
+        // #3781: unlike proxy_ca_bundle, this must work with no corporate
+        // proxy configured at all.
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        std::fs::write(&ca_path, generate_test_ca_pem()).unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+        assert!(cfg.https_proxy.is_none());
+    }
+
+    #[test]
+    fn validate_configuration_rejects_empty_additional_ca_bundle() {
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_nonexistent_additional_ca_bundle() {
+        // #3781 fix requirement: an operator with a mistyped path must see
+        // this at config-validation time, not a failed sandbox later.
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("/nonexistent/additional-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_certificate_free_additional_ca_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("not-a-cert.pem");
+        std::fs::write(&ca_path, "not a certificate\n").unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    /// Generate a real, valid self-signed CA certificate PEM for tests.
+    fn generate_test_ca_pem() -> String {
+        let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
+        let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        openshell_crypto::pki::self_signed(params, &key_pair)
+            .unwrap()
+            .pem()
+    }
+
+    #[test]
     fn validate_proxy_config_rejects_url_components() {
         for url in [
             "http://proxy.corp.com:8080/path",
@@ -1002,6 +1143,22 @@ mod tests {
                 "{allow:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_configuration_checks_nat64_prefixes() {
+        let mut config: PodmanComputeConfig = serde_json::from_str(
+            r#"{"policy_dns_ipv6_egress":"enabled","nat64_prefixes":["2001:db8:64::/96"]}"#,
+        )
+        .expect("podman config parses");
+        assert_eq!(
+            config.policy_dns_ipv6_egress,
+            Some(openshell_core::PolicyDnsIpv6Egress::Enabled)
+        );
+        config.validate_configuration().unwrap();
+
+        config.nat64_prefixes = vec!["10.0.0.0/8".to_string()];
+        assert!(config.validate_configuration().is_err());
     }
 
     #[test]

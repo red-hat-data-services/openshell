@@ -3,17 +3,19 @@
 
 //! Runtime-owned policy DNS listeners for combined Linux supervisors.
 
-use crate::opa::OpaEngine;
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
 use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_engine::PolicyEngine;
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_isolation_interface::contract::{
-    DnsTransport, NetworkMediationSource, PendingDnsQuery,
-};
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +30,7 @@ const MEDIATION_ACCEPT_WINDOW: usize = 32;
 const MEDIATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MEDIATION_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn accept_mediated_dns(source: Arc<dyn NetworkMediationSource>) -> PendingDnsQuery {
+async fn accept_mediated_dns(source: Arc<NetworkMediationSource>) -> PendingDnsQuery {
     let mut delay = MEDIATION_RETRY_DELAY;
     loop {
         match source.accept_dns().await {
@@ -47,6 +49,8 @@ pub(crate) struct PolicyDnsRuntimeConfig {
     pub(crate) ipv4_cidr: ipnet::Ipv4Net,
     pub(crate) ipv6_cidr: ipnet::Ipv6Net,
     pools: SyntheticPools,
+    ipv6_egress: bool,
+    trusted_resolver: Option<SocketAddr>,
 }
 
 impl PolicyDnsRuntimeConfig {
@@ -80,12 +84,34 @@ impl PolicyDnsRuntimeConfig {
             ipv4_cidr,
             ipv6_cidr,
             pools,
+            ipv6_egress: false,
+            trusted_resolver: None,
         })
+    }
+
+    /// Answer AAAA queries from the synthetic IPv6 pool instead of returning
+    /// NOERROR/NODATA.
+    #[must_use]
+    pub(crate) fn with_ipv6_egress(mut self, enabled: bool) -> Self {
+        self.ipv6_egress = enabled;
+        self
+    }
+
+    /// Use `server` instead of the first `/etc/resolv.conf` nameserver.
+    #[cfg(test)]
+    pub(crate) fn with_trusted_resolver(mut self, server: SocketAddr) -> Self {
+        self.trusted_resolver = Some(server);
+        self
+    }
+
+    fn upstream(&self) -> Result<SocketAddr> {
+        self.trusted_resolver
+            .map_or_else(trusted_resolver_from_resolv_conf, Ok)
     }
 }
 
 pub(crate) struct PolicyDnsRuntime {
-    pub(crate) store: Arc<ResolvedEndpointStore>,
+    pub(crate) service: Arc<PolicyDnsService>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -93,13 +119,14 @@ impl PolicyDnsRuntime {
     /// Start policy DNS over an isolation-backend exchange source. No UDP or
     /// TCP listener is bound in the supervisor namespace.
     pub(crate) fn start_mediated(
-        policy: Arc<OpaEngine>,
-        source: Arc<dyn NetworkMediationSource>,
+        policy: PolicyEngine,
+        source: Arc<NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let upstream = config.upstream()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -110,6 +137,7 @@ impl PolicyDnsRuntime {
             store.clone(),
             trusted_host_gateway,
         ));
+        let dns_service = service.clone();
         let task = tokio::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -125,15 +153,17 @@ impl PolicyDnsRuntime {
                 };
                 let source = source.clone();
                 accepts.push(accept_mediated_dns(source).boxed());
-                let service = service.clone();
+                let service = dns_service.clone();
                 tokio::spawn(async move {
                     let timing = query.timing.clone();
                     let response = match query.transport {
                         DnsTransport::Udp => {
-                            wire::handle_udp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_udp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                         DnsTransport::Tcp => {
-                            wire::handle_tcp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                     }
                     .map_err(|error| {
@@ -159,7 +189,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -167,29 +197,34 @@ impl PolicyDnsRuntime {
                 let _ = expiry_store.expire(std::time::Instant::now());
             }
         });
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
-                .message("Policy DNS connected to isolation boundary")
+                .unmapped("ipv6_egress", ipv6_egress)
+                .message(format!(
+                    "Policy DNS connected to isolation boundary (IPv6 egress {})",
+                    if ipv6_egress { "enabled" } else { "disabled" }
+                ))
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![task, expiry_task],
         })
     }
 
     pub(crate) fn start(
-        policy: Arc<OpaEngine>,
+        policy: PolicyEngine,
         udp: tokio::net::UdpSocket,
         tcp: tokio::net::TcpListener,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let upstream = config.upstream()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -223,11 +258,10 @@ impl PolicyDnsRuntime {
                 let udp = udp.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    // Docker and Podman do not currently prove usable IPv6
-                    // egress. Return NOERROR/NODATA for AAAA so dual-stack
-                    // clients can fall back to the usable IPv4 path.
+                    // Without IPv6 egress, AAAA receives NOERROR/NODATA so
+                    // dual-stack clients fall back to the usable IPv4 path.
                     if let Ok(response) =
-                        wire::handle_udp_query_with_ipv6(&service, &request, false).await
+                        wire::handle_udp_query_with_ipv6(&service, &request, ipv6_egress).await
                     {
                         let _ = udp.send_to(&response, peer).await;
                     }
@@ -236,6 +270,7 @@ impl PolicyDnsRuntime {
         });
 
         let mut tcp_engine_ready = engine_ready;
+        let tcp_service = service.clone();
         let tcp_task = tokio::spawn(async move {
             if tcp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
@@ -245,7 +280,7 @@ impl PolicyDnsRuntime {
                     break;
                 };
                 set_tcp_nodelay_best_effort(&stream);
-                let service = service.clone();
+                let service = tcp_service.clone();
                 tokio::spawn(async move {
                     // DNS-over-TCP connections may carry multiple sequential
                     // length-prefixed messages. libc commonly reuses one
@@ -262,7 +297,7 @@ impl PolicyDnsRuntime {
                             return;
                         }
                         let Ok(response) =
-                            wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &frame, ipv6_egress).await
                         else {
                             return;
                         };
@@ -273,7 +308,7 @@ impl PolicyDnsRuntime {
                 });
             }
         });
-        let expiry_store = store.clone();
+        let expiry_store = store;
         let expiry_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -282,16 +317,17 @@ impl PolicyDnsRuntime {
             }
         });
 
-        ocsf_emit!(
+        crate::telemetry::egress_emit!(
             ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
+                .unmapped("ipv6_egress", ipv6_egress)
                 .message(format!("Policy DNS listening on {address}"))
                 .build()
         );
         Ok(Self {
-            store,
+            service,
             tasks: vec![udp_task, tcp_task, expiry_task],
         })
     }
@@ -305,7 +341,7 @@ impl Drop for PolicyDnsRuntime {
     }
 }
 
-fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
+pub(crate) fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf")
         .into_diagnostic()
         .wrap_err("failed to read trusted supervisor resolver configuration")?;
@@ -331,7 +367,7 @@ fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn mediated_dns_accept_retries_errors_with_backoff() {
         use openshell_isolation_interface::contract::{
             BackendError, MediationTiming, ResolveError,
@@ -341,7 +377,7 @@ mod tests {
         struct RecoveringSource(AtomicUsize);
 
         #[async_trait::async_trait]
-        impl NetworkMediationSource for RecoveringSource {
+        impl rpc_test::NetworkMediationSource for RecoveringSource {
             async fn accept_tcp(
                 &self,
             ) -> std::result::Result<
@@ -370,13 +406,19 @@ mod tests {
 
         let source = Arc::new(RecoveringSource(AtomicUsize::new(0)));
         let start = tokio::time::Instant::now();
-        let query = accept_mediated_dns(source.clone()).await;
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accept_mediated_dns(rpc_test::network(source.clone())),
+        )
+        .await
+        .expect("RPC DNS source did not recover");
         assert_eq!(query.message, b"recovered query");
-        assert_eq!(source.0.load(Ordering::Acquire), 3);
+        // The RPC mediation stream may prefetch additional bounded queries.
+        assert!(source.0.load(Ordering::Acquire) >= 3);
         assert!(start.elapsed() >= MEDIATION_RETRY_DELAY * 3);
         // The same source remains usable when the accept window replenishes.
         assert_eq!(
-            accept_mediated_dns(source).await.message,
+            accept_mediated_dns(rpc_test::network(source)).await.message,
             b"recovered query"
         );
     }
@@ -403,6 +445,13 @@ mod tests {
         for address in [first.ipv4_cidr.network(), second.ipv4_cidr.broadcast()] {
             assert!(parent.contains(&address));
         }
+    }
+
+    #[test]
+    fn runtime_config_keeps_ipv6_egress_disabled_by_default() {
+        let config = PolicyDnsRuntimeConfig::for_epoch(3).unwrap();
+        assert!(!config.ipv6_egress);
+        assert!(config.with_ipv6_egress(true).ipv6_egress);
     }
 
     #[test]

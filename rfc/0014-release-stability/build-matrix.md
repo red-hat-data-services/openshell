@@ -2,7 +2,7 @@
 
 This supplement defines the build targets for the release system described by
 RFC 0014. The targets follow the structure of the
-[proposed support matrix](https://github.com/NVIDIA/OpenShell/blob/d575cf85f8c520774cc3e307ec1bcdabf57cd682/docs/reference/support-matrix.mdx)
+[proposed support matrix](https://github.com/ai-openshell/openshell/blob/d575cf85f8c520774cc3e307ec1bcdabf57cd682/docs/reference/support-matrix.mdx)
 and describe the intended final state.
 
 These tables enumerate build and capability targets. They do not imply that
@@ -21,7 +21,7 @@ of release jobs.
 | Platform | Installation methods | Requirements |
 | --- | --- | --- |
 | macOS (Apple Silicon) | Homebrew | macOS 13.3 or later |
-| Linux (x86_64, arm64) | APT/DEB, RPM, Snap | glibc 2.28 or later |
+| Linux (x86_64, arm64) | APT/DEB, RPM, snap | glibc 2.28 or later |
 | Windows (x86_64, arm64) | MSI, WinGet | Documented minimum Windows version and MSVC toolchain |
 
 Package installers include the CLI, TUI, gateway, and supported local drivers.

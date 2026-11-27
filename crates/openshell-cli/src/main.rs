@@ -5,12 +5,11 @@
 
 #![forbid(unsafe_code)]
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use openshell_cli::color::{self, ColorChoice, Colorize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -21,7 +20,9 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
+use openshell_core::proto::{
+    GpuResourceRequirements, ServiceAuthorizationMode, ServiceBackendHttpVersion,
+};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -46,19 +47,25 @@ impl From<GpuCliRequest> for GpuResourceRequirements {
     }
 }
 
-/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
-///
-/// Resolution priority:
-/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
-/// 2. `--gateway` flag (explicit name)
-/// 3. `OPENSHELL_GATEWAY` environment variable
-/// 4. Active gateway from `~/.config/openshell/active_gateway`
-///
-/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
-/// If stored metadata can still identify the gateway, the stored gateway name
-/// is preserved so auth and TLS materials continue to resolve correctly.
-fn normalize_gateway_endpoint(endpoint: &str) -> &str {
-    endpoint.trim_end_matches('/')
+fn normalize_gateway_endpoint(endpoint: &str) -> String {
+    let endpoint = if endpoint.contains(['?', '#']) {
+        endpoint
+    } else {
+        endpoint.trim_end_matches('/')
+    };
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_owned();
+    };
+    let (authority, route) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+    let (userinfo, host_port) = authority.split_at(authority.rfind('@').map_or(0, |i| i + 1));
+    if host_port.starts_with('[') {
+        return endpoint.to_owned();
+    }
+    let (host, port) = host_port.split_at(host_port.find(':').unwrap_or(host_port.len()));
+    format!(
+        "{scheme}://{userinfo}{}{port}{route}",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
@@ -77,18 +84,33 @@ fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
     })
 }
 
+/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
+///
+/// Resolution priority:
+/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
+/// 2. `--gateway` flag (explicit name)
+/// 3. `OPENSHELL_GATEWAY` environment variable
+/// 4. Active gateway from `~/.config/openshell/active_gateway`
+///
+/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
+/// If stored metadata can still identify the gateway, the stored gateway name
+/// is preserved so auth and TLS materials continue to resolve correctly.
 fn resolve_gateway(
     gateway_flag: &Option<String>,
     gateway_endpoint: &Option<String>,
+    allow_endpoint_override: bool,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
-        // When a gateway name is explicitly provided (via flag or env var),
-        // trust it directly — don't require metadata to exist yet. This
-        // avoids a race condition where mTLS certs are stored under the
-        // real gateway name but the CLI falls back to using the raw
-        // endpoint URL (producing a mangled path like `https___...`).
         let name = gateway_flag
-            .clone()
+            .as_ref()
+            .filter(|name| {
+                allow_endpoint_override
+                    || get_gateway_metadata(name).is_some_and(|metadata| {
+                        normalize_gateway_endpoint(&metadata.gateway_endpoint)
+                            == normalize_gateway_endpoint(endpoint)
+                    })
+            })
+            .cloned()
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -194,8 +216,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
@@ -409,6 +432,15 @@ const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell workspace delete staging
 ";
 
+const SECRET_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell secret create acme-oauth-client --value-env CLIENT_SECRET \\
+      --allowed-endpoint https://login.example.com/oauth/token
+  $ openshell secret create signing-key --value-file ./signing-key.pem
+  $ openshell secret update acme-oauth-client --value-file ./client-secret
+  $ openshell secret list
+  $ openshell secret delete acme-oauth-client
+";
+
 const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
@@ -505,6 +537,8 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Sandbox` embeds `SandboxCommands`, which is intentionally large.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -601,6 +635,13 @@ enum Commands {
         command: Option<WorkspaceCommands>,
     },
 
+    /// Manage workspace secrets used as shared credential minting material.
+    #[command(after_help = SECRET_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Secret {
+        #[command(subcommand)]
+        command: Option<SecretCommands>,
+    },
+
     // ===================================================================
     // GATEWAY COMMANDS
     // ===================================================================
@@ -657,41 +698,30 @@ enum Commands {
         shell: CompletionShell,
     },
 
-    /// SSH proxy (used by `ProxyCommand`).
-    ///
-    /// Two mutually exclusive modes:
-    ///
-    /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
-    ///
-    /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
+    /// Mint an SSH session and relay SSH over the selected gateway.
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
-        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
-        /// Required in token mode. In name mode, can be a gateway name.
-        #[arg(long, short = 'g')]
-        gateway: Option<String>,
-
-        /// Sandbox name. Required in token mode.
-        #[arg(long)]
-        sandbox: Option<String>,
-
-        /// SSH session token. Required in token mode.
-        #[arg(long)]
-        token: Option<String>,
-
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        /// Gateway endpoint override.
         #[arg(long)]
         server: Option<String>,
 
-        /// Gateway name. Used with --name to resolve gateway from metadata.
+        /// One-use local relay grant prepared by the parent.
+        #[arg(long, conflicts_with_all = ["server", "gateway_name"])]
+        handoff: Option<String>,
+
+        /// Registered gateway to use for credentials and endpoint discovery.
         #[arg(long)]
         gateway_name: Option<String>,
 
-        /// Sandbox name. Used in name mode.
-        #[arg(long)]
-        name: Option<String>,
+        /// Sandbox to connect to.
+        #[arg(long, alias = "sandbox")]
+        name: String,
+
+        /// Known-hosts file of a saved SSH profile, in which the verified host
+        /// key is pinned for `ssh`. Without it the host key is not verified,
+        /// and the connection is refused by default.
+        #[arg(long, conflicts_with = "handoff")]
+        known_hosts: Option<PathBuf>,
     },
 }
 
@@ -788,12 +818,31 @@ impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceBackendHttpVersion {
+    #[default]
+    #[value(name = "1.1")]
+    Http1,
+    #[value(name = "2")]
+    Http2,
+}
+
+impl From<CliServiceBackendHttpVersion> for ServiceBackendHttpVersion {
+    fn from(value: CliServiceBackendHttpVersion) -> Self {
+        match value {
+            CliServiceBackendHttpVersion::Http1 => Self::Http1,
+            CliServiceBackendHttpVersion::Http2 => Self::Http2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
     AwsStsAssumeRole,
+    GithubAppInstallation,
 }
 
 impl CliProviderRefreshStrategy {
@@ -803,6 +852,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
             Self::AwsStsAssumeRole => "aws_sts_assume_role",
+            Self::GithubAppInstallation => "github_app_installation",
         }
     }
 }
@@ -859,6 +909,10 @@ enum ProviderCommands {
         /// Provider type.
         #[arg(long = "type")]
         provider_type: String,
+
+        /// Labels to attach to the provider (KEY=VALUE, repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
 
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
@@ -918,6 +972,10 @@ enum ProviderCommands {
         /// Opaque continuation token from a previous page.
         #[arg(long, default_value = "")]
         page_token: String,
+
+        /// Filter providers by labels (e.g. env=dev,team=ml).
+        #[arg(long)]
+        label_selector: Option<String>,
 
         /// Print only provider names, one per line.
         #[arg(long, conflicts_with = "output")]
@@ -1034,6 +1092,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
 
+        /// Secret refresh material supplied by a workspace secret
+        /// (`KEY=SECRET`); `KEY` is auto-marked secret.
+        #[arg(long = "material-secret", value_name = "KEY=SECRET")]
+        material_secrets: Vec<String>,
+
         /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
         #[arg(
             long = "credential-expires-at",
@@ -1058,6 +1121,21 @@ enum ProviderRefreshCommands {
     /// Delete refresh metadata for a provider credential.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Copy referenced workspace secrets into provider-owned refresh material.
+    ///
+    /// Keeps the current grant, including a rotated refresh token. Run it
+    /// before deleting a secret or rolling back workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    InlineSecrets {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
@@ -1444,7 +1522,7 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Create the sandbox from a named sandbox template.
-        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
         /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
@@ -1465,6 +1543,10 @@ enum SandboxCommands {
         /// Outside a Git work tree, uploads proceed unfiltered with a warning.
         /// Filtering errors or empty selections stop the upload; use
         /// `--no-git-ignore` to intentionally upload everything.
+        ///
+        /// Cannot be combined with a trailing command, because uploads finish
+        /// after the main process starts. Create the sandbox without a command,
+        /// then run the workload with `sandbox exec`.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1520,7 +1602,8 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
-        /// Path to a custom sandbox policy YAML file.
+        /// Path to a custom sandbox policy file: YAML, or Cedar with a `.cedar` extension
+        /// (Cedar requires a development build of the gateway).
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
@@ -1567,6 +1650,24 @@ enum SandboxCommands {
         )]
         restart_policy: String,
 
+        /// Seconds to wait without provisioning progress before giving up
+        /// (default: 300, or `OPENSHELL_PROVISION_TIMEOUT`).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<std::num::NonZeroU32>,
+
+        /// Seconds to keep retrying while the gateway mutation lock is busy
+        /// (default: 60, or `OPENSHELL_CREATE_RETRY_TIMEOUT`). The budget
+        /// bounds the waits between attempts; the attempt in flight when it
+        /// runs out can still wait the gateway's lock budget (10s) before the
+        /// final answer.
+        #[arg(long, value_name = "SECONDS", overrides_with = "no_create_retry")]
+        create_retry_timeout: Option<std::num::NonZeroU32>,
+
+        /// Fail immediately when the gateway mutation lock is busy instead of
+        /// retrying.
+        #[arg(long, overrides_with = "create_retry_timeout")]
+        no_create_retry: bool,
+
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -1582,11 +1683,24 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Attach non-secret annotations to the sandbox (key=value format,
+        /// repeatable). Values may contain `/`, spaces, and `=`.
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+
         /// Set a non-secret environment variable in the sandbox.
         /// Do not use this option for API keys, tokens, or other secrets; create
         /// a provider and attach it with `--provider` instead. Repeatable.
+        /// Each value is limited to 8 KiB and cannot contain a newline.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Set a sandbox environment variable from the CLI process environment.
+        ///
+        /// Format: `KEY[=ENVVAR]`. When `ENVVAR` is omitted, `KEY` is used.
+        /// The value does not appear in the CLI process arguments. Repeatable.
+        #[arg(long = "env-from", value_name = "KEY[=ENVVAR]")]
+        env_from: Vec<String>,
 
         /// Suppress warnings when --env values look like credentials.
         #[arg(long = "no-credential-warnings")]
@@ -1609,6 +1723,7 @@ enum SandboxCommands {
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
+        /// Each argument is limited to 32 KiB.
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -1620,7 +1735,7 @@ enum SandboxCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Print only the active policy YAML (same policy as the default view; stdout only).
+        /// Print only the active policy, as YAML or Cedar source (stdout only).
         #[arg(long, conflicts_with = "output")]
         policy_only: bool,
 
@@ -1684,6 +1799,25 @@ enum SandboxCommands {
     /// Start a stopped sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Suspend a ready sandbox and retain its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support
+    /// suspend and resume. Use `sandbox resume` to restore the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended sandbox from its retained memory state.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
@@ -2111,6 +2245,13 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Validate an authored policy file offline, without a gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Lint {
+        /// Path to the authored policy YAML file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        policy: String,
+    },
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -2118,7 +2259,8 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Path to the policy YAML file.
+        /// Path to the policy file: YAML, or Cedar with a `.cedar` extension.
+        /// Global policies must be YAML.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
 
@@ -2147,8 +2289,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
-        /// Options include allowed-ip=..., credential rewrite flags, and
-        /// allow-uninspected-credentials.
+        /// Options include allowed-ip=..., allow-encoded-slash, credential
+        /// rewrite flags, and allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2406,6 +2548,10 @@ enum ServiceCommands {
         /// Handling for an incoming application Authorization header.
         #[arg(long, value_enum, default_value_t)]
         authorization_mode: CliServiceAuthorizationMode,
+
+        /// HTTP version on the sandbox loopback port. HTTP/2 requires the supervisor application listener.
+        #[arg(long, value_enum, default_value_t)]
+        backend_http_version: CliServiceBackendHttpVersion,
     },
 
     /// List exposed sandbox service endpoints.
@@ -2467,6 +2613,10 @@ enum WorkspaceCommands {
         /// Labels to attach to the workspace (KEY=VALUE).
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Fetch a workspace by name.
@@ -2475,6 +2625,10 @@ enum WorkspaceCommands {
         /// Workspace name.
         #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
         name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List workspaces.
@@ -2508,6 +2662,109 @@ enum WorkspaceCommands {
     /// Manage workspace members.
     #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Member(WorkspaceMemberCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretCommands {
+    /// Create a workspace secret.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Secret name (DNS-1123 label).
+        name: String,
+
+        /// Read the value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the value from this file, stored exactly as read, including any
+        /// trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// Token endpoint provider refresh may send the value to. Repeatable;
+        /// cannot be changed after creation. Omit for a reveal-only secret.
+        #[arg(long = "allowed-endpoint", value_name = "URL")]
+        allowed_endpoints: Vec<String>,
+
+        /// Human-readable description.
+        #[arg(long, default_value = "")]
+        description: String,
+
+        /// Labels to attach to the secret (KEY=VALUE).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Replace a workspace secret's value, description, or labels.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Secret name.
+        name: String,
+
+        /// Read the new value from this local environment variable.
+        #[arg(long = "value-env", value_name = "ENVVAR")]
+        value_env: Option<String>,
+
+        /// Read the new value from this file, stored exactly as read, including
+        /// any trailing newline. Write it with `printf '%s'` to avoid one.
+        #[arg(long = "value-file", value_name = "PATH")]
+        value_file: Option<PathBuf>,
+
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replace all labels (KEY=VALUE). Repeatable.
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Option<Vec<String>>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show workspace secret metadata. The value is never shown.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Secret name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List workspace secrets.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of secrets to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Filter by label selector (e.g. "team=platform").
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete workspace secrets. Fails while a provider refresh references one.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Secret name(s) to delete.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2591,7 +2848,25 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let (cli, explicit_gateway, explicit_endpoint) = {
+        let mut args = Cli::command().get_matches();
+        let explicit_gateway =
+            args.value_source("gateway") == Some(clap::parser::ValueSource::CommandLine);
+        let explicit_endpoint =
+            args.value_source("gateway_endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        (
+            Cli::from_arg_matches_mut(&mut args).unwrap_or_else(|err| err.exit()),
+            explicit_gateway,
+            explicit_endpoint,
+        )
+    };
+    let current_gateway = || {
+        resolve_gateway(
+            &cli.gateway,
+            &cli.gateway_endpoint,
+            explicit_gateway == explicit_endpoint,
+        )
+    };
 
     // Resolve colorization before anything is printed, so no command can emit
     // escape sequences into a pipe.
@@ -2696,7 +2971,7 @@ async fn run_async() -> Result<()> {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
             GatewayCommands::Info { output } => {
-                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                if let Ok(ctx) = current_gateway() {
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
@@ -2731,7 +3006,12 @@ async fn run_async() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status { output }) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            // A gateway named on the command line must be registered.
+            let resolved = match current_gateway() {
+                Err(err) if cli.gateway.is_some() => return Err(err),
+                resolved => resolved,
+            };
+            if let Ok(ctx) = resolved {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
                 run::gateway_status(
@@ -2764,7 +3044,7 @@ async fn run_async() -> Result<()> {
         // Top-level current identity
         // -----------------------------------------------------------
         Some(Commands::Whoami { output }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
@@ -2880,7 +3160,7 @@ async fn run_async() -> Result<()> {
                 target_host,
                 local,
             } => {
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -2902,7 +3182,7 @@ async fn run_async() -> Result<()> {
                 background,
             } => {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = current_gateway()?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -2933,7 +3213,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Service {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match command {
@@ -2942,6 +3222,7 @@ async fn run_async() -> Result<()> {
                     service,
                     target_port,
                     authorization_mode,
+                    backend_http_version,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -2950,6 +3231,7 @@ async fn run_async() -> Result<()> {
                         &service,
                         target_port,
                         authorization_mode.into(),
+                        backend_http_version.into(),
                         &cli.workspace,
                         &tls,
                     )
@@ -2997,7 +3279,7 @@ async fn run_async() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3019,12 +3301,16 @@ async fn run_async() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command: Some(PolicyCommands::Lint { policy }),
+        }) => run::sandbox_policy_lint(&policy)?,
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
+                PolicyCommands::Lint { .. } => unreachable!("offline lint is dispatched above"),
                 PolicyCommands::Set {
                     name,
                     policy,
@@ -3182,7 +3468,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Settings {
             command: Some(settings_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
 
@@ -3261,7 +3547,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Rule {
             command: Some(draft_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
@@ -3358,10 +3644,15 @@ async fn run_async() -> Result<()> {
                     no_tty,
                     detach,
                     restart_policy,
+                    timeout,
+                    create_retry_timeout,
+                    no_create_retry,
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    annotations,
                     envs,
+                    env_from,
                     no_credential_warnings,
                     approval_mode,
                     output,
@@ -3385,21 +3676,26 @@ async fn run_async() -> Result<()> {
                         None // prompt or auto-detect
                     };
 
-                    // Parse --label flags into a HashMap<String, String>.
-                    let mut labels_map = HashMap::new();
-                    for label_str in &labels {
-                        let parts: Vec<&str> = label_str.splitn(2, '=').collect();
-                        if parts.len() != 2 {
-                            return Err(miette::miette!(
-                                "invalid label format '{}', expected key=value",
-                                label_str
-                            ));
-                        }
-                        labels_map.insert(parts[0].to_string(), parts[1].to_string());
-                    }
+                    // Resolve --create-retry-timeout / --no-create-retry.
+                    // A zero budget disables retries; the environment and the
+                    // 60s default are applied in `run::sandbox_create`.
+                    let create_retry_timeout_secs = if no_create_retry {
+                        Some(0)
+                    } else {
+                        create_retry_timeout.map(std::num::NonZeroU32::get)
+                    };
+
+                    // Parse --label and --annotation flags into maps.
+                    let labels_map = run::parse_key_value_pairs(&labels, "--label")?;
+                    let annotations_map = run::parse_key_value_pairs(&annotations, "--annotation")?;
 
                     // Parse --env flags into a HashMap<String, String>.
-                    let env_map = run::parse_env_pairs(&envs)?;
+                    let mut env_map = run::parse_env_pairs(&envs)?;
+                    for (key, value) in run::parse_env_from_pairs(&env_from)? {
+                        if env_map.insert(key.clone(), value).is_some() {
+                            return Err(miette::miette!("duplicate environment key '{key}'"));
+                        }
+                    }
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3421,7 +3717,7 @@ async fn run_async() -> Result<()> {
                         || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -3448,12 +3744,15 @@ async fn run_async() -> Result<()> {
                             tty_override,
                             auto_providers_override,
                             labels: labels_map,
+                            annotations: annotations_map,
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
                             restart_policy: &restart_policy,
+                            provision_timeout_secs: timeout.map(std::num::NonZeroU32::get),
+                            create_retry_timeout_secs,
                         },
                         &cli.workspace,
                         &tls,
@@ -3469,7 +3768,7 @@ async fn run_async() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
@@ -3489,7 +3788,7 @@ async fn run_async() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
@@ -3506,7 +3805,7 @@ async fn run_async() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = current_gateway()?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
@@ -3574,6 +3873,14 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_suspend(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_resume(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
@@ -3638,7 +3945,7 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace)?;
                         }
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List {
@@ -3801,17 +4108,21 @@ async fn run_async() -> Result<()> {
         Some(Commands::Workspace {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
 
             match command {
-                WorkspaceCommands::Create { name, labels } => {
-                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                WorkspaceCommands::Create {
+                    name,
+                    labels,
+                    output,
+                } => {
+                    run::workspace_create(endpoint, &name, &labels, output.as_str(), &tls).await?;
                 }
-                WorkspaceCommands::Get { name } => {
-                    run::workspace_get(endpoint, &name, &tls).await?;
+                WorkspaceCommands::Get { name, output } => {
+                    run::workspace_get(endpoint, &name, output.as_str(), &tls).await?;
                 }
                 WorkspaceCommands::List {
                     page_size,
@@ -3867,7 +4178,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Provider {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
@@ -3876,6 +4187,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::Create {
                     name,
                     provider_type,
+                    labels,
                     from_existing,
                     credentials,
                     from_gcloud_adc,
@@ -3900,6 +4212,7 @@ async fn run_async() -> Result<()> {
                         server: endpoint,
                         name: &name,
                         provider_type: provider_type.as_str(),
+                        labels: &labels,
                         credentials: &credentials,
                         credential_source,
                         config: &config,
@@ -3930,6 +4243,7 @@ async fn run_async() -> Result<()> {
                         material,
                         secret_material_env,
                         secret_material_keys,
+                        material_secrets,
                         credential_expires_at,
                     } => {
                         run::provider_refresh_config(
@@ -3941,6 +4255,7 @@ async fn run_async() -> Result<()> {
                                 material: &material,
                                 secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
+                                material_secrets: &material_secrets,
                                 credential_expires_at_ms: credential_expires_at,
                             },
                             &cli.workspace,
@@ -3974,6 +4289,19 @@ async fn run_async() -> Result<()> {
                         )
                         .await?;
                     }
+                    ProviderRefreshCommands::InlineSecrets {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_inline_secrets(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
                 },
                 ProviderCommands::ListProfiles { output, global } => {
                     // Normalize the legacy list command before execution so output,
@@ -3995,6 +4323,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::List {
                     page_size,
                     page_token,
+                    label_selector,
                     names,
                     output,
                     all_workspaces,
@@ -4003,6 +4332,7 @@ async fn run_async() -> Result<()> {
                         endpoint,
                         page_size,
                         &page_token,
+                        label_selector.as_deref().unwrap_or_default(),
                         names,
                         output.as_str(),
                         &cli.workspace,
@@ -4042,14 +4372,14 @@ async fn run_async() -> Result<()> {
         Some(Commands::Profile {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             command.run(endpoint, &cli.workspace, &tls).await?;
         }
         Some(Commands::Term { theme }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = current_gateway()?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
@@ -4057,13 +4387,14 @@ async fn run_async() -> Result<()> {
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
-            openshell_tui::run(
+            openshell_tui::run_with_gateway_insecure(
                 channel,
                 interceptor,
                 &ctx.name,
                 &ctx.endpoint,
                 &cli.workspace,
                 theme,
+                tls.gateway_insecure,
             )
             .await?;
         }
@@ -4080,53 +4411,39 @@ async fn run_async() -> Result<()> {
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
-            gateway,
-            sandbox,
-            token,
             server,
             gateway_name,
             name,
+            handoff,
+            known_hosts,
         }) => {
-            match (gateway, sandbox, token, server, gateway_name, name) {
-                // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
-                    let mut effective_tls = match gateway_name_opt {
-                        Some(ref g) => tls.with_gateway_name(g),
-                        None => tls,
-                    };
-                    if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g)?;
-                    }
-                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
-                        .await?;
-                }
-                // Name mode with --gateway-name: resolve endpoint from metadata.
-                (_, _, _, server_override, Some(g), Some(n)) => {
-                    let endpoint = if let Some(srv) = server_override {
-                        srv
-                    } else {
-                        let meta = load_gateway_metadata(&g).map_err(|_| {
-                            miette::miette!(
-                                "Unknown gateway '{g}'.\n\
-                                  Register it first: openshell gateway add <endpoint> --name {g}\n\
-                                  Or list available gateways: openshell gateway select"
-                            )
-                        })?;
-                        meta.gateway_endpoint
-                    };
-                    let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g)?;
-                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
-                }
-                // Legacy name mode with --server only (no --gateway-name).
-                (_, _, _, Some(srv), None, Some(n)) => {
-                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls, &cli.workspace).await?;
-                }
-                _ => {
-                    return Err(miette::miette!(
-                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
-                    ));
-                }
+            if let Some(handle) = handoff {
+                let (grant, peer) = openshell_core::ssh_handoff::receive(&handle).await?;
+                let mut tls = tls.with_gateway_name(&grant.gateway_name);
+                apply_auth(&mut tls, &grant.gateway_name)?;
+                openshell_cli::ssh::relay_prepared_ssh(grant, peer, &name, &cli.workspace, &tls)
+                    .await?;
+            } else {
+                // A saved profile resolves its own endpoint. A local --server
+                // can explicitly pair an endpoint with the chosen profile.
+                let use_global_endpoint =
+                    gateway_name.is_none() && (!explicit_gateway || explicit_endpoint);
+                let endpoint =
+                    server.or_else(|| cli.gateway_endpoint.filter(|_| use_global_endpoint));
+                let allow_endpoint_override = gateway_name.is_some() || explicit_gateway;
+                let profile = gateway_name.or(cli.gateway);
+                let ctx = resolve_gateway(&profile, &endpoint, allow_endpoint_override)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                run::sandbox_ssh_proxy_by_name(
+                    &ctx.endpoint,
+                    &ctx.name,
+                    &name,
+                    &tls,
+                    &cli.workspace,
+                    known_hosts,
+                )
+                .await?;
             }
         }
 
@@ -4163,6 +4480,98 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("settings")
                 .expect("settings subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Secret {
+            command: Some(command),
+        }) => {
+            let ctx = current_gateway()?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match command {
+                SecretCommands::Create {
+                    name,
+                    value_env,
+                    value_file,
+                    allowed_endpoints,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_create(
+                        endpoint,
+                        run::SecretCreateInput {
+                            name: &name,
+                            description: &description,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            allowed_endpoints: &allowed_endpoints,
+                            labels: &labels,
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Update {
+                    name,
+                    value_env,
+                    value_file,
+                    description,
+                    labels,
+                    output,
+                } => {
+                    run::secret_update(
+                        endpoint,
+                        run::SecretUpdateInput {
+                            name: &name,
+                            value: run::SecretValueSource {
+                                env: value_env.as_deref(),
+                                file: value_file.as_deref(),
+                            },
+                            description: description.as_deref(),
+                            labels: labels.as_deref(),
+                        },
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Get { name, output } => {
+                    run::secret_get(endpoint, &name, output.as_str(), &cli.workspace, &tls).await?;
+                }
+                SecretCommands::List {
+                    page_size,
+                    page_token,
+                    label_selector,
+                    output,
+                } => {
+                    run::secret_list(
+                        endpoint,
+                        page_size,
+                        &page_token,
+                        label_selector.as_deref().unwrap_or(""),
+                        output.as_str(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                SecretCommands::Delete { names } => {
+                    run::secret_delete(endpoint, &names, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Secret { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("secret")
+                .expect("secret subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -4855,6 +5264,35 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_upload_conflicts_with_command_and_help_says_so() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "true",
+        ])
+        .expect_err("--upload with a trailing command should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let cmd = Cli::command();
+        let create = cmd
+            .find_subcommand("sandbox")
+            .and_then(|c| c.find_subcommand("create"))
+            .expect("missing sandbox create subcommand");
+        let help = create
+            .get_arguments()
+            .find(|a| a.get_id() == "upload")
+            .and_then(|a| a.get_long_help())
+            .expect("--upload has long help")
+            .to_string();
+        assert!(help.contains("Cannot be combined with a trailing command"));
+        assert!(help.contains("sandbox exec"));
+    }
+
+    #[test]
     fn sandbox_create_no_git_ignore_requires_upload() {
         let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--no-git-ignore"]);
         assert!(
@@ -4904,10 +5342,35 @@ mod tests {
             )
             .unwrap();
 
-            let ctx = resolve_gateway(&None, &Some("https://gw.example.com/".to_string())).unwrap();
+            let ctx = resolve_gateway(&None, &Some("https://GW.example.com/".to_string()), false)
+                .unwrap();
             assert_eq!(ctx.name, "edge-gateway");
-            assert_eq!(ctx.endpoint, "https://gw.example.com/");
+            assert_eq!(ctx.endpoint, "https://GW.example.com/");
         });
+    }
+
+    #[test]
+    fn endpoint_matching_preserves_userinfo_port_and_route() {
+        let endpoint = "https://User:Password@GW.example:8443/Tenant?k=Token/#Section";
+        let normalized = normalize_gateway_endpoint(endpoint);
+        assert_eq!(normalized, endpoint.replace("GW", "gw"));
+        for (from, to) in [
+            ("User", "user"),
+            ("Password", "password"),
+            ("8443", "443"),
+            ("Tenant", "tenant"),
+            ("Token", "token"),
+            ("Section", "section"),
+        ] {
+            assert_ne!(
+                normalized,
+                normalize_gateway_endpoint(&endpoint.replace(from, to))
+            );
+        }
+        assert_ne!(
+            normalize_gateway_endpoint("https://gw/?key=token/"),
+            normalize_gateway_endpoint("https://gw/?key=token")
+        );
     }
 
     #[test]
@@ -4923,6 +5386,7 @@ mod tests {
             let ctx = resolve_gateway(
                 &Some("named-gateway".to_string()),
                 &Some("https://override.example.com".to_string()),
+                true,
             )
             .unwrap();
 
@@ -4989,48 +5453,52 @@ mod tests {
         });
     }
 
-    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
-    /// accepted by the `SshProxy` subcommand and land in the right fields.
-    /// This catches drift when CLI flags are renamed or restructured.
     #[test]
-    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
-        // This is the exact flag pattern constructed by the TUI in lib.rs
-        // (handle_shell_connect, handle_exec, handle_port_forward).
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "ssh-proxy",
-            "--gateway",
-            "https://gw.example.com:8080/proxy/connect",
-            "--sandbox",
-            "my-box",
-            "--workspace",
-            "team-a",
-            "--token",
-            "tok-abc",
-            "--gateway-name",
-            "my-gateway",
-        ])
-        .expect("TUI proxy command flags must be accepted by the CLI");
-        assert_eq!(cli.workspace, "team-a");
+    fn ssh_proxy_rejects_tokens_in_arguments() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway",
+                "gw",
+                "--sandbox",
+                "demo",
+                "--token",
+                "test-token",
+            ])
+            .is_err()
+        );
+    }
 
-        match cli.command {
-            Some(Commands::SshProxy {
-                gateway,
-                sandbox,
-                token,
+    #[test]
+    fn ssh_proxy_accepts_generated_and_saved_commands() {
+        for name_flag in ["--sandbox", "--name"] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "ssh-proxy",
+                "--gateway-name",
+                "my-gateway",
+                name_flag,
+                "my-box",
+                "--workspace",
+                "team-a",
+                "--known-hosts",
+                "/home/u/.config/openshell/known_hosts/my-gateway/openshell-my-box.team-a",
+            ])
+            .unwrap();
+            assert_eq!(cli.workspace, "team-a");
+            let Some(Commands::SshProxy {
                 gateway_name,
+                name,
+                known_hosts,
                 ..
-            }) => {
-                assert_eq!(
-                    gateway.as_deref(),
-                    Some("https://gw.example.com:8080/proxy/connect"),
-                    "gateway URL must land in SshProxy.gateway, not the global flag"
-                );
-                assert_eq!(sandbox.as_deref(), Some("my-box"));
-                assert_eq!(token.as_deref(), Some("tok-abc"));
-                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
-            }
-            other => panic!("expected SshProxy, got: {other:?}"),
+            }) = cli.command
+            else {
+                panic!("expected ssh-proxy")
+            };
+            assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            assert_eq!(name, "my-box");
+            assert!(known_hosts.is_some());
         }
     }
 
@@ -5486,6 +5954,38 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_suspend_and_resume_accept_optional_names() {
+        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
+            .expect("suspend command should parse");
+        assert!(matches!(
+            suspend.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
+            .expect("resume command should parse");
+        assert!(matches!(
+            resume.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume { name: None }),
+            })
+        ));
+
+        let named = Cli::try_parse_from(["openshell", "sandbox", "resume", "demo"])
+            .expect("named resume should parse");
+        assert!(matches!(
+            named.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume {
+                    name: Some(ref name),
+                }),
+            }) if name == "demo"
+        ));
+    }
+
+    #[test]
     fn sandbox_list_accepts_output_json() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json"])
             .expect("sandbox list -o json should parse");
@@ -5654,6 +6154,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_create_accepts_labels_with_each_credential_source() {
+        for source in [
+            vec![],
+            vec!["--from-existing"],
+            vec!["--credential", "GITHUB_TOKEN=token"],
+            vec!["--from-gcloud-adc"],
+            vec!["--from-oidc-token"],
+            vec!["--runtime-credentials"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "create",
+                "--name",
+                "labeled",
+                "--type",
+                "github",
+                "--label",
+                "env=dev",
+                "--label",
+                "team=ml",
+            ];
+            args.extend(source);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command: Some(ProviderCommands::Create { labels, .. }),
+                }) => assert_eq!(labels, ["env=dev", "team=ml"]),
+                other => panic!("expected provider create, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_list_accepts_label_selector_in_all_output_modes() {
+        for output in [
+            vec![],
+            vec!["--names"],
+            vec!["-o", "json"],
+            vec!["-o", "yaml"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "list",
+                "--all-workspaces",
+                "--label-selector",
+                "env=dev,team=ml",
+            ];
+            args.extend(output);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command:
+                        Some(ProviderCommands::List {
+                            label_selector,
+                            all_workspaces,
+                            ..
+                        }),
+                }) => {
+                    assert_eq!(label_selector.as_deref(), Some("env=dev,team=ml"));
+                    assert!(all_workspaces);
+                }
+                other => panic!("expected provider list, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn provider_create_accepts_no_credential_source() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -5758,6 +6327,39 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--credential"));
         assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn github_app_refresh_command_parses() {
+        let config = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "repo-reader",
+            "--credential-key",
+            "GITHUB_TOKEN",
+            "--strategy",
+            "github-app-installation",
+            "--material",
+            "repository_ids=[42]",
+            "--material",
+            "permissions={\"contents\":\"read\"}",
+            "--secret-material-env",
+            "private_key=GITHUB_APP_PRIVATE_KEY",
+        ])
+        .expect("GitHub App refresh configuration should parse");
+        assert!(matches!(
+            config.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::GithubAppInstallation,
+                        ..
+                    }
+                ))
+            })
+        ));
     }
 
     #[test]
@@ -6113,6 +6715,33 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_annotation_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--annotation",
+            "policy-source-file=/home/you/my policy.yaml",
+            "--annotation",
+            "owner=platform",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { annotations, .. }),
+                ..
+            }) => assert_eq!(
+                annotations,
+                vec![
+                    "policy-source-file=/home/you/my policy.yaml".to_string(),
+                    "owner=platform".to_string(),
+                ]
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_create_restart_policy_defaults_to_never() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
         match cli.command {
@@ -6141,6 +6770,73 @@ mod tests {
             }) => assert_eq!(restart_policy, "on-failure"),
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_timeout_parses() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "900"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { timeout, .. }),
+                ..
+            }) => assert_eq!(timeout, std::num::NonZeroU32::new(900)),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["openshell", "sandbox", "create", "--timeout", "0"]).is_err());
+    }
+
+    fn create_retry_flags(args: &[&str]) -> (Option<std::num::NonZeroU32>, bool) {
+        let cli = Cli::try_parse_from(
+            ["openshell", "sandbox", "create"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        create_retry_timeout,
+                        no_create_retry,
+                        ..
+                    }),
+                ..
+            }) => (create_retry_timeout, no_create_retry),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_parse() {
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(create_retry_flags(&["--no-create-retry"]), (None, true));
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--create-retry-timeout",
+                "0"
+            ])
+            .is_err(),
+            "a zero retry budget must be rejected; --no-create-retry disables retries"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_retry_flags_use_the_last_one_given() {
+        assert_eq!(
+            create_retry_flags(&["--no-create-retry", "--create-retry-timeout", "30"]),
+            (std::num::NonZeroU32::new(30), false)
+        );
+        assert_eq!(
+            create_retry_flags(&["--create-retry-timeout", "30", "--no-create-retry"]),
+            (None, true)
+        );
     }
 
     #[test]
@@ -6545,6 +7241,35 @@ mod tests {
     }
 
     #[test]
+    fn workspace_create_and_get_accept_output_format() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "create",
+            "--name",
+            "team-ml",
+            "--output",
+            "json",
+        ])
+        .expect("workspace create --output should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Create { output, .. }),
+            }) => assert_eq!(output.as_str(), "json"),
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "workspace", "get", "team-ml", "-o", "yaml"])
+            .expect("workspace get -o should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Get { output, .. }),
+            }) => assert_eq!(output.as_str(), "yaml"),
+            other => panic!("expected workspace get, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_template_list_names_conflicts_with_output() {
         let result = Cli::try_parse_from([
             "openshell",
@@ -6818,12 +7543,14 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        backend_http_version,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service.as_deref(), Some("api"));
                 assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http1);
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
@@ -6842,6 +7569,7 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
@@ -6854,7 +7582,7 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_parses_bearer_passthrough() {
+    fn service_expose_parses_bearer_passthrough_and_http2_backend() {
         let cli = Cli::try_parse_from([
             "openshell",
             "service",
@@ -6863,19 +7591,26 @@ mod tests {
             "4500",
             "--authorization-mode",
             "bearer-passthrough",
+            "--backend-http-version",
+            "2",
         ])
-        .expect("service authorization mode should parse");
+        .expect("service authorization mode and backend HTTP version should parse");
 
         match cli.command {
             Some(Commands::Service {
                 command:
                     Some(ServiceCommands::Expose {
-                        authorization_mode, ..
+                        authorization_mode,
+                        backend_http_version,
+                        ..
                     }),
-            }) => assert_eq!(
-                authorization_mode,
-                CliServiceAuthorizationMode::BearerPassthrough
-            ),
+            }) => {
+                assert_eq!(
+                    authorization_mode,
+                    CliServiceAuthorizationMode::BearerPassthrough
+                );
+                assert_eq!(backend_http_version, CliServiceBackendHttpVersion::Http2);
+            }
             other => panic!("expected service expose command, got: {other:?}"),
         }
     }

@@ -31,7 +31,8 @@ use hyper_util::rt::TokioIo;
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-use openshell_core::{Error, Result, UpstreamProxyConfig};
+use openshell_core::sandbox_env::{self, OtlpExport, OtlpProtocol};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result, UpstreamProxyConfig};
 #[cfg(unix)]
 use openshell_otel::TraceContextInterceptor;
 use openshell_server::AcquiredRemoteDriverEndpoint;
@@ -80,6 +81,8 @@ pub struct VmComputeConfig {
 
     /// Bootstrap image used to boot and prepare VM sandbox target images.
     pub bootstrap_image: String,
+    /// Per-image byte limit for host extraction of registry bootstrap layers.
+    pub bootstrap_extraction_max_bytes: Option<std::num::NonZeroU64>,
 
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
@@ -113,6 +116,11 @@ pub struct VmComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes passed to the VM
+    /// driver for its host-side supervisors.
+    #[serde(flatten)]
+    pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
+
     /// Path on the gateway host to a PEM CA bundle trusted for the corporate
     /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
     pub proxy_ca_bundle: Option<PathBuf>,
@@ -122,6 +130,10 @@ pub struct VmComputeConfig {
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
+
+    /// Allow bind-mounting host directories into VM sandboxes.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl VmComputeConfig {
@@ -204,6 +216,7 @@ impl VmComputeConfig {
 
     fn validate_proxy_config(&self) -> Result<()> {
         self.upstream_proxy.validate().map_err(Error::config)?;
+        self.ipv6_egress.validate().map_err(Error::config)?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err(Error::config("proxy_ca_bundle must not be empty when set"));
@@ -241,6 +254,7 @@ impl Default for VmComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             grpc_endpoint: String::new(),
             bootstrap_image: String::new(),
+            bootstrap_extraction_max_bytes: None,
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -251,9 +265,11 @@ impl Default for VmComputeConfig {
             rootfs_tar_max_bytes: None,
             guest_tls_ca: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -526,6 +542,7 @@ pub async fn spawn(
     gateway_name: &str,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
+    additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
@@ -570,11 +587,15 @@ pub async fn spawn(
         .arg("--overlay-disk-mib")
         .arg(vm_config.overlay_disk_mib.to_string());
     append_vm_identity_args(&mut command, vm_config);
-    append_vm_rootfs_tar_args(&mut command, vm_config);
+    append_vm_image_size_and_staging_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    append_vm_network_trust_args(&mut command, additional_ca_bundle);
+    if vm_config.enable_bind_mounts {
+        command.arg("--enable-bind-mounts");
+    }
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -619,7 +640,12 @@ fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
 }
 
 #[cfg(unix)]
-fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
+fn append_vm_image_size_and_staging_args(command: &mut Command, config: &VmComputeConfig) {
+    if let Some(max_bytes) = config.bootstrap_extraction_max_bytes {
+        command
+            .arg("--bootstrap-extraction-max-bytes")
+            .arg(max_bytes.to_string());
+    }
     if let Some(path) = config.rootfs_tar_staging_dir.as_ref() {
         command.arg("--rootfs-tar-staging-dir").arg(path);
     }
@@ -627,6 +653,25 @@ fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
         command
             .arg("--rootfs-tar-max-bytes")
             .arg(max_bytes.to_string());
+    }
+}
+
+#[cfg(unix)]
+fn append_vm_network_trust_args(
+    command: &mut Command,
+    bundle: Option<&NetworkSupervisorTrustBundle>,
+) {
+    if let Some(bundle) = bundle {
+        // Only stable, non-secret artifact metadata crosses the process
+        // boundary. The child reads and verifies the bounded artifact once,
+        // then retains its own immutable snapshot for sandbox launches.
+        command
+            .arg("--additional-ca-bundle")
+            .arg(bundle.artifact_path());
+        command.arg("--additional-ca-digest").arg(bundle.digest());
+        command
+            .arg("--additional-ca-certificate-count")
+            .arg(bundle.certificate_count().to_string());
     }
 }
 
@@ -651,6 +696,8 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     if let Some(path) = config.proxy_ca_bundle.as_ref() {
         command.arg("--upstream-proxy-ca-bundle").arg(path);
     }
+    // The VM driver accepts the supervisor's flag names and forwards them.
+    command.args(config.ipv6_egress.supervisor_args());
     if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
         command
             .arg("--provider-spiffe-workload-api-tcp-endpoint")
@@ -659,9 +706,66 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     }
 }
 
+fn append_otlp_export_args(
+    command: &mut Command,
+    export: Option<&OtlpExport>,
+    endpoint_flag: &str,
+    protocol_flag: &str,
+) {
+    if let Some(export) = export {
+        command
+            .arg(format!("--{endpoint_flag}"))
+            .arg(&export.endpoint);
+        if export.protocol != OtlpProtocol::Grpc {
+            command
+                .arg(format!("--{protocol_flag}"))
+                .arg(export.protocol.as_str());
+        }
+    }
+}
+
 fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    if let Some(config) = otlp_config {
-        command.arg("--otlp-endpoint").arg(&config.endpoint);
+    let otlp = otlp_config
+        .map(OtlpConfig::supervisor_otlp)
+        .unwrap_or_default();
+    append_otlp_export_args(
+        command,
+        otlp.traces.as_ref(),
+        sandbox_env::OTLP_ENDPOINT_FLAG,
+        sandbox_env::OTLP_PROTOCOL_FLAG,
+    );
+    append_otlp_export_args(
+        command,
+        otlp.ocsf.as_ref(),
+        sandbox_env::OTLP_OCSF_ENDPOINT_FLAG,
+        sandbox_env::OTLP_OCSF_PROTOCOL_FLAG,
+    );
+    append_otlp_export_args(
+        command,
+        otlp.agent.as_ref(),
+        sandbox_env::OTLP_AGENT_ENDPOINT_FLAG,
+        sandbox_env::OTLP_AGENT_PROTOCOL_FLAG,
+    );
+    if let Some(traces) = otlp_config.and_then(|otlp| otlp.traces.as_ref()) {
+        let collector = &traces.collector;
+        for (flag, path) in [
+            (sandbox_env::OTLP_CA_FILE_FLAG, collector.ca_file()),
+            (sandbox_env::OTLP_CERT_FILE_FLAG, collector.cert_file()),
+            (sandbox_env::OTLP_KEY_FILE_FLAG, collector.key_file()),
+        ] {
+            if let Some(path) = path {
+                command.arg(format!("--{flag}")).arg(path);
+            }
+        }
+    }
+    // The driver's own trace exporter reads this like any OTLP SDK; keeping
+    // it out of the arguments keeps the headers out of process listings.
+    if let Some(headers) = openshell_server::gateway_trace_headers(otlp_config) {
+        command.env("OTEL_EXPORTER_OTLP_TRACES_HEADERS", headers.expose_secret());
+    }
+    // The driver names its own spans with the gateway name, and supervisors
+    // name their spans, OCSF records, and relayed traces with it.
+    if !otlp.is_empty() {
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
@@ -672,6 +776,7 @@ pub async fn spawn(
     _gateway_name: &str,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
+    _additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
@@ -754,13 +859,17 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
+        append_vm_image_size_and_staging_args, append_vm_network_trust_args,
+        append_vm_proxy_and_spiffe_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
     };
-    use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
+    use openshell_core::sandbox_env::OtlpProtocol;
+    use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
+    use openshell_server::config_file::{
+        AgentOtlpConfig, OcsfOtlpConfig, OtlpCollectorConfig, OtlpConfig, OtlpTracesConfig,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -803,13 +912,97 @@ mod tests {
     }
 
     #[test]
+    fn vm_driver_receives_trace_headers_in_its_environment_only() {
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .run(|| {
+                let otlp: OtlpConfig = toml::from_str(
+                    "endpoint = 'http://collector.internal:4318'\n\
+                 headers = { authorization = 'Bearer secret-token' }\n",
+                )
+                .unwrap();
+                let mut command = tokio::process::Command::new("openshell-driver-vm");
+                append_otlp_args(&mut command, Some(&otlp), "production-us-west");
+
+                let env = command
+                    .as_std()
+                    .get_envs()
+                    .find(|(name, _)| *name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                    .and_then(|(_, value)| value)
+                    .map(|value| value.to_string_lossy().into_owned());
+                assert_eq!(env.as_deref(), Some("authorization=Bearer%20secret-token"));
+                assert!(
+                    command
+                        .as_std()
+                        .get_args()
+                        .all(|arg| !arg.to_string_lossy().contains("secret-token"))
+                );
+            });
+    }
+
+    #[test]
+    fn vm_driver_receives_the_trace_collectors_tls_file_paths() {
+        let dir = tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["collector".into()]).unwrap();
+        let [ca, cert, key] = ["ca.pem", "client.pem", "client-key.pem"].map(|name| {
+            let path = dir.path().join(name);
+            let pem = if name == "client-key.pem" {
+                certified.signing_key.serialize_pem()
+            } else {
+                certified.cert.pem()
+            };
+            std::fs::write(&path, pem).unwrap();
+            path
+        });
+        let collector = OtlpCollectorConfig::new("https://collector:4317", OtlpProtocol::Grpc)
+            .with_tls_files(Some(ca.clone()), Some(cert.clone()), Some(key.clone()))
+            .unwrap();
+        assert!(collector.tls().client_identity().is_some());
+        let otlp = OtlpConfig {
+            metrics: None,
+            service_name: None,
+            traces: Some(OtlpTracesConfig { collector }),
+            ocsf: None,
+            agent: None,
+        };
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(&mut command, Some(&otlp), "production-us-west");
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for (flag, path) in [
+            ("--otlp-ca-file", ca),
+            ("--otlp-cert-file", cert),
+            ("--otlp-key-file", key),
+        ] {
+            let pair = [flag.to_string(), path.display().to_string()];
+            assert!(
+                args.windows(2).any(|window| window == pair),
+                "{pair:?} in {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn vm_driver_command_includes_gateway_otlp_configuration() {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
+                metrics: None,
                 service_name: Some("custom-gateway".to_string()),
+                traces: Some(OtlpTracesConfig {
+                    collector: OtlpCollectorConfig::new(
+                        "http://collector.internal:4317",
+                        OtlpProtocol::Grpc,
+                    ),
+                }),
+                ocsf: None,
+                agent: None,
             }),
             "production-us-west",
         );
@@ -826,6 +1019,142 @@ mod tests {
                 "http://collector.internal:4317",
                 "--gateway-name",
                 "production-us-west"
+            ]
+        );
+
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                metrics: None,
+                service_name: None,
+                traces: Some(OtlpTracesConfig {
+                    collector: OtlpCollectorConfig::new(
+                        "http://collector.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
+                }),
+                ocsf: None,
+                agent: None,
+            }),
+            "production-us-west",
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args[..4],
+            [
+                "--otlp-endpoint",
+                "http://collector.internal:4318",
+                "--otlp-protocol",
+                "http/protobuf",
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_includes_gateway_ocsf_export() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                metrics: None,
+                service_name: None,
+                traces: None,
+                ocsf: Some(OcsfOtlpConfig {
+                    collector: OtlpCollectorConfig::new(
+                        "http://siem.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
+                    schema_version: Some("2.0".into()),
+                }),
+                agent: None,
+            }),
+            "production-us-west",
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--otlp-ocsf-endpoint",
+                "http://siem.internal:4318",
+                "--otlp-ocsf-protocol",
+                "http/protobuf",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_includes_the_agent_trace_relay() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                metrics: None,
+                service_name: None,
+                traces: None,
+                ocsf: None,
+                agent: Some(AgentOtlpConfig {
+                    collector: OtlpCollectorConfig::new(
+                        "http://agents.internal:4318",
+                        OtlpProtocol::HttpProtobuf,
+                    ),
+                }),
+            }),
+            "production-us-west",
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--otlp-agent-endpoint",
+                "http://agents.internal:4318",
+                "--otlp-agent-protocol",
+                "http/protobuf",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_ipv6_egress_settings() {
+        let config: VmComputeConfig = toml::from_str(
+            r#"
+policy_dns_ipv6_egress = "disabled"
+nat64_prefixes = ["2001:db8:64::/96"]
+"#,
+        )
+        .expect("VM driver config parses");
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_proxy_and_spiffe_args(&mut command, &config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--policy-dns-ipv6-egress",
+                "disabled",
+                "--nat64-prefix",
+                "2001:db8:64::/96"
             ]
         );
     }
@@ -883,6 +1212,45 @@ mod tests {
     }
 
     #[test]
+    fn vm_driver_command_forwards_only_network_trust_artifact_metadata() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        let pem =
+            b"-----BEGIN CERTIFICATE-----\nprivate-fixture-bytes\n-----END CERTIFICATE-----\n";
+        let bundle = NetworkSupervisorTrustBundle::new(
+            pem.to_vec(),
+            2,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            PathBuf::from("/var/lib/openshell/network/additional-ca.crt"),
+        );
+        append_vm_network_trust_args(&mut command, Some(&bundle));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--additional-ca-bundle",
+                "/var/lib/openshell/network/additional-ca.crt",
+                "--additional-ca-digest",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "--additional-ca-certificate-count",
+                "2",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+        assert!(
+            !args.iter().any(|arg| arg.contains("private-fixture-bytes")),
+            "CA material must not cross the process boundary in argv: {args:?}"
+        );
+
+        let mut unset = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_network_trust_args(&mut unset, None);
+        assert_eq!(unset.as_std().get_args().count(), 0);
+    }
+
+    #[test]
     fn invalid_corporate_proxy_config_is_rejected_before_the_driver_starts() {
         let err = UpstreamProxyConfig {
             https_proxy: Some("socks5://proxy.corp.com:1080".to_string()),
@@ -931,11 +1299,12 @@ mod tests {
     }
 
     #[test]
-    fn vm_gateway_toml_forwards_rootfs_tar_settings() {
+    fn vm_gateway_toml_forwards_image_size_and_staging_settings() {
         let config: VmComputeConfig = toml::from_str(
             r#"
                 grpc_endpoint = "http://127.0.0.1:50051"
                 rootfs_tar_staging_dir = "/var/lib/openshell/rootfs-tar-staging"
+                bootstrap_extraction_max_bytes = 33554432
                 rootfs_tar_max_bytes = 1073741824
             "#,
         )
@@ -945,7 +1314,7 @@ mod tests {
             .expect("rootfs tar settings must pass static validation");
 
         let mut command = tokio::process::Command::new("openshell-driver-vm");
-        append_vm_rootfs_tar_args(&mut command, &config);
+        append_vm_image_size_and_staging_args(&mut command, &config);
         let args = command
             .as_std()
             .get_args()
@@ -955,6 +1324,8 @@ mod tests {
         assert_eq!(
             args,
             [
+                "--bootstrap-extraction-max-bytes",
+                "33554432",
                 "--rootfs-tar-staging-dir",
                 "/var/lib/openshell/rootfs-tar-staging",
                 "--rootfs-tar-max-bytes",

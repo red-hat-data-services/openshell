@@ -7,6 +7,7 @@
 //! start, stop, list, and track background SSH port forwards.
 
 use crate::paths::{create_dir_restricted, xdg_config_dir};
+use crate::ssh_host_key::HostKeyCheck;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::borrow::Cow;
 use std::net::TcpListener;
@@ -364,14 +365,13 @@ fn proxy_command_option_present(args: &[&str], proxy_index: usize) -> bool {
 fn proxy_option_takes_value(arg: &str) -> bool {
     matches!(
         arg,
-        "--gateway" | "--workspace" | "--token" | "--gateway-name"
+        "--gateway" | "--workspace" | "--token" | "--gateway-name" | "--server" | "--handoff"
     )
 }
 
 fn proxy_option_has_inline_value(arg: &str) -> bool {
-    ["--gateway=", "--workspace=", "--token=", "--gateway-name="]
-        .iter()
-        .any(|prefix| arg.starts_with(prefix))
+    arg.split_once('=')
+        .is_some_and(|(option, _)| proxy_option_takes_value(option))
 }
 
 fn is_outer_ssh_option_start(arg: &str) -> bool {
@@ -826,50 +826,79 @@ fn lsof_listeners(port: u16) -> Option<String> {
 // SSH utility functions (shared between CLI and TUI)
 // ---------------------------------------------------------------------------
 
-/// Resolve the SSH gateway host and port for a sandbox connection.
+/// An authenticated `GetSandbox` reply advertises tokenless SSH on this gateway.
+pub const DIRECT_SSH_HEADER: &str = "x-openshell-direct-ssh";
+
+pub fn supports_direct_ssh<T>(response: &tonic::Response<T>) -> Result<bool> {
+    let values = response.metadata().get_all(DIRECT_SSH_HEADER);
+    let mut values = values.iter();
+    match (values.next(), values.next()) {
+        (None, None) => Ok(false),
+        (Some(value), None) if value == "1" => Ok(true),
+        _ => Err(miette::miette!(
+            "invalid direct SSH capability in gateway response"
+        )),
+    }
+}
+
+/// Resolve the SSH gateway scheme, host, and port for a sandbox connection.
 ///
 /// If the server-provided gateway host is a loopback address, use the host
 /// and port from the cluster endpoint instead so the client connects to the
-/// right machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
-/// which may not be reachable from outside — the cluster URL has the actual
-/// Docker-mapped or tunnel port.
+/// right machine. The server returns its internal bind address (e.g.
+/// `http://0.0.0.0:8080`) which may not be reachable from outside — the
+/// cluster URL has the actual scheme and Docker-mapped or tunnel authority.
 pub fn resolve_ssh_gateway(
+    gateway_scheme: &str,
     gateway_host: &str,
     gateway_port: u16,
     cluster_url: &str,
-) -> (String, u16) {
+) -> (String, String, u16) {
     let is_loopback = gateway_host == "127.0.0.1"
         || gateway_host == "0.0.0.0"
         || gateway_host == "localhost"
+        || gateway_host == "::"
         || gateway_host == "::1";
 
     if !is_loopback {
-        return (gateway_host.to_string(), gateway_port);
+        return (
+            gateway_scheme.to_string(),
+            gateway_host.to_string(),
+            gateway_port,
+        );
     }
 
-    // Extract host and port from the cluster URL. The cluster URL represents
-    // the externally reachable endpoint (e.g. Docker port-mapped address).
+    // Extract the scheme, host, and port from the cluster URL. The cluster URL
+    // represents the externally reachable endpoint (e.g. a TLS-terminating
+    // proxy or Docker port-mapped address).
     if let Ok(url) = url::Url::parse(cluster_url)
+        && matches!(url.scheme(), "http" | "https")
         && let Some(host) = url.host_str()
     {
+        let cluster_scheme = url.scheme().to_string();
         let cluster_port = url.port_or_known_default().unwrap_or(gateway_port);
         let cluster_is_loopback =
             host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
         if !cluster_is_loopback {
-            // Remote cluster: use the remote host but keep the cluster URL port.
-            return (host.to_string(), cluster_port);
+            // Remote cluster: use the complete externally reachable endpoint.
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
         // Unspecified addresses are bind-only, and tonic cannot use an IPv6
         // literal as a TLS DNS name. In those cases, keep the cluster URL's
         // already-reachable authority. Other loopback addresses retain the
-        // gateway-reported host.
+        // gateway-reported host, but use the cluster scheme and port because
+        // those describe the externally reachable listener.
         if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
-            return (host.to_string(), cluster_port);
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
-        return (gateway_host.to_string(), cluster_port);
+        return (cluster_scheme, gateway_host.to_string(), cluster_port);
     }
 
-    (gateway_host.to_string(), gateway_port)
+    (
+        gateway_scheme.to_string(),
+        gateway_host.to_string(),
+        gateway_port,
+    )
 }
 
 /// Bracket a bare IPv6 literal (e.g. `::1` → `[::1]`) so it can be embedded in
@@ -909,35 +938,68 @@ pub fn shell_escape(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
-///
-/// Every interpolated argument is shell-escaped so that server-supplied values
-/// (gateway URL, sandbox name, workspace, token, gateway name) cannot inject shell
-/// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
-pub fn build_proxy_command(
-    exe: &str,
-    gateway_url: &str,
-    sandbox_name: &str,
-    workspace: &str,
-    token: &str,
-    gateway_name: &str,
-) -> String {
+/// Build a one-use proxy command. The handle identifies an owner-only IPC
+/// endpoint. Only the parent and proxy exchange the relay credentials.
+pub fn build_proxy_command(exe: &str, handle: &str, sandbox: &str, workspace: &str) -> String {
     format!(
-        "{} ssh-proxy --gateway {} --sandbox {} --workspace {} --token {} --gateway-name {}",
+        "{} ssh-proxy --sandbox {} --workspace {} --handoff {}",
         shell_escape(exe),
-        shell_escape(gateway_url),
-        shell_escape(sandbox_name),
+        shell_escape(sandbox),
         shell_escape(workspace),
-        shell_escape(token),
-        shell_escape(gateway_name),
+        shell_escape(handle),
     )
+    .replace('%', "%%")
 }
 
-/// Error returned when a `CreateSshSessionResponse` fails validation.
+/// The `ProxyCommand` of a sandbox SSH connection, with the host-key decision
+/// it was built with.
+pub struct SandboxProxyCommand {
+    command: String,
+    host_key: HostKeyCheck,
+}
+
+impl SandboxProxyCommand {
+    pub fn new(command: String, host_key: HostKeyCheck) -> Self {
+        Self { command, host_key }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.command
+    }
+
+    /// Present when the user lets a connection whose key cannot be verified
+    /// go ahead.
+    #[must_use]
+    pub fn unverified_warning(&self) -> Option<String> {
+        self.host_key.unverified_warning()
+    }
+}
+
+/// Build the `ssh` options shared by every sandbox session.
 ///
-/// The response fields flow into a `ProxyCommand` string executed by
-/// `/bin/sh -c`; any deviation from the documented charset is rejected at the
-/// gRPC trust boundary before escaping is attempted.
+/// Every sandbox is addressed as the host `sandbox`, so a user's `ControlMaster`
+/// or `ControlPath` would reuse one sandbox's connection for another. Command
+/// line options beat `ssh_config`, so connection sharing is turned off here.
+pub fn sandbox_ssh_args(proxy: &SandboxProxyCommand, log_level: &str) -> Vec<String> {
+    let host_key_options = proxy
+        .host_key
+        .ssh_options()
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"));
+    [
+        format!("ProxyCommand={}", proxy.command),
+        format!("LogLevel={log_level}"),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "ControlPersist=no".to_string(),
+    ]
+    .into_iter()
+    .chain(host_key_options)
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
+}
+
+/// Error returned when an SSH session field fails validation.
 #[derive(Debug, thiserror::Error)]
 pub enum SshSessionResponseError {
     #[error("{field} is empty")]
@@ -977,22 +1039,11 @@ fn is_fingerprint_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b':' | b'+' | b'/' | b'=' | b'-')
 }
 
-/// Validate a `CreateSshSessionResponse` before any of its fields are used to
-/// build a shell command or config file.
-///
-/// This is a belt-and-suspenders pair to [`build_proxy_command`]: escaping
-/// alone is sufficient to prevent injection, but rejecting malformed fields
-/// at the trust boundary fails loudly before the string is assembled and
-/// catches gateway bugs or tampering early.
+/// Check the SSH session response against the gateway protocol's charset and length limits.
 pub fn validate_ssh_session_response(
     resp: &crate::proto::CreateSshSessionResponse,
 ) -> std::result::Result<(), SshSessionResponseError> {
-    validate_field(
-        "sandbox_id",
-        &resp.sandbox_id,
-        MAX_SANDBOX_ID_LEN,
-        is_sandbox_id_byte,
-    )?;
+    validate_ssh_sandbox_id(&resp.sandbox_id)?;
     validate_field("token", &resp.token, MAX_TOKEN_LEN, is_token_byte)?;
     validate_field(
         "gateway_host",
@@ -1021,6 +1072,10 @@ pub fn validate_ssh_session_response(
         }
     }
     Ok(())
+}
+
+pub fn validate_ssh_sandbox_id(id: &str) -> std::result::Result<(), SshSessionResponseError> {
+    validate_field("sandbox_id", id, MAX_SANDBOX_ID_LEN, is_sandbox_id_byte)
 }
 
 fn validate_field(
@@ -1072,55 +1127,84 @@ pub fn build_sandbox_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh_host_key::KnownHostsPin;
     use crate::test_environment::Environment;
 
     #[test]
+    fn direct_ssh_requires_one_explicit_capability_value() {
+        let mut response = tonic::Response::new(());
+        assert!(!supports_direct_ssh(&response).unwrap());
+        for value in ["0", "true", "1,1"] {
+            response
+                .metadata_mut()
+                .insert(DIRECT_SSH_HEADER, value.parse().unwrap());
+            assert!(supports_direct_ssh(&response).is_err());
+        }
+        response
+            .metadata_mut()
+            .insert(DIRECT_SSH_HEADER, "1".parse().unwrap());
+        assert!(supports_direct_ssh(&response).unwrap());
+        response
+            .metadata_mut()
+            .append(DIRECT_SSH_HEADER, "1".parse().unwrap());
+        assert!(supports_direct_ssh(&response).is_err());
+    }
+
+    #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
-        let (host, port) = resolve_ssh_gateway("10.0.0.5", 8080, "https://spark.local");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("http", "10.0.0.5", 8080, "https://spark.local");
+        assert_eq!(resolved, ("http".to_string(), "10.0.0.5".to_string(), 8080));
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
-        assert_eq!(host, "spark.local");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://spark.local");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "spark.local".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://10.0.0.5:443");
+        assert_eq!(resolved, ("https".to_string(), "10.0.0.5".to_string(), 443));
     }
 
     #[test]
     fn resolve_ssh_gateway_uses_known_default_http_port() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "http://gateway.example.test");
-        assert_eq!(host, "gateway.example.test");
-        assert_eq!(port, 80);
+        let resolved = resolve_ssh_gateway("https", "0.0.0.0", 8080, "http://gateway.example.test");
+        assert_eq!(
+            resolved,
+            ("http".to_string(), "gateway.example.test".to_string(), 80)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_localhost() {
-        let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
-        assert_eq!(host, "remote-host");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "localhost", 8080, "https://remote-host:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "remote-host".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://127.0.0.1:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_preserves_loopback_tls_authority() {
-        let (host, port) = resolve_ssh_gateway("::1", 8080, "https://localhost:8443");
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 8443);
+        let resolved = resolve_ssh_gateway("http", "::1", 8080, "https://localhost:8443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 8443)
+        );
     }
 
     #[test]
@@ -1128,16 +1212,38 @@ mod tests {
         // The gateway binds 0.0.0.0 but advertises that bind address via the
         // SSH session response. 0.0.0.0 is not a valid connect target and is
         // not in any TLS cert SAN; fall through to the cluster URL's host.
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 9000);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://127.0.0.1:9000");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 9000)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_swaps_unspecified_ipv6_for_cluster_host() {
+        let resolved = resolve_ssh_gateway("http", "::", 8080, "https://localhost:18443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 18443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_handles_invalid_cluster_url() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "not-a-url");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_ignores_non_http_cluster_url() {
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "ssh://remote-host:22");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
     }
 
     #[test]
@@ -1286,11 +1392,9 @@ mod tests {
         // Attacker-controlled values in every escapable position.
         let cmd = build_proxy_command(
             "/usr/local/bin/openshell",
-            "https://gw:443/connect",
+            "handle",
             "x$(touch /tmp/pwn)x",
             "ws; touch /tmp/pwn",
-            "tok`id`",
-            "gw-name",
         );
 
         // The `$` / backtick must only appear inside single-quoted regions.
@@ -1308,25 +1412,48 @@ mod tests {
     fn build_proxy_command_empty_values_quote_rather_than_vanish() {
         // An empty value must become `''` rather than disappearing — otherwise
         // downstream argv splitting would misalign.
-        let cmd = build_proxy_command("exe", "gw", "", "", "tok", "name");
+        let cmd = build_proxy_command("exe", "handle", "", "");
         assert!(cmd.contains("--sandbox ''"));
         assert!(cmd.contains("--workspace ''"));
     }
 
     #[test]
-    fn build_proxy_command_safe_values_pass_through_unquoted() {
-        let cmd = build_proxy_command(
-            "/usr/local/bin/openshell",
-            "gw",
-            "sb-123",
-            "workspace-1",
-            "tok.456",
-            "name_1",
-        );
+    fn build_proxy_command_contains_only_handle_and_sandbox_identity() {
+        let cmd = build_proxy_command("/opt/My %h/bin", "opaque", "sb-123", "workspace-1");
         assert_eq!(
             cmd,
-            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --workspace workspace-1 --token tok.456 --gateway-name name_1"
+            "'/opt/My %%h/bin' ssh-proxy --sandbox sb-123 --workspace workspace-1 --handoff opaque"
         );
+    }
+
+    const HOST_KEY_FINGERPRINT: &str = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA";
+
+    fn sandbox_proxy(exe: &str, known_hosts: &std::path::Path) -> SandboxProxyCommand {
+        let pin = KnownHostsPin::at(known_hosts.to_path_buf(), "sbx-1", "team-a").unwrap();
+        let host_key = HostKeyCheck::for_relay(HOST_KEY_FINGERPRINT.parse().unwrap(), pin).unwrap();
+        SandboxProxyCommand::new(
+            build_proxy_command(exe, "handle", "sbx-1", "team-a"),
+            host_key,
+        )
+    }
+
+    #[test]
+    fn sandbox_ssh_args_disable_connection_sharing() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = sandbox_proxy("openshell", &dir.path().join("pin"));
+        let args = sandbox_ssh_args(&proxy, "DEBUG");
+        let options: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-o");
+                pair[1].as_str()
+            })
+            .collect();
+        assert!(options[0].starts_with("ProxyCommand=openshell ssh-proxy "));
+        assert!(options.contains(&"LogLevel=DEBUG"));
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(options.contains(&option), "missing {option}");
+        }
     }
 
     /// Helper: return the concatenation of characters that appear outside
@@ -1705,6 +1832,29 @@ mod tests {
             Some("team-a"),
             Some("sbx-1"),
             Some("id-2")
+        ));
+    }
+
+    #[test]
+    fn ssh_forward_command_matches_generated_host_key_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = sandbox_proxy("/path/openshell", &dir.path().join("pin"));
+        let mut argv = vec!["/usr/bin/ssh".to_string()];
+        argv.extend(sandbox_ssh_args(&proxy, "ERROR"));
+        argv.extend(["-N", "-L", "80:127.0.0.1:80", "sandbox"].map(str::to_string));
+        let line = argv.join(" ");
+
+        assert!(command_matches_ssh_forward(
+            &line,
+            80,
+            Some("team-a"),
+            Some("sbx-1")
+        ));
+        assert!(!command_matches_ssh_forward(
+            &line,
+            80,
+            Some("team-b"),
+            Some("sbx-1")
         ));
     }
 

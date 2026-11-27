@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish TypeScript SDK
+
+# Publishes the deprecated @nvidia/openshell-sdk stub, which re-exports
+# @ai-openshell/sdk. Run it by hand after ai-openshell/sdk-typescript publishes
+# the matching @ai-openshell/sdk release. That release needs the core tag
+# first, so the core Release workflow can't publish the stub.
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Stable tag to publish, e.g. v0.1.6
+        required: true
+        type: string
+      npm-version:
+        description: npm package version, e.g. 0.1.6
+        required: true
+        type: string
+      make-latest:
+        description: Update the latest dist-tag if this is still the newest stable release
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Publish TypeScript SDK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: nix shell --inputs-from . nixpkgs#nodejs_24 -c bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.release-tag }}
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Configure npm auth for GitHub Packages
+        working-directory: ./sdk/typescript
+        run: |
+          {
+            echo "@nvidia:registry=https://npm.pkg.github.com"
+            # Keep the token reference literal for npm to expand at publish time.
+            # shellcheck disable=SC2016
+            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
+          } > .npmrc
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.make-latest
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: release-workflow
+          sparse-checkout: .github/actions/check-latest-release
+
+      - name: Check current latest release
+        id: latest
+        if: inputs.make-latest
+        uses: ./release-workflow/.github/actions/check-latest-release
+        with:
+          release-tag: ${{ inputs.release-tag }}
+
+      - name: Publish
+        working-directory: ./sdk/typescript
+        env:
+          OPENSHELL_NPM_VERSION: ${{ inputs.npm-version }}
+          MAKE_LATEST: ${{ steps.latest.outputs.make-latest }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The package is a stub that re-exports @ai-openshell/sdk from npmjs.org.
+          # Depend on the same minor line, and refuse to publish a stub that
+          # npm cannot install yet.
+          IFS=. read -r major minor _ <<<"${OPENSHELL_NPM_VERSION}"
+          sdk_range="^${major}.${minor}.0"
+          if [[ -z "$(npm view "@ai-openshell/sdk@${sdk_range}" version --registry=https://registry.npmjs.org/)" ]]; then
+            echo "::error title=@ai-openshell/sdk missing::No @ai-openshell/sdk version matches ${sdk_range} on npmjs.org. Release ai-openshell/sdk-typescript first, then run this workflow again."
+            exit 1
+          fi
+          npm pkg set version="${OPENSHELL_NPM_VERSION}"
+          npm pkg set "dependencies.@ai-openshell/sdk=${sdk_range}"
+          package="$(npm pkg get name | tr -d '"')@${OPENSHELL_NPM_VERSION}"
+          if npm view "${package}" version >/dev/null 2>&1; then
+            echo "${package} is already published."
+            exit 0
+          fi
+          dist_tag=latest
+          if [[ "${MAKE_LATEST}" != "true" ]]; then
+            dist_tag="release-${OPENSHELL_NPM_VERSION%.*}"
+          fi
+          npm publish --tag "${dist_tag}"

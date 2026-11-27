@@ -19,12 +19,12 @@ use openshell_core::proto::{
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DetachSandboxProviderRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest,
+    InlineProviderRefreshSecretsRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxProvidersRequest, Provider,
+    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderMutationKind,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RotateProviderCredentialRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -129,6 +129,10 @@ pub async fn sandbox_provider_list(
     Ok(())
 }
 
+/// Attempts for an attach or detach whose resource version went stale between
+/// the command's read and its write.
+const PROVIDER_ATTACHMENT_CAS_ATTEMPTS: u32 = 5;
+
 /// Save a provider attachment and optionally wait for its installed authority.
 pub async fn sandbox_provider_attach(
     server: &str,
@@ -141,45 +145,53 @@ pub async fn sandbox_provider_attach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .attach_sandbox_provider(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to attach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "attachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| {
@@ -216,45 +228,53 @@ pub async fn sandbox_provider_detach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .detach_sandbox_provider(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to detach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "detachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
@@ -382,6 +402,7 @@ pub async fn ensure_required_providers(
         loop {
             let response = client
                 .list_providers(ListProvidersRequest {
+                    label_selector: String::new(),
                     page_size: 100,
                     page_token,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1046,6 +1067,7 @@ pub async fn provider_create(
         server,
         name,
         provider_type,
+        labels: &[],
         credentials,
         credential_source,
         config,
@@ -1060,6 +1082,7 @@ pub struct ProviderCreateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
     pub provider_type: &'a str,
+    pub labels: &'a [String],
     pub credentials: &'a [String],
     pub credential_source: ProviderCreateCredentialSource,
     pub config: &'a [String],
@@ -1082,6 +1105,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         server,
         name,
         provider_type,
+        labels,
         credentials,
         credential_source,
         config,
@@ -1089,6 +1113,8 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         profile_workspace,
         tls,
     } = options;
+
+    let labels = parse_key_value_pairs(labels, "--label")?;
 
     let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
     let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
@@ -1209,7 +1235,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     id: String::new(),
                     name: name.to_string(),
                     created_time: None,
-                    labels: HashMap::new(),
+                    labels,
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
@@ -1265,6 +1291,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (workspace).to_string(),
                 )),
+                material_secrets: HashMap::new(),
             })
             .await
         {
@@ -1346,6 +1373,21 @@ pub async fn provider_get(
     println!("  {} {}", "Id:".dimmed(), provider.object_id());
     println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    if let Some(meta) = &provider.metadata
+        && !meta.labels.is_empty()
+    {
+        let mut labels: Vec<_> = meta.labels.iter().collect();
+        labels.sort_unstable_by_key(|(key, _)| *key);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            labels
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -1455,6 +1497,7 @@ pub async fn provider_list(
     server: &str,
     page_size: i32,
     page_token: &str,
+    label_selector: &str,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -1466,6 +1509,7 @@ pub async fn provider_list(
         .list_providers(ListProvidersRequest {
             page_size,
             page_token: page_token.to_string(),
+            label_selector: label_selector.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -1717,6 +1761,9 @@ pub async fn provider_profile_import(
 
     let mut client = grpc_client(server, tls).await?;
     if !items.is_empty() {
+        if profiles_require_stable_placeholders(&items) {
+            lint_profile_items(&mut client, items.clone(), workspace).await?;
+        }
         let response = client
             .import_provider_profiles(ImportProviderProfilesRequest {
                 request_id: String::new(),
@@ -1763,6 +1810,9 @@ pub async fn provider_profile_update(
 
     let mut client = grpc_client(server, tls).await?;
     if let Some(item) = items.pop() {
+        if profiles_require_stable_placeholders(std::slice::from_ref(&item)) {
+            lint_profile_items(&mut client, vec![item.clone()], workspace).await?;
+        }
         let expected_resource_version = item
             .profile
             .as_ref()
@@ -1804,14 +1854,7 @@ pub async fn provider_profile_lint(
 
     if !items.is_empty() {
         let mut client = grpc_client(server, tls).await?;
-        let response = client
-            .lint_provider_profiles(LintProviderProfilesRequest {
-                profiles: items,
-                workspace_scope: provider_profile_workspace_scope(workspace),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
+        let response = lint_profile_items(&mut client, items, workspace).await?;
         diagnostics.extend(response.diagnostics);
     }
 
@@ -1901,7 +1944,7 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
@@ -1911,6 +1954,7 @@ fn refresh_status_header() -> String {
         "NEXT_REFRESH".bold(),
         "LAST_REFRESH".bold(),
         "FAILURE_CODE".bold(),
+        "MATERIAL_SECRETS".bold(),
         "LAST_ERROR".bold(),
     )
 }
@@ -1922,6 +1966,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub material: &'a [String],
     pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
+    pub material_secrets: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
 
@@ -1947,6 +1992,20 @@ pub async fn provider_refresh_config(
         }
         material.insert(key, value);
     }
+    // Workspace-secret references are secret material too. Listing them in
+    // secret_material_keys makes gateways that predate workspace secrets reject
+    // the request instead of ignoring the references.
+    let material_secrets = parse_key_value_pairs(input.material_secrets, "--material-secret")?;
+    for key in material_secrets.keys() {
+        if material.contains_key(key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both inline material and --material-secret"
+            ));
+        }
+        if !secret_material_keys.contains(key) {
+            secret_material_keys.push(key.clone());
+        }
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -1956,6 +2015,7 @@ pub async fn provider_refresh_config(
             strategy: strategy as i32,
             material,
             secret_material_keys,
+            material_secrets,
             expiration_time: input
                 .credential_expires_at_ms
                 .map(openshell_core::time::timestamp_from_millis)
@@ -2020,6 +2080,37 @@ pub async fn provider_rotate(
     Ok(())
 }
 
+pub async fn provider_refresh_inline_secrets(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .inline_provider_refresh_secrets(InlineProviderRefreshSecretsRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+            request_id: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+    println!(
+        "{} Copied workspace secrets into provider-owned material for {} {}",
+        "✓".green().bold(),
+        status.provider,
+        status.credential_key
+    );
+    Ok(())
+}
+
 pub async fn provider_refresh_delete(
     server: &str,
     name: &str,
@@ -2065,6 +2156,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "github_app_installation" => Ok(ProviderCredentialRefreshStrategy::GithubAppInstallation),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -2079,7 +2171,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
         .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {:<32}  {}",
         status.provider,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
@@ -2092,11 +2184,26 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
         ),
         format_optional_epoch_ms(proto_timestamp_ms(status.last_refresh_time.as_ref())),
         status.failure_code,
+        material_secrets_field(&status.material_secrets),
         truncate_status_field(&status.last_error, 72),
     )
 }
 
-fn provider_refresh_recovery_action_name(
+/// Material keys supplied by workspace secrets, as `key=secret`, sorted. These
+/// are the credentials to convert with `provider refresh inline-secrets`.
+fn material_secrets_field(material_secrets: &HashMap<String, String>) -> String {
+    if material_secrets.is_empty() {
+        return "-".to_string();
+    }
+    let mut bindings: Vec<_> = material_secrets
+        .iter()
+        .map(|(key, secret)| format!("{key}={secret}"))
+        .collect();
+    bindings.sort();
+    bindings.join(",")
+}
+
+pub fn provider_refresh_recovery_action_name(
     action: ProviderCredentialRefreshRecoveryAction,
 ) -> &'static str {
     match action {
@@ -2108,7 +2215,9 @@ fn provider_refresh_recovery_action_name(
     }
 }
 
-fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
+pub(super) fn provider_refresh_strategy_name(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static str {
     match strategy {
         ProviderCredentialRefreshStrategy::Static => "static",
         ProviderCredentialRefreshStrategy::External => "external",
@@ -2116,8 +2225,45 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
+}
+
+fn profiles_require_stable_placeholders(items: &[ProviderProfileImportItem]) -> bool {
+    items
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .any(|profile| {
+            profile
+                .credentials
+                .iter()
+                .any(|credential| credential.stable_placeholder)
+        })
+}
+
+// Check support before persisting an opt-in: older gateways discard unknown
+// credential fields and can otherwise report a successful revision-scoped import.
+async fn lint_profile_items(
+    client: &mut crate::tls::GrpcClient,
+    items: Vec<ProviderProfileImportItem>,
+    workspace: &str,
+) -> Result<openshell_core::proto::LintProviderProfilesResponse> {
+    let requires_stable = profiles_require_stable_placeholders(&items);
+    let response = client
+        .lint_provider_profiles(LintProviderProfilesRequest {
+            profiles: items,
+            workspace_scope: provider_profile_workspace_scope(workspace),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if requires_stable && !response.supports_stable_placeholder {
+        return Err(miette!(
+            "gateway does not support stable_placeholder; upgrade the gateway before enabling it"
+        ));
+    }
+    Ok(response)
 }
 
 fn load_profile_import_items(
@@ -2171,7 +2317,7 @@ async fn load_profile_import_items_with_url(
             "provider profile URL must end in .yaml, .yml, or .json"
         ));
     }
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -3383,6 +3529,7 @@ binaries: [/usr/bin/curl]
         assert!(header.contains("RECOVERY"));
         assert!(header.contains("FAILURE_CODE"));
         assert!(header.contains("LAST_ERROR"));
+        assert!(header.contains("MATERIAL_SECRETS"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
             provider: "my-graph".to_string(),
@@ -3399,6 +3546,7 @@ binaries: [/usr/bin/curl]
             failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
             provider_error_subtype: "invalid_rapt".to_string(),
             last_error_time: openshell_core::time::timestamp_from_millis(1_767_225_000_000).ok(),
+            material_secrets: HashMap::new(),
         });
 
         assert!(row.contains("my-graph"));
@@ -3410,6 +3558,21 @@ binaries: [/usr/bin/curl]
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
+        assert!(row.contains("  -  "), "no secret references render as '-'");
+    }
+
+    #[test]
+    fn refresh_status_row_lists_workspace_secret_bindings() {
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            provider: "alice-mcp".to_string(),
+            credential_key: "MCP_ACCESS_TOKEN".to_string(),
+            material_secrets: HashMap::from([
+                ("private_key".to_string(), "signing-key".to_string()),
+                ("client_secret".to_string(), "acme-oauth-client".to_string()),
+            ]),
+            ..Default::default()
+        });
+        assert!(row.contains("client_secret=acme-oauth-client,private_key=signing-key"));
     }
 
     #[test]
